@@ -44,6 +44,7 @@ if(APPLE)
   endif()
   set(PLATFORM_LIBS
       "-framework CoreFoundation"
+      "-framework IOKit"
       "-framework SystemConfiguration"
       "-framework Security")
 elseif(UNIX)
@@ -137,6 +138,7 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/knn.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/mod.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/projection.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/query_table.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/scan.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
