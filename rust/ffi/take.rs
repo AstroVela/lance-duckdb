@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::ptr;
 
@@ -82,24 +83,34 @@ fn create_dataset_take_stream_inner(
     let row_ids = if !filter_out_of_range || row_ids.is_empty() {
         row_ids
     } else {
-        let max_row_id = if handle.dataset.manifest.uses_stable_row_ids() {
-            handle.dataset.manifest.next_row_id
-        } else {
-            handle
-                .dataset
-                .manifest
+        let manifest = &handle.dataset.manifest;
+        let uses_stable_row_ids = manifest.uses_stable_row_ids();
+        let fragment_row_counts = (!uses_stable_row_ids).then(|| {
+            manifest
                 .fragments
                 .iter()
-                .map(|fragment| fragment.num_rows().unwrap_or_default() as u64)
-                .sum::<u64>()
+                .map(|fragment| (fragment.id, fragment.physical_rows.unwrap_or_default()))
+                .collect::<HashMap<_, _>>()
+        });
+        let row_id_is_in_range = |row_id: u64| {
+            if uses_stable_row_ids {
+                row_id < manifest.next_row_id
+            } else {
+                let fragment_id = row_id >> 32;
+                let row_offset = row_id as u32 as usize;
+                fragment_row_counts
+                    .as_ref()
+                    .and_then(|counts| counts.get(&fragment_id))
+                    .is_some_and(|row_count| row_offset < *row_count)
+            }
         };
-        if row_ids.iter().all(|id| *id < max_row_id) {
+        if row_ids.iter().all(|id| row_id_is_in_range(*id)) {
             row_ids
         } else {
             row_ids_filtered = row_ids
                 .iter()
                 .copied()
-                .filter(|id| *id < max_row_id)
+                .filter(|id| row_id_is_in_range(*id))
                 .collect::<Vec<_>>();
             row_ids_filtered.as_slice()
         }
