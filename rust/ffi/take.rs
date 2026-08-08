@@ -2,6 +2,7 @@ use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
 
+use futures::{stream, StreamExt, TryStreamExt};
 use lance::dataset::{fragment::FileFragment, Dataset, ProjectionRequest};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -21,22 +22,34 @@ async fn fragment_physical_row_counts(
     fragment_ids.sort_unstable();
     fragment_ids.dedup();
 
-    let mut row_counts = Vec::with_capacity(fragment_ids.len());
-    for fragment_id in fragment_ids {
-        let Ok(fragment_idx) = dataset
-            .manifest
-            .fragments
-            .binary_search_by_key(&fragment_id, |fragment| fragment.id)
-        else {
-            continue;
-        };
-        let fragment = FileFragment::new(
-            dataset.clone(),
-            dataset.manifest.fragments[fragment_idx].clone(),
-        );
-        row_counts.push((fragment_id, fragment.physical_rows().await?));
-    }
-    Ok(row_counts)
+    let fragments = fragment_ids
+        .into_iter()
+        .filter_map(|fragment_id| {
+            let fragment_idx = dataset
+                .manifest
+                .fragments
+                .binary_search_by_key(&fragment_id, |fragment| fragment.id)
+                .ok()?;
+            Some((
+                fragment_id,
+                FileFragment::new(
+                    dataset.clone(),
+                    dataset.manifest.fragments[fragment_idx].clone(),
+                ),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let io_parallelism = dataset.object_store(None).await?.io_parallelism();
+    stream::iter(fragments)
+        .map(|(fragment_id, fragment)| async move {
+            fragment
+                .physical_rows()
+                .await
+                .map(|row_count| (fragment_id, row_count))
+        })
+        .buffered(io_parallelism)
+        .try_collect()
+        .await
 }
 
 fn row_address_is_in_range(fragment_row_counts: &[(u64, usize)], row_id: u64) -> bool {
