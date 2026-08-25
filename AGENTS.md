@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository contains a DuckDB extension for querying Lance format datasets (including scan, vector search, and full-text search). The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
+This repository contains the Lance extension source for querying Lance format datasets (including scan, vector search, and full-text search). It can be compiled either against official DuckDB or against Vane's DuckDB fork. The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
 
 ## Documentation Language
 
@@ -12,14 +12,25 @@ All documentation in this repository (including `README.md` and files under `doc
 
 For any planning, implementation, review, or refactor work in this repository:
 
-- The only hard constraints are upstream DuckDB requirements and upstream Lance requirements.
-- If any repository-local guidance conflicts with DuckDB or Lance behavior/contracts, follow DuckDB/Lance.
+- The hard constraints are Vane's DuckDB fork contracts and upstream Lance requirements.
+- If any repository-local guidance conflicts with Vane, DuckDB, or Lance behavior/contracts, follow those upstream contracts.
 - Any decision made inside `lance-duckdb` (APIs/ABIs, FFI boundaries, internal formats, module boundaries, naming, testing conventions, or implementation strategies) is mutable and may be changed when a better design is found.
 - Treat repository-local rules in this document as default guidance, not immutable policy.
 
 ## Deliverable & Compatibility Policy
 
-This project is delivered as a fully self-contained DuckDB extension artifact (statically linked in our distribution). Low-level APIs/ABIs/formats in this repository (C++/Rust FFI boundaries, internal encodings, file/IPC formats, etc.) are strictly internal implementation details:
+This project has two independent product lanes: a loadable Lance extension for
+official DuckDB and an opt-in custom `vane-ai` wheel that statically links Lance
+against an exact Vane revision. A Vane-ABI loadable build may exist as a native
+compatibility harness, but it is not the distributed Vane deliverable. Native
+artifacts must never be mixed because the official-DuckDB and Vane C++ ABIs
+differ. The artifacts, Python helpers, tests, examples, and release workflows
+are owned by this repository. The upstream Vane repository must not fetch, pin,
+vendor, patch, package, or test Lance as an in-tree component; its default wheel
+does not include Lance.
+Low-level APIs/ABIs/formats in this repository (C++/Rust FFI boundaries,
+internal encodings, file/IPC formats, etc.) are strictly internal
+implementation details:
 
 - They are not intended to be directly consumed by end users.
 - There are no external downstream users that depend on them.
@@ -48,32 +59,42 @@ Prefer DuckDB/Lance native mechanisms over extension-specific replacements.
 
 ## Essential Commands
 
-### Building
+### Building against Vane
+
 ```bash
-# Initial setup (only needed once)
+# Run from this checkout. The manifest pins the Vane ABI tested by the plugin.
+export VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+# Native compatibility harness.
+make vane_ci
+# Custom vane-ai wheel with Lance statically linked.
+make vane_wheel
+```
+
+### Building with official DuckDB
+
+```bash
 git submodule update --init --recursive
+GEN=ninja make release -j 4
+./build/release/test/unittest "test/*"
+```
 
-# Build commands (provided by DuckDB extension tooling from `extension-ci-tools`)
-make
-GEN=ninja make release
-GEN=ninja make debug
-GEN=ninja make clean
-GEN=ninja make clean_all
+Run Rust-only checks from this checkout without a full Vane/CMake build:
 
-# Rust-only checks (without a full DuckDB/CMake build)
+```bash
+cd /path/to/lance-duckdb
 cargo check --manifest-path Cargo.toml
 cargo clippy --manifest-path Cargo.toml --all-targets
 ```
 
 ### Formatting
 
-This repository is configured with `uv`, so you can run formatting via:
+Run Rust formatting from this checkout:
 
 ```bash
-uv run make format
+cargo fmt --all --check
 ```
 
-PR requirement: Before submitting a PR, run `uv run make format` and commit any resulting formatting changes (as a separate commit if it helps review).
+Format C++ with DuckDB's pinned clang-format version and CMake with cmake-format before submitting changes.
 
 ### Commit & PR Conventions
 
@@ -90,21 +111,19 @@ type[(scope)]: short description
 
 ### Testing
 
-The `release` build can be slow. For fast iteration, prefer `test_debug` when available.
+The official-DuckDB, Vane native compatibility, and custom Vane static-wheel
+lanes are all owned by this repository. Run Python tests from non-editable
+installations. Static-wheel tests must use the exact built wheel from a fresh
+environment outside both source trees, with no extension path or unsigned-code
+override.
 
 ```bash
-# Run all tests (builds and runs sqllogictest)
-GEN=ninja make test
+python -m pip install . pytest
+pytest python/tests/test_identity.py python/tests/test_loading.py \
+  python/tests/test_vane_wheel_provenance.py
 
-# Run with specific build
-GEN=ninja make test_debug     # Test with debug build
-GEN=ninja make test_release   # Test with release build
-
-# Run DuckDB with extension for manual testing
-./build/release/duckdb -c "SELECT * FROM 'test/data/test_data.lance' LIMIT 1;"
-
-# Or load the loadable extension from a standalone DuckDB binary
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT * FROM 'test/data/test_data.lance' LIMIT 1;"
+export LANCE_DUCKDB_STATIC_WHEEL_TEST=1
+pytest python/tests/test_vane.py
 ```
 
 ## Architecture & Key Design Decisions
@@ -135,11 +154,17 @@ When modifying filter or aggregate pushdown, changes typically span both sides: 
 
 ## Testing Conventions
 
-Tests use DuckDB's `sqllogictest` format in `test/sql/`. S3/MinIO tests (`s3_*.test`) are gated by `LANCE_TEST_S3=1` and require a running MinIO instance.
+Tests use DuckDB's `sqllogictest` format in `test/sql/`. S3/MinIO tests
+(`s3_*.test`) are gated by `LANCE_TEST_S3=1` and require a running MinIO
+instance. Vane integration tests and examples live under `python/tests/` and
+`examples/vane/`, never in the Vane repository.
 
 ## Common Gotchas
 
-- **Extension loading**: Local builds are unsigned. Always use `duckdb -unsigned` when loading the extension manually.
+- **Extension availability**: Load the stock-DuckDB extension only from an
+  explicit pre-provisioned artifact compiled for that host ABI. Vane Ray uses
+  the custom wheel in which Lance is `STATICALLY_LINKED`; every node must run
+  the same wheel build. Runtime extension install or download is forbidden.
 - **Debug vs release**: `D_ASSERT` checks are stripped in release builds. A test that passes in one configuration but fails in the other usually indicates an assertion violation or uninitialized-variable issue.
 - **Rust build diagnostics**: When Cargo fails inside the CMake build, error output is hard to read. Run `cargo check --manifest-path Cargo.toml` in isolation for clearer diagnostics.
 

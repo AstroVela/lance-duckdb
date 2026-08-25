@@ -1,0 +1,415 @@
+name: Vane static Lance wheel
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install package non-editably
+        run: python -m pip install . "pytest>=8"
+
+      - name: Run host-independent Python tests
+        run: >-
+          pytest
+          python/tests/test_identity.py
+          python/tests/test_loading.py
+          python/tests/test_vane_wheel_provenance.py
+
+  vane-native:
+    name: Vane ABI native compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}
+      VANE_MANIFEST: ${{ github.workspace }}/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/build/vane-source
+      VANE_NATIVE_BUILD_DIR: ${{ github.workspace }}/build/vane-native
+      VANE_BUILD_JOBS: 12
+      VCPKG_TARGET_TRIPLET: x64-linux
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-native-ccache
+      CCACHE_MAXSIZE: 750M
+      CCACHE_COMPILERCHECK: content
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+    steps:
+      - name: Checkout extension and CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache protobuf-compiler
+          python -m pip install "cmake>=3.29" "ninja>=1.10"
+
+      - name: Restore native compiler cache
+        id: native_ccache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: vane-native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vane-extension.toml') }}
+
+      - name: Restore extension dependency cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vane-native-vcpkg-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vane-extension.toml') }}
+
+      - name: Read vcpkg baseline
+        id: vcpkg
+        shell: bash
+        run: |
+          baseline="$(python -c 'import json; print(json.load(open("vcpkg.json"))["builtin-baseline"])')"
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Print exact source identities
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          git rev-parse HEAD
+          git rev-parse HEAD:vane-extension-ci-tools
+          make vane_identity \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR"
+
+      - name: Build and run native dual-build smoke test
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          ccache --zero-stats
+          make vane_ci \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_NATIVE_BUILD_DIR="$VANE_NATIVE_BUILD_DIR" \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS"
+          cmake --build "$VANE_NATIVE_BUILD_DIR" \
+            --target loadable_extension_demo_loadable_extension \
+            --parallel "$VANE_BUILD_JOBS"
+
+      - name: Upload exact-ABI plan-transport failure extension
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-plan-transport-test-extension
+          path: ${{ env.VANE_NATIVE_BUILD_DIR }}/test/extension/loadable_extension_demo.duckdb_extension
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Report native compiler cache
+        if: always()
+        env:
+          VANE_CCACHE_ACTION_HIT: ${{ steps.native_ccache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions ccache restore hit: %s\n' "${VANE_CCACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+  vane-wheel:
+    name: Vane wheel with static Lance
+    needs: [python, vane-native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}
+      VANE_MANIFEST: ${{ github.workspace }}/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/build/vane-source
+      VANE_WHEEL_BUILD_DIR: ${{ github.workspace }}/build/vane-wheel
+      VANE_WHEEL_DIST_DIR: ${{ github.workspace }}/build/vane-wheel/dist
+      LANCE_HELPER_DIST_DIR: ${{ github.workspace }}/build/lance-helper-wheel
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/build/vane-vcpkg
+      VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/build/vane-source/vcpkg_installed
+      VANE_BUILD_JOBS: 12
+      VCPKG_TARGET_TRIPLET: x64-linux
+      LANCE_DUCKDB_TEST_NON_STATIC_EXTENSION: ${{ runner.temp }}/vane-plan-transport-test-extension/loadable_extension_demo.duckdb_extension
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-wheel-ccache
+      CCACHE_MAXSIZE: 750M
+      CCACHE_COMPILERCHECK: content
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+    steps:
+      - name: Checkout extension and recursive submodules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install wheel build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            libtool \
+            pkg-config \
+            tar \
+            unzip \
+            zip
+          python -m pip install \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools>=77" \
+            "setuptools-scm>=9.2.0"
+
+      - name: Restore wheel compiler cache
+        id: wheel_ccache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: vane-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vane-extension.toml') }}
+
+      - name: Restore extension dependency cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vane-wheel-vcpkg-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vane-extension.toml') }}
+
+      - name: Read vcpkg baseline
+        id: vcpkg
+        shell: bash
+        run: |
+          baseline="$(python -c 'import json; print(json.load(open("vcpkg.json"))["builtin-baseline"])')"
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Set up extension vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Download exact-ABI plan-transport failure extension
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: vane-plan-transport-test-extension
+          path: ${{ runner.temp }}/vane-plan-transport-test-extension
+
+      - name: Build and verify the static Lance wheel
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+        run: |
+          ccache --zero-stats
+          git rev-parse HEAD
+          git rev-parse HEAD:vane-extension-ci-tools
+          make vane_identity \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR"
+          make vane_wheel \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_WHEEL_BUILD_DIR="$VANE_WHEEL_BUILD_DIR" \
+            VANE_WHEEL_DIST_DIR="$VANE_WHEEL_DIST_DIR" \
+            VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT" \
+            VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS"
+          python -m build \
+            --wheel \
+            --no-isolation \
+            --outdir "$LANCE_HELPER_DIST_DIR" \
+            "$GITHUB_WORKSPACE"
+
+      - name: Select exactly one host wheel and helper wheel
+        id: wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=("$VANE_WHEEL_DIST_DIR"/*.whl)
+          test "${#wheels[@]}" -eq 1
+          helper_wheels=("$LANCE_HELPER_DIST_DIR"/*.whl)
+          test "${#helper_wheels[@]}" -eq 1
+          echo "path=${wheels[0]}" >> "$GITHUB_OUTPUT"
+          echo "filename=$(basename "${wheels[0]}")" >> "$GITHUB_OUTPUT"
+          echo "helper_path=${helper_wheels[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Install the exact wheel in a fresh environment
+        id: fresh
+        shell: bash
+        env:
+          WHEEL_PATH: ${{ steps.wheel.outputs.path }}
+          LANCE_HELPER_WHEEL_PATH: ${{ steps.wheel.outputs.helper_path }}
+        run: |
+          set -euo pipefail
+          fresh_environment="$RUNNER_TEMP/vane-lance-wheel-venv"
+          python -m venv "$fresh_environment"
+          "$fresh_environment/bin/python" -m pip install \
+            --disable-pip-version-check \
+            "$WHEEL_PATH"
+          "$fresh_environment/bin/python" -m pip install \
+            --disable-pip-version-check \
+            "pytest>=8"
+          "$fresh_environment/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            "$LANCE_HELPER_WHEEL_PATH"
+          echo "python=$fresh_environment/bin/python" >> "$GITHUB_OUTPUT"
+
+      - name: Verify installed module and static extension identity
+        shell: bash
+        env:
+          FRESH_PYTHON: ${{ steps.fresh.outputs.python }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          env \
+            -u LANCE_DUCKDB_EXTENSION \
+            -u LANCE_DUCKDB_TEST_ALLOW_UNSIGNED \
+            -u PYTHONPATH \
+            "$FRESH_PYTHON" -I - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          import lance_duckdb
+          import vane
+          from vane import _native
+
+          prefix = Path(sys.prefix).resolve()
+          helper_path = Path(lance_duckdb.__file__).resolve()
+          helper_path.relative_to(prefix)
+          connection = vane.connect(
+              ":memory:",
+              config={
+                  "autoinstall_known_extensions": "false",
+                  "autoload_known_extensions": "false",
+              },
+          )
+          before = connection.execute(
+              "SELECT install_mode FROM duckdb_extensions() "
+              "WHERE lower(extension_name) = 'lance'"
+          ).fetchone()
+          assert before == ("STATICALLY_LINKED",)
+          connection.execute("LOAD lance")
+          loaded = connection.execute(
+              "SELECT loaded, install_mode FROM duckdb_extensions() "
+              "WHERE lower(extension_name) = 'lance'"
+          ).fetchone()
+          assert loaded == (True, "STATICALLY_LINKED")
+          version = connection.execute(
+              "SELECT library_version, source_id FROM pragma_version()"
+          ).fetchone()
+          connection.close()
+          print(
+              json.dumps(
+                  {
+                      "vane_module": vane.__file__,
+                      "native_module": _native.__file__,
+                      "lance_helper_module": str(helper_path),
+                      "version": version,
+                      "lance": loaded,
+                  },
+                  sort_keys=True,
+              )
+          )
+          PY
+
+      - name: Run local and real two-worker Ray integration tests
+        shell: bash
+        env:
+          FRESH_PYTHON: ${{ steps.fresh.outputs.python }}
+          LANCE_DUCKDB_STATIC_WHEEL_TEST: "1"
+          PYTHONSAFEPATH: "1"
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          env \
+            -u LANCE_DUCKDB_EXTENSION \
+            -u LANCE_DUCKDB_TEST_ALLOW_UNSIGNED \
+            -u PYTHONPATH \
+            "$FRESH_PYTHON" -I -m pytest \
+              -c "$GITHUB_WORKSPACE/pyproject.toml" \
+              --rootdir="$GITHUB_WORKSPACE" \
+              --import-mode=importlib \
+              "$GITHUB_WORKSPACE/python/tests/test_vane.py"
+
+      - name: Generate deterministic provenance and checksum
+        shell: bash
+        env:
+          FRESH_PYTHON: ${{ steps.fresh.outputs.python }}
+          WHEEL_PATH: ${{ steps.wheel.outputs.path }}
+        run: |
+          set -euo pipefail
+          env \
+            -u LANCE_DUCKDB_EXTENSION \
+            -u LANCE_DUCKDB_TEST_ALLOW_UNSIGNED \
+            -u PYTHONPATH \
+            python ci/generate_vane_wheel_provenance.py \
+              --extension-root "$GITHUB_WORKSPACE" \
+              --manifest "$VANE_MANIFEST" \
+              --vane-source "$VANE_SOURCE_DIR" \
+              --wheel "$WHEEL_PATH" \
+              --python "$FRESH_PYTHON" \
+              --output "$VANE_WHEEL_DIST_DIR/vane-lance-wheel.provenance.json" \
+              --checksum-output "$VANE_WHEEL_DIST_DIR/vane-lance-wheel.sha256"
+
+      - name: Report wheel compiler cache
+        if: always()
+        env:
+          VANE_CCACHE_ACTION_HIT: ${{ steps.wheel_ccache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions ccache restore hit: %s\n' "${VANE_CCACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload custom Vane wheel and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-lance-wheel
+          path: |
+            ${{ steps.wheel.outputs.path }}
+            ${{ env.VANE_WHEEL_DIST_DIR }}/vane-lance-wheel.provenance.json
+            ${{ env.VANE_WHEEL_DIST_DIR }}/vane-lance-wheel.sha256
+          if-no-files-found: error

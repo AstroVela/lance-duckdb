@@ -61,8 +61,8 @@ endloop
 
 endloop
 
-# In-flight commits need their read-version manifests for conflict resolution,
-# so destructive cleanup must wait until all writers have quiesced.
+# Run destructive cleanup after this test's write phase so the following index
+# stress starts from a deterministic native Lance state.
 statement ok
 VACUUM LANCE maintenance_cc.main.maintenance_concurrency
 WITH (

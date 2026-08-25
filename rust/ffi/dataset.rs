@@ -14,6 +14,8 @@ use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
+use lance_select::RowAddrTreeMap;
+use object_store::ObjectStoreExt;
 use roaring::RoaringTreemap;
 
 use crate::constants::ROW_ID_COLUMN;
@@ -24,9 +26,11 @@ use super::session::record_dataset_open;
 use super::types::DatasetHandle;
 use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
 use super::util::{
-    cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
-    FfiResult,
+    cstr_to_str, ffi_output_string, lance_mutation_error, optional_session_handle,
+    parse_optional_filter_ir, redact_uri_for_display, redact_uri_in_detail, slice_from_ptr,
+    FfiError, FfiResult,
 };
+use super::write::VaneTransaction;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +49,12 @@ pub struct LanceFragmentStats {
     pub bytes_on_disk: u64,
 }
 
+enum DeletePreparation {
+    Ready(Option<Box<VaneTransaction>>, i64),
+    CleanupIncomplete(String),
+}
+
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void {
     match open_dataset_inner(path, ptr::null_mut()) {
@@ -59,6 +69,7 @@ pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void 
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_with_session(
     path: *const c_char,
@@ -88,10 +99,14 @@ fn open_dataset_inner(path: *const c_char, session: *mut c_void) -> FfiResult<Da
     }) {
         Ok(Ok(ds)) => Arc::new(ds),
         Ok(Err(err)) => {
+            let detail = redact_uri_in_detail(&err.to_string(), path_str);
             return Err(FfiError::new(
                 ErrorCode::DatasetOpen,
-                format!("dataset open '{path_str}': {err}"),
-            ))
+                format!(
+                    "dataset open '{}': {detail}",
+                    redact_uri_for_display(path_str)
+                ),
+            ));
         }
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
@@ -99,6 +114,7 @@ fn open_dataset_inner(path: *const c_char, session: *mut c_void) -> FfiResult<Da
     Ok(DatasetHandle::new(dataset))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_with_storage_options(
     path: *const c_char,
@@ -124,6 +140,7 @@ pub unsafe extern "C" fn lance_open_dataset_with_storage_options(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_with_storage_options_and_session(
     path: *const c_char,
@@ -204,10 +221,14 @@ fn open_dataset_with_storage_options_inner(
     }) {
         Ok(Ok(ds)) => Arc::new(ds),
         Ok(Err(err)) => {
+            let detail = redact_uri_in_detail(&err.to_string(), path_str);
             return Err(FfiError::new(
                 ErrorCode::DatasetOpen,
-                format!("dataset open '{path_str}': {err}"),
-            ))
+                format!(
+                    "dataset open '{}': {detail}",
+                    redact_uri_for_display(path_str)
+                ),
+            ));
         }
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
@@ -216,6 +237,7 @@ fn open_dataset_with_storage_options_inner(
     Ok(DatasetHandle::new(dataset))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     if !dataset.is_null() {
@@ -225,6 +247,153 @@ pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void) -> u64 {
+    match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => {
+            clear_last_error();
+            handle.dataset.version_id()
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            0
+        }
+    }
+}
+
+pub(super) async fn dataset_snapshot_identity_value(dataset: &lance::Dataset) -> FfiResult<String> {
+    let manifest = dataset.manifest();
+    let location = dataset.manifest_location();
+    let mut size = location.size;
+    let mut e_tag = location.e_tag.clone();
+
+    // checkout_version reconstructs a ManifestLocation without preserving all
+    // object metadata. Fill only missing values from the immutable manifest
+    // object so the original handle and a checkout of the same snapshot agree.
+    // Values already captured by a stale handle must not be overwritten: after
+    // DROP/recreate they are what distinguishes the previous generation.
+    if size.is_none() || e_tag.is_none() {
+        let store = dataset.object_store(None).await.map_err(|error| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!(
+                    "resolve object store for dataset snapshot identity: {}",
+                    redact_uri_in_detail(&error.to_string(), dataset.uri())
+                ),
+            )
+        })?;
+        let metadata = store.inner.head(&location.path).await.map_err(|error| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!(
+                    "inspect manifest for dataset snapshot identity: {}",
+                    redact_uri_in_detail(&error.to_string(), dataset.uri())
+                ),
+            )
+        })?;
+        size.get_or_insert(metadata.size);
+        if e_tag.is_none() {
+            e_tag = metadata.e_tag;
+        }
+    }
+
+    // JSON tuple encoding is unambiguous even if a backend-supplied ETag or
+    // transaction path contains the old '|' delimiter. The value is opaque to
+    // C++ and is used only for exact snapshot identity comparisons.
+    serde_json::to_string(&(
+        manifest.version,
+        manifest.timestamp_nanos,
+        manifest.transaction_file.as_deref().unwrap_or_default(),
+        size.unwrap_or_default(),
+        e_tag.as_deref().unwrap_or_default(),
+    ))
+    .map_err(|error| {
+        FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("serialize dataset snapshot identity: {error}"),
+        )
+    })
+}
+
+fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiResult<std::ffi::CString> {
+    let payload = runtime::block_on(dataset_snapshot_identity_value(dataset))
+        .map_err(|error| FfiError::new(ErrorCode::Runtime, format!("runtime: {error}")))??;
+    ffi_output_string(
+        format!("snapshot|{payload}"),
+        ErrorCode::DatasetOpen,
+        "dataset snapshot identity",
+    )
+}
+
+#[ffi_guard_macro::ffi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_generation_id(dataset: *mut c_void) -> *const c_char {
+    let handle = match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => handle,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return ptr::null();
+        }
+    };
+    // This identity is deliberately scoped to the opened snapshot.  A worker
+    // validates it after checking out the serialized version, so ordinary
+    // commits and vacuuming version 1 cannot make a retained snapshot appear to
+    // belong to another dataset generation.  Recreating a dataset at the same
+    // URI produces a different manifest identity even if version numbers reset.
+    match dataset_snapshot_identity(&handle.dataset) {
+        Ok(generation_id) => {
+            clear_last_error();
+            generation_id.into_raw()
+        }
+        Err(error) => {
+            set_last_error(error.code, error.message);
+            ptr::null()
+        }
+    }
+}
+
+#[ffi_guard_macro::ffi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_checkout_version(
+    dataset: *mut c_void,
+    version: u64,
+) -> *mut c_void {
+    let handle = match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => handle,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return ptr::null_mut();
+        }
+    };
+    if version == 0 {
+        set_last_error(
+            ErrorCode::InvalidArgument,
+            "dataset version must be greater than zero",
+        );
+        return ptr::null_mut();
+    }
+    match runtime::block_on(handle.dataset.checkout_version(version)) {
+        Ok(Ok(dataset)) => {
+            record_dataset_open();
+            clear_last_error();
+            Box::into_raw(Box::new(DatasetHandle::new(Arc::new(dataset)))) as *mut c_void
+        }
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::DatasetOpen,
+                format!("dataset checkout version {version}: {err}"),
+            );
+            ptr::null_mut()
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_count_rows(dataset: *mut c_void) -> i64 {
     match dataset_count_rows_inner(dataset) {
@@ -257,6 +426,7 @@ fn dataset_count_rows_inner(dataset: *mut c_void) -> FfiResult<i64> {
         .map_err(|_| FfiError::new(ErrorCode::DatasetCountRows, "row count overflow"))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_schema(dataset: *mut c_void) -> *mut c_void {
     match get_schema_inner(dataset) {
@@ -276,6 +446,7 @@ fn get_schema_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandl
     Ok(handle.arrow_schema.clone())
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_schema_for_scan(dataset: *mut c_void) -> *mut c_void {
     match get_schema_for_scan_inner(dataset) {
@@ -304,6 +475,7 @@ fn get_schema_for_scan_inner(dataset: *mut c_void) -> FfiResult<super::types::Sc
     Ok(Arc::new(schema))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_fragments(
     dataset: *mut c_void,
@@ -325,6 +497,9 @@ fn dataset_list_fragments_inner(dataset: *mut c_void, out_len: *mut usize) -> Ff
     if out_len.is_null() {
         return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
     }
+    unsafe {
+        std::ptr::write_unaligned(out_len, 0);
+    }
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let ids: Vec<u64> = handle.dataset.fragments().iter().map(|f| f.id).collect();
@@ -340,6 +515,7 @@ fn dataset_list_fragments_inner(dataset: *mut c_void, out_len: *mut usize) -> Ff
     Ok(data)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_fragment_stats(
     dataset: *mut c_void,
@@ -363,6 +539,9 @@ fn dataset_list_fragment_stats_inner(
 ) -> FfiResult<*mut LanceFragmentStats> {
     if out_len.is_null() {
         return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
+    }
+    unsafe {
+        std::ptr::write_unaligned(out_len, 0);
     }
     let handle = unsafe { super::util::dataset_handle(dataset)? };
 
@@ -396,6 +575,7 @@ fn dataset_list_fragment_stats_inner(
     Ok(data)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_fragment_list(ptr: *mut u64, len: usize) {
     if ptr.is_null() {
@@ -407,6 +587,7 @@ pub unsafe extern "C" fn lance_free_fragment_list(ptr: *mut u64, len: usize) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_fragment_stats_list(ptr: *mut LanceFragmentStats, len: usize) {
     if ptr.is_null() {
@@ -418,6 +599,7 @@ pub unsafe extern "C" fn lance_free_fragment_stats_list(ptr: *mut LanceFragmentS
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_field_stats(
     dataset: *mut c_void,
@@ -467,6 +649,9 @@ fn dataset_list_field_stats_inner(
     if out_len.is_null() {
         return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
     }
+    unsafe {
+        std::ptr::write_unaligned(out_len, 0);
+    }
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let stats = fetch_data_stats!(handle);
@@ -483,6 +668,7 @@ fn dataset_list_field_stats_inner(
     Ok(unsafe { boxed_slice_to_c(out, out_len) })
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_field_stats_list(ptr: *mut LanceFieldStats, len: usize) {
     if ptr.is_null() {
@@ -500,6 +686,7 @@ pub struct LanceNamedFieldStats {
     pub bytes_on_disk: u64,
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_named_field_stats(
     dataset: *mut c_void,
@@ -524,39 +711,53 @@ fn dataset_list_named_field_stats_inner(
     if out_len.is_null() {
         return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
     }
+    unsafe {
+        std::ptr::write_unaligned(out_len, 0);
+    }
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let stats = fetch_data_stats!(handle);
 
-    // Build field_id → name map from lance schema.
+    // Deferred materialization operates on DuckDB's top-level scan columns.
+    // Ignore nested field statistics here: mapping a nested leaf by its bare
+    // name can otherwise attribute its bytes to an unrelated top-level column
+    // with the same name.  Top-level fields without statistics continue to use
+    // the type-based fallback in C++.
     let lance_schema = handle.dataset.schema();
-    let mut id_to_name: HashMap<i32, String> = HashMap::new();
-    fn collect_field_names(
-        fields: &[lance_core::datatypes::Field],
-        map: &mut HashMap<i32, String>,
-    ) {
-        for f in fields {
-            map.insert(f.id, f.name.clone());
-            collect_field_names(&f.children, map);
-        }
-    }
-    collect_field_names(&lance_schema.fields, &mut id_to_name);
+    let id_to_name = lance_schema
+        .fields
+        .iter()
+        .map(|field| (field.id, field.name.clone()))
+        .collect::<HashMap<_, _>>();
 
-    let out: Vec<LanceNamedFieldStats> = stats
+    let out = stats
         .fields
         .into_iter()
         .filter_map(|field| {
             let name = id_to_name.get(&(field.id as i32))?;
-            Some(LanceNamedFieldStats {
-                name: super::util::to_c_string(name).into_raw(),
-                bytes_on_disk: field.bytes_on_disk,
-            })
+            Some((name, field.bytes_on_disk))
+        })
+        .map(|(name, bytes_on_disk)| {
+            ffi_output_string(
+                name.as_bytes(),
+                ErrorCode::DatasetCalculateDataStats,
+                "field statistics name",
+            )
+            .map(|name| (name, bytes_on_disk))
+        })
+        .collect::<FfiResult<Vec<_>>>()?;
+    let out = out
+        .into_iter()
+        .map(|(name, bytes_on_disk)| LanceNamedFieldStats {
+            name: name.into_raw(),
+            bytes_on_disk,
         })
         .collect();
 
     Ok(unsafe { boxed_slice_to_c(out, out_len) })
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_named_field_stats_list(
     ptr: *mut LanceNamedFieldStats,
@@ -577,6 +778,7 @@ pub unsafe extern "C" fn lance_free_named_field_stats_list(
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_delete(
     dataset: *mut c_void,
@@ -596,6 +798,7 @@ pub unsafe extern "C" fn lance_dataset_delete(
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_delete_transaction_with_storage_options(
     path: *const c_char,
@@ -653,6 +856,16 @@ fn delete_transaction_with_storage_options_inner(
             ErrorCode::InvalidArgument,
             "out_deleted_rows is null",
         ));
+    }
+    if super::util::output_regions_overlap(out_transaction, out_deleted_rows) {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "out_transaction and out_deleted_rows must not overlap",
+        ));
+    }
+    unsafe {
+        std::ptr::write_unaligned(out_transaction, std::ptr::null_mut());
+        std::ptr::write_unaligned(out_deleted_rows, 0);
     }
 
     let path_str = unsafe { cstr_to_str(path, "path")? };
@@ -726,17 +939,17 @@ fn delete_transaction_with_storage_options_inner(
             .map_err(|e| e.to_string())?;
 
         let Some(filter_expr) = scanner.get_expr_filter().map_err(|e| e.to_string())? else {
-            return Ok::<_, String>((None, 0_i64));
+            return Ok::<_, String>(DeletePreparation::Ready(None, 0_i64));
         };
 
         if matches!(
             filter_expr,
             Expr::Literal(ScalarValue::Boolean(Some(false)), _)
         ) {
-            return Ok::<_, String>((None, 0_i64));
+            return Ok::<_, String>(DeletePreparation::Ready(None, 0_i64));
         }
 
-        let (updated_fragments, deleted_fragment_ids, deleted_rows) = if matches!(
+        let (updated_fragments, deleted_fragment_ids, affected_rows, deleted_rows) = if matches!(
             filter_expr,
             Expr::Literal(ScalarValue::Boolean(Some(true)), _)
         ) {
@@ -748,7 +961,7 @@ fn delete_transaction_with_storage_options_inner(
             let deleted_rows = dataset.count_rows(None).await.map_err(|e| e.to_string())?;
             let deleted_rows = i64::try_from(deleted_rows)
                 .map_err(|_| "deleted row count overflow".to_string())?;
-            (Vec::new(), deleted_fragment_ids, deleted_rows)
+            (Vec::new(), deleted_fragment_ids, None, deleted_rows)
         } else {
             let stable_row_ids = dataset.manifest.uses_stable_row_ids();
             let mut captured_row_ids = CapturedRowIds::new(stable_row_ids);
@@ -790,12 +1003,24 @@ fn delete_transaction_with_storage_options_inner(
                 }
             };
 
-            let (fragments, deleted_ids) = apply_deletions(dataset.as_ref(), &row_addrs).await?;
-            (fragments, deleted_ids, deleted_rows_i64)
+            let (fragments, deleted_ids) = match apply_deletions(dataset.as_ref(), &row_addrs).await
+            {
+                Ok(result) => result,
+                Err(error) if error.cleanup_incomplete => {
+                    return Ok(DeletePreparation::CleanupIncomplete(error.message));
+                }
+                Err(error) => return Err(error.message),
+            };
+            (
+                fragments,
+                deleted_ids,
+                Some(RowAddrTreeMap::from(row_addrs)),
+                deleted_rows_i64,
+            )
         };
 
         if updated_fragments.is_empty() && deleted_fragment_ids.is_empty() {
-            return Ok::<_, String>((None, deleted_rows));
+            return Ok::<_, String>(DeletePreparation::Ready(None, deleted_rows));
         }
 
         let operation = Operation::Delete {
@@ -803,10 +1028,20 @@ fn delete_transaction_with_storage_options_inner(
             deleted_fragment_ids,
             predicate,
         };
-        let txn = Transaction::new(dataset.manifest.version, operation, None);
-        Ok::<_, String>((Some(txn), deleted_rows))
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let txn = match affected_rows {
+            Some(affected_rows) => VaneTransaction::with_affected_rows(transaction, affected_rows),
+            None => VaneTransaction::new(transaction),
+        };
+        Ok::<_, String>(DeletePreparation::Ready(Some(Box::new(txn)), deleted_rows))
     }) {
-        Ok(Ok(v)) => v,
+        Ok(Ok(DeletePreparation::Ready(maybe_txn, deleted_rows))) => (maybe_txn, deleted_rows),
+        Ok(Ok(DeletePreparation::CleanupIncomplete(message))) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCommitOutcomeUnknown,
+                message,
+            ))
+        }
         Ok(Err(message)) => return Err(FfiError::new(ErrorCode::DatasetDelete, message)),
         Err(err) => {
             return Err(FfiError::new(
@@ -818,13 +1053,11 @@ fn delete_transaction_with_storage_options_inner(
 
     unsafe {
         std::ptr::write_unaligned(out_deleted_rows, deleted_rows);
-        std::ptr::write_unaligned(out_transaction, std::ptr::null_mut());
     }
 
     if let Some(txn) = maybe_txn {
-        let boxed = Box::new(txn);
         unsafe {
-            std::ptr::write_unaligned(out_transaction, Box::into_raw(boxed) as *mut c_void);
+            std::ptr::write_unaligned(out_transaction, Box::into_raw(txn) as *mut c_void);
         }
     }
 
@@ -842,6 +1075,9 @@ fn dataset_delete_inner(
             ErrorCode::InvalidArgument,
             "out_deleted_rows is null",
         ));
+    }
+    unsafe {
+        std::ptr::write_unaligned(out_deleted_rows, 0);
     }
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
@@ -868,18 +1104,139 @@ fn dataset_delete_inner(
     let deleted_rows = match runtime::block_on(ds.delete(&predicate)) {
         Ok(Ok(result)) => result.num_deleted_rows,
         Ok(Err(err)) => {
-            return Err(FfiError::new(
+            return Err(lance_mutation_error(
                 ErrorCode::DatasetDelete,
-                format!("dataset delete: {err}"),
+                ErrorCode::DatasetCommitOutcomeUnknown,
+                "dataset delete",
+                err,
             ))
         }
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
-    let deleted_rows_i64 = i64::try_from(deleted_rows)
-        .map_err(|_| FfiError::new(ErrorCode::DatasetDelete, "deleted row count overflow"))?;
+    let deleted_rows_i64 = i64::try_from(deleted_rows).map_err(|_| {
+        FfiError::new(
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset delete committed, but the deleted row count exceeds the FFI result range",
+        )
+    })?;
 
     unsafe {
         std::ptr::write_unaligned(out_deleted_rows, deleted_rows_i64);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
+
+    fn batch(value: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![value]));
+        RecordBatch::try_new(schema, vec![column]).unwrap()
+    }
+
+    #[test]
+    fn fragment_stats_error_is_not_an_empty_success() {
+        let mut len = usize::MAX;
+        let stats = unsafe { lance_dataset_list_fragment_stats(ptr::null_mut(), &mut len) };
+
+        assert!(stats.is_null());
+        assert_eq!(len, 0);
+        assert_eq!(
+            crate::error::lance_last_error_code(),
+            ErrorCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn empty_fragment_stats_success_has_a_non_null_pointer() {
+        let root = std::env::temp_dir().join(format!(
+            "lance-duckdb-empty-fragment-stats-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = root.join("dataset.lance").to_string_lossy().into_owned();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let empty_batch = RecordBatch::new_empty(schema);
+        let dataset = runtime::block_on(
+            InsertBuilder::new(path.as_str())
+                .with_params(&WriteParams {
+                    mode: WriteMode::Overwrite,
+                    ..Default::default()
+                })
+                .execute(vec![empty_batch]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(dataset.fragments().is_empty());
+
+        let mut handle = Box::new(DatasetHandle::new(Arc::new(dataset)));
+        let handle_ptr = handle.as_mut() as *mut DatasetHandle as *mut c_void;
+        let mut len = usize::MAX;
+        let stats = unsafe { lance_dataset_list_fragment_stats(handle_ptr, &mut len) };
+
+        assert!(!stats.is_null());
+        assert_eq!(len, 0);
+        unsafe { lance_free_fragment_stats_list(stats, len) };
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_identity_is_stable_after_new_commit_and_root_vacuum() {
+        let root = std::env::temp_dir().join(format!(
+            "lance-duckdb-snapshot-identity-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = root.join("dataset.lance").to_string_lossy().into_owned();
+
+        let (coordinator_identity, latest_identity, checked_out_identity) =
+            runtime::block_on(async {
+                let overwrite = WriteParams {
+                    mode: WriteMode::Overwrite,
+                    ..Default::default()
+                };
+                InsertBuilder::new(path.as_str())
+                    .with_params(&overwrite)
+                    .execute(vec![batch(1)])
+                    .await?;
+
+                let append = WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                };
+                let version_two = InsertBuilder::new(path.as_str())
+                    .with_params(&append)
+                    .execute(vec![batch(2)])
+                    .await?;
+                assert_eq!(version_two.version_id(), 2);
+                version_two
+                    .cleanup_old_versions(chrono::Duration::zero(), Some(true), Some(false))
+                    .await?;
+                assert!(version_two.checkout_version(1).await.is_err());
+                let coordinator_identity =
+                    dataset_snapshot_identity_value(&version_two).await.unwrap();
+
+                let latest = InsertBuilder::new(path.as_str())
+                    .with_params(&append)
+                    .execute(vec![batch(3)])
+                    .await?;
+                assert_eq!(latest.version_id(), 3);
+                let latest_identity = dataset_snapshot_identity_value(&latest).await.unwrap();
+                let checked_out = latest.checkout_version(2).await?;
+                let checked_out_identity =
+                    dataset_snapshot_identity_value(&checked_out).await.unwrap();
+                Ok::<_, lance::Error>((coordinator_identity, latest_identity, checked_out_identity))
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(coordinator_identity, checked_out_identity);
+        assert_ne!(coordinator_identity, latest_identity);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

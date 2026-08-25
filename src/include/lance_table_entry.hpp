@@ -25,6 +25,10 @@ struct LanceNamespaceTableConfig {
   string bearer_token_override;
   string api_key_override;
   string headers_tsv;
+  bool requires_worker_auth = false;
+  //! SQL-facing URI captured from the ATTACH input. The physical display URI
+  //! may be canonicalized for Vane worker replay and must remain separate.
+  string sql_display_uri;
   string display_uri;
 
   bool IsDirectory() const { return kind == LanceNamespaceKind::Directory; }
@@ -47,6 +51,10 @@ public:
                                       AlterInfo &info) override;
 
   unique_ptr<CatalogEntry> Copy(ClientContext &context) const override;
+
+#ifdef LANCE_DUCKDB_HAS_LOGICAL_WRITE_TARGET
+  string GetLogicalWriteTargetDefinition(ClientContext &context) override;
+#endif
 
   TableFunction GetScanFunction(ClientContext &context,
                                 unique_ptr<FunctionData> &bind_data) override;

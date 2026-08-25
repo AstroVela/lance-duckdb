@@ -1,13 +1,13 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "lance_extension.hpp"
-#include "lance_secrets.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "lance_secrets.hpp"
 
 namespace duckdb {
 
@@ -16,6 +16,7 @@ void RegisterLanceMaintenance(ExtensionLoader &loader);
 void RegisterLanceMaintenanceParser(DBConfig &config);
 void RegisterLanceScan(ExtensionLoader &loader);
 void RegisterLanceSearch(ExtensionLoader &loader);
+void RegisterLanceMetadata(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 void RegisterLanceWrite(ExtensionLoader &loader);
 void RegisterLanceStorage(DBConfig &config);
@@ -27,6 +28,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Register internal scan table functions.
   RegisterLanceScan(loader);
   RegisterLanceSearch(loader);
+  RegisterLanceMetadata(loader);
   RegisterLanceWrite(loader);
   RegisterLanceMaintenance(loader);
 }

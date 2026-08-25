@@ -8,6 +8,16 @@ This integration is intentionally thin:
 - You configure credentials and object store settings using `CREATE SECRET (TYPE LANCE, ...)`.
 - The extension reads the matching secret by URI prefix (`SCOPE`) and forwards the key/value pairs to Lance as
   `storage_options`.
+- For `s3://` paths without a matching `TYPE LANCE` secret, the extension also maps DuckDB's current `s3_*` settings
+  to Lance storage options for coordinator-local execution.
+
+Distributed Vane execution rejects storage options containing credentials or tokens, including explicit
+`s3_access_key_id`, `s3_secret_access_key`, and `s3_session_token` settings. Workers must obtain credentials from a
+credential chain configured independently on every node; otherwise run the operation locally. Non-secret settings
+such as region and endpoint may be replayed only when their values contain no URI user information, query, or fragment.
+To keep Vane's generic connection snapshot credential-free, a Lance relation is not distributable while its connection
+contains explicit S3 credentials, even when that particular relation uses local storage. Use a separate credential-free
+connection for distributed Lance work.
 
 For the upstream Lance object store options and provider behavior, see https://lance.org/guide/object_store/.
 
@@ -132,6 +142,17 @@ CREATE SECRET (
   VIRTUAL_HOSTED_STYLE_REQUEST false,
   ALLOW_HTTP true
 );
+```
+
+The equivalent connection settings are useful for coordinator-local execution:
+
+```sql
+SET s3_access_key_id = 'minioadmin';
+SET s3_secret_access_key = 'minioadmin';
+SET s3_region = 'us-east-1';
+SET s3_endpoint = '127.0.0.1:9000';
+SET s3_use_ssl = false;
+SET s3_url_style = 'path';
 ```
 
 ## Google Cloud Storage (`gs://`)

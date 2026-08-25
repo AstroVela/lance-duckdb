@@ -12,8 +12,10 @@
 #include "lance_insert.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
+#include "lance_write.hpp"
 
 #include <cstdint>
+#include <limits>
 
 namespace duckdb {
 
@@ -29,6 +31,7 @@ struct LanceInsertGlobalState : public GlobalSinkState {
   const LanceTableEntry *table = nullptr;
   string display_uri;
   string open_path;
+  string cache_key;
   vector<string> option_keys;
   vector<string> option_values;
 
@@ -38,6 +41,7 @@ struct LanceInsertGlobalState : public GlobalSinkState {
   idx_t insert_count = 0;
 
   void *writer = nullptr;
+  bool writer_has_accepted_batch = false;
   ArrowSchemaWrapper schema_root;
 
   ~LanceInsertGlobalState() override {
@@ -55,14 +59,25 @@ public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
 
-  PhysicalLanceInsert(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                      LanceTableEntry &table_p, vector<string> column_names_p,
-                      vector<LogicalType> column_types_p,
-                      idx_t estimated_cardinality)
+  PhysicalLanceInsert(
+      PhysicalPlan &physical_plan, vector<LogicalType> types_p,
+      LanceTableEntry &table_p, vector<string> column_names_p,
+      vector<LogicalType> column_types_p, idx_t estimated_cardinality
+#ifdef LANCE_VANE_DISTRIBUTED
+      ,
+      unique_ptr<distributed::ExtensionWriteTaskProvider> distributed_provider_p
+#endif
+      )
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
         table(table_p), column_names(std::move(column_names_p)),
-        column_types(std::move(column_types_p)) {}
+        column_types(std::move(column_types_p))
+#ifdef LANCE_VANE_DISTRIBUTED
+        ,
+        distributed_provider(std::move(distributed_provider_p))
+#endif
+  {
+  }
 
   bool IsSink() const override { return true; }
   bool IsSource() const override { return true; }
@@ -70,7 +85,8 @@ public:
   bool SinkOrderDependent() const override { return false; }
 
   unique_ptr<GlobalSinkState>
-  GetGlobalSinkState(ClientContext &) const override {
+  GetGlobalSinkState(ClientContext &context) const override {
+    RequireLanceMutationSlot(context, table.catalog);
     return make_uniq<LanceInsertGlobalState>(table, column_names, column_types);
   }
 
@@ -87,6 +103,10 @@ public:
 
     auto &gstate = input.global_state.Cast<LanceInsertGlobalState>();
     lock_guard<mutex> guard(gstate.lock);
+    if (chunk.size() >
+        std::numeric_limits<idx_t>::max() - gstate.insert_count) {
+      throw OutOfRangeException("Lance INSERT row count overflow");
+    }
 
     if (!gstate.writer) {
       auto props = context.client.GetClientProperties();
@@ -102,11 +122,14 @@ public:
       ResolveLanceStorageOptionsForTable(
           context.client, *gstate.table, gstate.open_path, gstate.option_keys,
           gstate.option_values, gstate.display_uri);
+      gstate.cache_key =
+          LanceBuildDatasetCacheKeyForTable(context.client, *gstate.table);
 
       vector<const char *> key_ptrs;
       vector<const char *> value_ptrs;
       BuildStorageOptionPointerArrays(gstate.option_keys, gstate.option_values,
                                       key_ptrs, value_ptrs);
+      auto *session = LanceGetSessionHandle(context.client);
 
       gstate.writer = lance_open_uncommitted_writer_with_storage_options(
           gstate.open_path.c_str(), "append",
@@ -114,11 +137,12 @@ public:
           value_ptrs.empty() ? nullptr : value_ptrs.data(),
           gstate.option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
           LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
-          nullptr, LanceGetSessionHandle(context.client),
-          &gstate.schema_root.arrow_schema);
+          nullptr, nullptr, 1, session, &gstate.schema_root.arrow_schema);
       if (!gstate.writer) {
-        throw IOException("Failed to open Lance writer: " + gstate.open_path +
-                          LanceFormatErrorSuffix());
+        auto error = LanceConsumeLastErrorDetail();
+        auto message = "Failed to open Lance writer: " + gstate.display_uri +
+                       LanceFormatErrorSuffix(error);
+        throw IOException(message);
       }
     }
 
@@ -126,18 +150,30 @@ public:
         extension_type_cast;
     auto props = context.client.GetClientProperties();
 
-    ArrowArray array;
-    memset(&array, 0, sizeof(array));
-    ArrowConverter::ToArrowArray(chunk, &array, props, extension_type_cast);
+    ArrowArrayWrapper array;
+    ArrowConverter::ToArrowArray(chunk, &array.arrow_array, props,
+                                 extension_type_cast);
 
-    auto rc = lance_writer_write_batch(gstate.writer, &array);
-    if (array.release) {
-      array.release(&array);
-    }
+    auto rc = lance_writer_write_batch(gstate.writer, &array.arrow_array);
     if (rc != 0) {
-      throw IOException("Failed to write to Lance dataset" +
-                        LanceFormatErrorSuffix());
+      auto error = LanceConsumeLastErrorDetail();
+      // A batch validation failure is definitive only before this writer has
+      // accepted any earlier input. Once the background writer has observed a
+      // previous batch, closing it cannot prove that all staged files were
+      // removed.
+      auto outcome_unknown =
+          error.code != 19 || gstate.writer_has_accepted_batch;
+      auto message =
+          "Failed to write to Lance dataset" + LanceFormatErrorSuffix(error);
+      lance_close_writer(gstate.writer);
+      gstate.writer = nullptr;
+      if (outcome_unknown && error.code != 55) {
+        message += "; staged-file cleanup is unresolved; do not retry "
+                   "automatically (code=55)";
+      }
+      throw IOException(message);
     }
+    gstate.writer_has_accepted_batch = true;
     gstate.insert_count += chunk.size();
     return SinkResultType::NEED_MORE_INPUT;
   }
@@ -158,18 +194,40 @@ public:
         return SinkFinalizeType::READY;
       }
       auto rc = lance_writer_finish_uncommitted(gstate.writer, &txn);
+      LanceLastError error;
+      if (rc != 0) {
+        error = LanceConsumeLastErrorDetail();
+      }
       lance_close_writer(gstate.writer);
       gstate.writer = nullptr;
-      if (rc != 0 || !txn) {
-        throw IOException("Failed to finalize Lance append transaction" +
-                          LanceFormatErrorSuffix());
+      if (rc != 0) {
+        auto outcome_unknown = LanceMutationOutcomeUnknown(error, {24});
+        auto message = "Failed to finalize Lance append transaction" +
+                       LanceFormatErrorSuffix(error);
+        if (txn) {
+          outcome_unknown = true;
+          lance_free_transaction(txn);
+          message += "; native failure also returned an uncommitted "
+                     "transaction; cleanup is unresolved";
+        }
+        if (outcome_unknown && error.code != 55) {
+          message += "; staged-file cleanup is unresolved; do not retry "
+                     "automatically (code=55)";
+        }
+        throw IOException(message);
+      }
+      if (!txn) {
+        throw IOException(
+            "Failed to finalize Lance append transaction: native success "
+            "returned a null transaction; do not retry automatically "
+            "(code=55)");
       }
     }
 
     RegisterLancePendingAppend(
         context, table.catalog, std::move(gstate.open_path),
         std::move(gstate.option_keys), std::move(gstate.option_values),
-        LanceBuildDatasetCacheKeyForTable(context, table), txn);
+        std::move(gstate.cache_key), txn);
     return SinkFinalizeType::READY;
   }
 
@@ -200,10 +258,20 @@ public:
 
   string GetName() const override { return "LanceInsert"; }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  optional_ptr<distributed::ExtensionWriteTaskProvider>
+  GetExtensionWriteTaskProvider() override {
+    return distributed_provider.get();
+  }
+#endif
+
 private:
   LanceTableEntry &table;
   vector<string> column_names;
   vector<LogicalType> column_types;
+#ifdef LANCE_VANE_DISTRIBUTED
+  unique_ptr<distributed::ExtensionWriteTaskProvider> distributed_provider;
+#endif
 };
 
 PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
@@ -246,9 +314,33 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
     column_types.push_back(col.Type());
   }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  string distributed_target;
+  vector<string> distributed_option_keys;
+  vector<string> distributed_option_values;
+  string distributed_display_uri;
+  ResolveLanceStorageOptionsForTable(
+      context, *lance_table, distributed_target, distributed_option_keys,
+      distributed_option_values, distributed_display_uri);
+  LanceDistributedWriteSpec distributed_spec;
+  distributed_spec.target = distributed_target;
+  distributed_spec.mode = "append";
+  distributed_spec.names = column_names;
+  distributed_spec.types = column_types;
+  distributed_spec.option_keys = distributed_option_keys;
+  distributed_spec.option_values = distributed_option_values;
+  auto distributed_provider =
+      MakeLanceDistributedWriteProvider(std::move(distributed_spec));
+#endif
+
   auto &insert = planner.Make<PhysicalLanceInsert>(
       op.types, *lance_table, std::move(column_names), std::move(column_types),
-      op.estimated_cardinality);
+      op.estimated_cardinality
+#ifdef LANCE_VANE_DISTRIBUTED
+      ,
+      std::move(distributed_provider)
+#endif
+  );
   insert.children.push_back(*plan);
   return insert;
 }

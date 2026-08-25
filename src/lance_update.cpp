@@ -31,29 +31,6 @@
 
 namespace duckdb {
 
-static vector<pair<string, string>> ParseLanceMetadataRows(const char *ptr) {
-  if (!ptr) {
-    throw IOException("Failed to read Lance field metadata" +
-                      LanceFormatErrorSuffix());
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<pair<string, string>> out;
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out.emplace_back(std::move(parts[0]), std::move(parts[1]));
-  }
-  return out;
-}
-
 static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
                                         LanceTableEntry &table,
                                         const string &field_name,
@@ -67,8 +44,15 @@ static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
                       display_uri + LanceFormatErrorSuffix());
   }
 
-  auto rows = ParseLanceMetadataRows(
-      lance_dataset_list_field_metadata(dataset, field_name.c_str()));
+  vector<pair<string, string>> rows;
+  try {
+    rows = ParseLanceKeyValueRows(
+        lance_dataset_list_field_metadata(dataset, field_name.c_str()),
+        "Lance field metadata");
+  } catch (...) {
+    lance_close_dataset(dataset);
+    throw;
+  }
   lance_close_dataset(dataset);
 
   for (auto &entry : rows) {
@@ -195,6 +179,8 @@ public:
     }
     state.emitted = true;
 
+    RequireLanceMutationSlot(context.client, table.catalog);
+
     if (set_columns.size() != set_expr_irs.size()) {
       throw InternalException("Lance UPDATE has mismatched SET columns/values");
     }
@@ -205,7 +191,7 @@ public:
     string display_uri;
     ResolveLanceStorageOptionsForTable(context.client, table, open_path,
                                        option_keys, option_values, display_uri);
-
+    auto cache_key = LanceBuildDatasetCacheKeyForTable(context.client, table);
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
     BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
@@ -218,6 +204,7 @@ public:
     set_expr_ir_ptrs.reserve(set_expr_irs.size());
     set_expr_ir_lens.reserve(set_expr_irs.size());
     for (idx_t i = 0; i < set_columns.size(); i++) {
+      ValidateLanceCString(set_columns[i], "Lance UPDATE column");
       set_col_ptrs.push_back(set_columns[i].c_str());
       set_expr_ir_ptrs.push_back(
           reinterpret_cast<const uint8_t *>(set_expr_irs[i].data()));
@@ -230,23 +217,31 @@ public:
         predicate_ir.empty()
             ? nullptr
             : reinterpret_cast<const uint8_t *>(predicate_ir.data());
+    auto *session = LanceGetSessionHandle(context.client);
     auto rc = lance_overwrite_update_transaction_with_irs_and_storage_options(
         open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         predicate_ptr, predicate_ir.size(), set_col_ptrs.data(),
         set_expr_ir_ptrs.data(), set_expr_ir_lens.data(), set_columns.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-        LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context.client),
-        &txn, &rows_updated);
+        LANCE_DEFAULT_MAX_BYTES_PER_FILE, session, &txn, &rows_updated);
     if (rc != 0) {
-      throw IOException("Failed to create Lance UPDATE transaction for '" +
-                        open_path + "'" + LanceFormatErrorSuffix());
+      auto error = LanceConsumeLastErrorDetail();
+      auto outcome_unknown = LanceMutationOutcomeUnknown(error, {1, 2, 3, 28});
+      auto message = "Failed to create Lance UPDATE transaction for '" +
+                     display_uri + "'" + LanceFormatErrorSuffix(error);
+      if (outcome_unknown && error.code != 55) {
+        message += "; mutation outcome is unresolved; do not retry "
+                   "automatically (code=55)";
+      }
+      throw IOException(message);
     }
     if (!txn) {
       if (rows_updated != 0) {
         throw IOException(
-            "Failed to create Lance UPDATE transaction for '" + open_path +
-            "': null transaction returned for non-zero updated rows");
+            "Failed to create Lance UPDATE transaction for '" + display_uri +
+            "': null transaction returned for non-zero updated rows; do not "
+            "retry automatically (code=55)");
       }
       state.rows_updated = 0;
       chunk.SetCardinality(1);
@@ -255,10 +250,10 @@ public:
       return SourceResultType::FINISHED;
     }
 
-    RegisterLancePendingAppend(
-        context.client, table.catalog, std::move(open_path),
-        std::move(option_keys), std::move(option_values),
-        LanceBuildDatasetCacheKeyForTable(context.client, table), txn);
+    RegisterLancePendingAppend(context.client, table.catalog,
+                               std::move(open_path), std::move(option_keys),
+                               std::move(option_values), std::move(cache_key),
+                               txn);
 
     state.rows_updated = rows_updated;
 
@@ -316,7 +311,6 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
   if (!scan_bind) {
     throw InternalException("Lance UPDATE is missing Lance scan bind data");
   }
-
   vector<string> predicate_ir_parts;
   if (!parts.get->table_filters.filters.empty() &&
       !TryBuildLanceTableFilterIRParts(scan_bind->names, scan_bind->types,

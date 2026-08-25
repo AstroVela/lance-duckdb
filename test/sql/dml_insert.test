@@ -68,5 +68,17 @@ SELECT sum(id) FROM ns.main.lance_insert_append;
 ----
 10
 
+# The source reads its fixed bind-time version while the sink prepares a new
+# Lance MVCC transaction. The statement must not wait on repository-specific
+# coordination state.
+statement ok
+INSERT INTO ns.main.lance_insert_append
+SELECT id + 10, s FROM ns.main.lance_insert_append;
+
+query II
+SELECT count(*), sum(id) FROM ns.main.lance_insert_append;
+----
+8	60
+
 statement ok
 DETACH ns;

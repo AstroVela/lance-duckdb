@@ -1,21 +1,26 @@
-# Lance Extension
+# Lance in DuckDB and Vane
 
-The Lance extension provides support for managing Lance tables and querying them in SQL, via DuckDB.
+The Lance extension provides support for managing Lance tables and querying them
+through official DuckDB and Vane's DuckDB fork.
 
-## Installation
+The source is built in two independent ABI modes. The official DuckDB entry
+point leaves `LANCE_VANE_DISTRIBUTED` disabled and produces a normal loadable
+extension. The Vane entry point enables the distributed scan/write adapter and
+statically links Lance into an opt-in custom `vane-ai` wheel. Native objects
+from the two DuckDB environments are not interchangeable.
 
-To install and load the extension, run these commands in your DuckDB CLI:
+## Availability
 
-```sql
-INSTALL lance;
-LOAD lance;
-```
+This repository owns both products. Stock DuckDB loads an exact matching
+artifact from a pre-provisioned path. The custom Vane wheel reports Lance as
+`STATICALLY_LINKED` and loads it by name. The optional
+`lance_duckdb.load_lance_extension` helper supports both modes and never
+installs or downloads an extension. Upstream Vane does not pin Lance, and its
+default wheel does not include Lance; the custom wheel is not an official Vane
+release.
 
-> If you already have a version of the extension installed locally, run the following command to update it to the latest version:
-
-```sql
-UPDATE EXTENSIONS;
-```
+For Vane deployment and distributed execution details, see
+[Vane Integration](vane-integration.md).
 
 ## Examples
 

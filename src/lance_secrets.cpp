@@ -2,14 +2,9 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
+#include "lance_common.hpp"
 
 namespace duckdb {
-
-static bool ShouldRedactLanceStorageOption(const string &key) {
-  return StringUtil::Contains(StringUtil::Lower(key), "secret") ||
-         StringUtil::Contains(StringUtil::Lower(key), "password") ||
-         StringUtil::Contains(StringUtil::Lower(key), "token");
-}
 
 static unique_ptr<BaseSecret>
 CreateLanceSecretFromConfig(ClientContext &, CreateSecretInput &input) {
@@ -44,7 +39,7 @@ CreateLanceSecretFromConfig(ClientContext &, CreateSecretInput &input) {
   }
 
   for (auto &kv : secret->secret_map) {
-    if (ShouldRedactLanceStorageOption(kv.first)) {
+    if (LanceStorageOptionIsSensitive(kv.first)) {
       secret->redact_keys.insert(kv.first);
     }
   }
