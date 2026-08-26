@@ -1,7 +1,7 @@
 schema_version = 1
 name = "lance"
 extension_config = "extension_config_vane.cmake"
-build_extensions = ["httpfs", "parquet", "json", "icu"]
+build_extensions = ["parquet", "json", "icu"]
 native_test_selection = "test/sql/dual_build_smoke.test"
 
 [vane]

@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      DUCKDB_CI_TOOLS_VERSION: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+      DUCKDB_CI_TOOLS_VERSION: 401cc753a9251216567652ed06b456a20f74c9b0
       VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
     steps:
       - name: Checkout CI inputs
@@ -83,11 +83,11 @@ jobs:
   code-quality:
     name: C++ code quality
     needs: preflight
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@401cc753a9251216567652ed06b456a20f74c9b0
     with:
       extension_name: lance
       duckdb_version: v1.5-variegata
-      ci_tools_version: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+      ci_tools_version: 401cc753a9251216567652ed06b456a20f74c9b0
 
   rust-quality:
     name: Rust code quality

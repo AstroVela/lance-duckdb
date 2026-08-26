@@ -4,6 +4,7 @@ Cargo.lock
 
 # DuckDB extension build
 build/
+/.cache/
 configure/
 duckdb_unittest_tempdir/
 /test/bin
