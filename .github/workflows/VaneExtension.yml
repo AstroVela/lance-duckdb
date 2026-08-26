@@ -158,7 +158,7 @@ jobs:
       VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/build/vane-source/vcpkg_installed
       VANE_BUILD_JOBS: 12
       VCPKG_TARGET_TRIPLET: x64-linux
-      LANCE_DUCKDB_TEST_NON_STATIC_EXTENSION: ${{ runner.temp }}/vane-plan-transport-test-extension/loadable_extension_demo.duckdb_extension
+      LANCE_DUCKDB_TEST_NON_STATIC_EXTENSION: ${{ github.workspace }}/build/vane-plan-transport-test-extension/loadable_extension_demo.duckdb_extension
       CCACHE_DIR: ${{ github.workspace }}/.cache/vane-wheel-ccache
       CCACHE_MAXSIZE: 750M
       CCACHE_COMPILERCHECK: content
@@ -233,7 +233,7 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: vane-plan-transport-test-extension
-          path: ${{ runner.temp }}/vane-plan-transport-test-extension
+          path: ${{ github.workspace }}/build/vane-plan-transport-test-extension
 
       - name: Build and verify the static Lance wheel
         env:
