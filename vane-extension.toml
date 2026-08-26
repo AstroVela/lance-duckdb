@@ -1,0 +1,9 @@
+schema_version = 1
+name = "lance"
+extension_config = "extension_config_vane.cmake"
+build_extensions = ["httpfs", "parquet", "json", "icu"]
+native_test_selection = "test/sql/dual_build_smoke.test"
+
+[vane]
+repository = "AstroVela/vane"
+revision = "b84f025e0aeab3e46523f48ae9d233dc28d28d62"

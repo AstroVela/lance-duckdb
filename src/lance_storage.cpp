@@ -1109,9 +1109,13 @@ public:
 
   LanceDuckCatalog(AttachedDatabase &db,
                    shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
-                   shared_ptr<LanceRestNamespaceConfig> rest_ns)
+                   shared_ptr<LanceRestNamespaceConfig> rest_ns,
+                   string attach_path)
       : DuckCatalog(db), directory_ns(std::move(directory_ns)),
-        rest_ns(std::move(rest_ns)) {}
+        rest_ns(std::move(rest_ns)), attach_path(std::move(attach_path)) {}
+
+  string GetCatalogType() override { return "lance"; }
+  string GetDBPath() override { return attach_path; }
 
   using DuckCatalog::PlanUpdate;
 
@@ -1703,6 +1707,7 @@ public:
 private:
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
+  string attach_path;
 };
 
 PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
@@ -1750,8 +1755,13 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     vector<string> option_keys;
     vector<string> option_values;
     string open_root;
+#ifdef LANCE_VANE_DISTRIBUTED
+    ResolveLanceStorageOptionsForDistributedRead(context, root, open_root,
+                                                 option_keys, option_values);
+#else
     ResolveLanceStorageOptions(context, root, open_root, option_keys,
                                option_values);
+#endif
 
     string list_error;
     vector<string> discovered_tables;
@@ -1798,8 +1808,15 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   // Back the attached catalog by an in-memory DuckCatalog that lazily
   // materializes per-table entries mapping to internal scan / namespace scan,
   // scan, and supports CREATE TABLE for directory namespaces.
+  //
+  // AttachedDatabase captured the caller-visible access mode before invoking
+  // this callback. The ephemeral DuckCatalog backing store itself must always
+  // be writable: DuckDB rejects read-only in-memory storage, which is otherwise
+  // selected automatically for remote namespace paths such as s3://.
+  attach_options.access_mode = AccessMode::READ_WRITE;
   info.path = ":memory:";
-  auto catalog = make_uniq<LanceDuckCatalog>(db, directory_ns, rest_ns);
+  auto catalog = make_uniq<LanceDuckCatalog>(db, directory_ns, rest_ns,
+                                             std::move(attach_path));
   catalog->Initialize(false);
 
   auto system_transaction =

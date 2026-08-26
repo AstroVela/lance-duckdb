@@ -7,6 +7,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use datafusion::logical_expr::Expr;
+#[cfg(feature = "vane-distributed")]
+use datafusion::object_store::ObjectStoreExt;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::scalar::ScalarValue;
 use datafusion_sql::unparser::expr_to_sql;
@@ -41,7 +43,8 @@ pub struct LanceFragmentStats {
     pub fragment_id: u64,
     /// Number of rows in the fragment. `-1` means unknown.
     pub num_rows: i64,
-    /// Sum of known data file sizes in bytes. Missing/unknown sizes are treated as 0.
+    /// Sum of data file sizes in bytes. `0` is also the unknown sentinel when
+    /// any constituent file size is unavailable.
     pub bytes_on_disk: u64,
 }
 
@@ -219,10 +222,151 @@ fn open_dataset_with_storage_options_inner(
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     if !dataset.is_null() {
+        // SAFETY: dataset was allocated by Box::into_raw in an open or checkout function.
         unsafe {
             let _ = Box::from_raw(dataset as *mut DatasetHandle);
         }
     }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void) -> u64 {
+    match dataset_version_inner(dataset) {
+        Ok(version) => {
+            clear_last_error();
+            version
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            0
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+fn dataset_version_inner(dataset: *mut c_void) -> FfiResult<u64> {
+    // SAFETY: dataset_handle validates the opaque pointer before dereferencing it.
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+    Ok(handle.dataset.version_id())
+}
+
+#[cfg(feature = "vane-distributed")]
+async fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiResult<String> {
+    let manifest = dataset.manifest();
+    let location = dataset.manifest_location();
+    let mut size = location.size;
+    let mut e_tag = location.e_tag.clone();
+
+    // checkout_version may reconstruct the manifest location without its
+    // object metadata. Fill only missing fields: metadata retained by an old
+    // handle is what distinguishes it from a same-version replacement.
+    if size.is_none() || e_tag.is_none() {
+        let store = dataset.object_store(None).await.map_err(|_| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                "resolve object store for dataset snapshot identity",
+            )
+        })?;
+        let metadata = store.inner.head(&location.path).await.map_err(|_| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                "inspect manifest for dataset snapshot identity",
+            )
+        })?;
+        size.get_or_insert(metadata.size);
+        if e_tag.is_none() {
+            e_tag = metadata.e_tag;
+        }
+    }
+
+    serde_json::to_string(&(
+        manifest.version,
+        manifest.timestamp_nanos,
+        manifest.transaction_file.as_deref().unwrap_or_default(),
+        size.unwrap_or_default(),
+        e_tag.as_deref().unwrap_or_default(),
+    ))
+    .map_err(|err| {
+        FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("serialize dataset snapshot identity: {err}"),
+        )
+    })
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_generation_id(dataset: *mut c_void) -> *const c_char {
+    match dataset_generation_id_inner(dataset) {
+        Ok(identity) => {
+            clear_last_error();
+            identity.into_raw()
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+fn dataset_generation_id_inner(dataset: *mut c_void) -> FfiResult<std::ffi::CString> {
+    // SAFETY: dataset_handle validates the opaque pointer before dereferencing it.
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let identity = match runtime::block_on(dataset_snapshot_identity(&handle.dataset)) {
+        Ok(Ok(identity)) => identity,
+        Ok(Err(err)) => return Err(err),
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+    std::ffi::CString::new(format!("snapshot|{identity}")).map_err(|err| {
+        FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("dataset snapshot identity contains NUL: {err}"),
+        )
+    })
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_checkout_version(
+    dataset: *mut c_void,
+    version: u64,
+) -> *mut c_void {
+    match dataset_checkout_version_inner(dataset, version) {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+fn dataset_checkout_version_inner(dataset: *mut c_void, version: u64) -> FfiResult<DatasetHandle> {
+    // SAFETY: dataset_handle validates the opaque pointer before dereferencing it.
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+    if version == 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "dataset version must be greater than zero",
+        ));
+    }
+    let dataset = match runtime::block_on(handle.dataset.checkout_version(version)) {
+        Ok(Ok(dataset)) => dataset,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("dataset checkout version {version}: {err}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+    record_dataset_open();
+    Ok(DatasetHandle::new(Arc::new(dataset)))
 }
 
 #[no_mangle]
@@ -369,10 +513,16 @@ fn dataset_list_fragment_stats_inner(
     let mut out: Vec<LanceFragmentStats> = Vec::with_capacity(handle.dataset.fragments().len());
     for frag in handle.dataset.fragments().iter() {
         let mut bytes_on_disk = 0u64;
+        let mut all_file_sizes_known = true;
         for file in frag.files.iter() {
             if let Some(sz) = file.file_size_bytes.get() {
                 bytes_on_disk = bytes_on_disk.saturating_add(sz.get());
+            } else {
+                all_file_sizes_known = false;
             }
+        }
+        if !all_file_sizes_known {
+            bytes_on_disk = 0;
         }
         let num_rows = match frag.num_rows() {
             Some(v) => i64::try_from(v).unwrap_or(-1),

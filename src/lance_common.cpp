@@ -13,7 +13,7 @@
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-
+#include <cstdlib>
 #include <cstring>
 
 namespace duckdb {
@@ -177,6 +177,103 @@ void LanceFillStorageOptionsFromSecrets(ClientContext &context,
   }
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static bool ProcessHasLanceS3Environment() {
+  static constexpr const char *AWS_ENVIRONMENT_KEYS[] = {
+      "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY",
+      "AWS_SESSION_TOKEN",
+      "AWS_REGION",
+      "AWS_DEFAULT_REGION",
+      "AWS_ENDPOINT_URL",
+      "AWS_PROFILE",
+      "AWS_SHARED_CREDENTIALS_FILE",
+      "AWS_CONFIG_FILE",
+      "AWS_WEB_IDENTITY_TOKEN_FILE",
+      "AWS_ROLE_ARN",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+  };
+  for (auto *key : AWS_ENVIRONMENT_KEYS) {
+    auto *value = std::getenv(key);
+    if (value && value[0]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool TryGetLanceS3Setting(ClientContext &context, const string &name,
+                                 string &out_value) {
+  Value value;
+  if (!context.TryGetCurrentSetting(name, value) || value.IsNull()) {
+    return false;
+  }
+  out_value = value.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+  return !out_value.empty();
+}
+
+static void AppendLanceStorageOption(vector<string> &out_keys,
+                                     vector<string> &out_values,
+                                     const string &key, const string &value) {
+  if (value.empty()) {
+    return;
+  }
+  out_keys.push_back(key);
+  out_values.push_back(value);
+}
+
+static void
+FillLanceStorageOptionsFromDuckDBS3Settings(ClientContext &context,
+                                            vector<string> &out_keys,
+                                            vector<string> &out_values) {
+  string access_key_id;
+  string secret_access_key;
+  string session_token;
+  string region;
+  TryGetLanceS3Setting(context, "s3_access_key_id", access_key_id);
+  TryGetLanceS3Setting(context, "s3_secret_access_key", secret_access_key);
+  TryGetLanceS3Setting(context, "s3_session_token", session_token);
+  TryGetLanceS3Setting(context, "s3_region", region);
+  AppendLanceStorageOption(out_keys, out_values, "access_key_id",
+                           access_key_id);
+  AppendLanceStorageOption(out_keys, out_values, "secret_access_key",
+                           secret_access_key);
+  AppendLanceStorageOption(out_keys, out_values, "session_token",
+                           session_token);
+  AppendLanceStorageOption(out_keys, out_values, "region", region);
+
+  string endpoint;
+  if (TryGetLanceS3Setting(context, "s3_endpoint", endpoint)) {
+    Value use_ssl_value;
+    auto use_ssl = true;
+    if (context.TryGetCurrentSetting("s3_use_ssl", use_ssl_value) &&
+        !use_ssl_value.IsNull()) {
+      use_ssl =
+          use_ssl_value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+    }
+    if (endpoint.find("://") == string::npos) {
+      endpoint = string(use_ssl ? "https://" : "http://") + endpoint;
+    }
+    AppendLanceStorageOption(out_keys, out_values, "endpoint", endpoint);
+    if (StringUtil::StartsWith(StringUtil::Lower(endpoint), "http://")) {
+      AppendLanceStorageOption(out_keys, out_values, "allow_http", "true");
+    }
+  }
+
+  string url_style;
+  if (TryGetLanceS3Setting(context, "s3_url_style", url_style)) {
+    if (StringUtil::CIEquals(url_style, "path")) {
+      AppendLanceStorageOption(out_keys, out_values,
+                               "virtual_hosted_style_request", "false");
+    } else if (StringUtil::CIEquals(url_style, "vhost")) {
+      AppendLanceStorageOption(out_keys, out_values,
+                               "virtual_hosted_style_request", "true");
+    }
+  }
+}
+#endif
+
 static void FillLanceNamespaceAuthFromSecrets(ClientContext &context,
                                               const string &endpoint,
                                               string &out_bearer_token,
@@ -274,6 +371,32 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
   LanceFillStorageOptionsFromSecrets(context, out_open_path, out_keys,
                                      out_values);
 }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+void ResolveLanceStorageOptionsForDistributedRead(ClientContext &context,
+                                                  const string &path,
+                                                  string &out_open_path,
+                                                  vector<string> &out_keys,
+                                                  vector<string> &out_values) {
+  ResolveLanceStorageOptions(context, path, out_open_path, out_keys,
+                             out_values);
+  if (out_keys.empty() && StringUtil::StartsWith(out_open_path, "s3://")) {
+    string replayed_endpoint;
+    auto has_replayed_endpoint =
+        TryGetLanceS3Setting(context, "s3_endpoint", replayed_endpoint);
+    if (!has_replayed_endpoint && ProcessHasLanceS3Environment()) {
+      // The source connection can still use Lance's ordinary AWS environment
+      // resolution. Avoid replacing that provider chain with DuckDB's default,
+      // partially populated s3_* settings. Vane removes these variables from
+      // isolated workers, where the captured settings below are authoritative.
+      return;
+    }
+    // Vane scrubs inherited AWS environment variables from shared workers and
+    // replays the query session through DuckDB's s3_* settings instead.
+    FillLanceStorageOptionsFromDuckDBS3Settings(context, out_keys, out_values);
+  }
+}
+#endif
 
 void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
                                      const vector<string> &option_values,
@@ -463,8 +586,13 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
   string open_root;
   vector<string> option_keys;
   vector<string> option_values;
+#ifdef LANCE_VANE_DISTRIBUTED
+  ResolveLanceStorageOptionsForDistributedRead(context, root, open_root,
+                                               option_keys, option_values);
+#else
   ResolveLanceStorageOptions(context, root, open_root, option_keys,
                              option_values);
+#endif
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
@@ -518,12 +646,9 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
   return dataset;
 }
 
-void *LanceOpenDataset(ClientContext &context, const string &path) {
-  string open_path;
-  vector<string> option_keys;
-  vector<string> option_values;
-  ResolveLanceStorageOptions(context, path, open_path, option_keys,
-                             option_values);
+static void *OpenLanceDatasetWithStorageOptions(
+    ClientContext &context, const string &open_path,
+    const vector<string> &option_keys, const vector<string> &option_values) {
   auto *session = LanceGetSessionHandle(context);
 
   if (option_keys.empty()) {
@@ -538,6 +663,29 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
       open_path.c_str(), key_ptrs.data(), value_ptrs.data(), option_keys.size(),
       session);
 }
+
+void *LanceOpenDataset(ClientContext &context, const string &path) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptions(context, path, open_path, option_keys,
+                             option_values);
+  return OpenLanceDatasetWithStorageOptions(context, open_path, option_keys,
+                                            option_values);
+}
+
+#ifdef LANCE_VANE_DISTRIBUTED
+void *LanceOpenDatasetForDistributedScan(ClientContext &context,
+                                         const string &path) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptionsForDistributedRead(context, path, open_path,
+                                               option_keys, option_values);
+  return OpenLanceDatasetWithStorageOptions(context, open_path, option_keys,
+                                            option_values);
+}
+#endif
 
 static unordered_map<string, Value>
 BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,

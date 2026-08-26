@@ -14,6 +14,7 @@ endif
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
+-include vane-extension-ci-tools/makefiles/vane_extension.Makefile
 
 .PHONY: configure_ci
 configure_ci:

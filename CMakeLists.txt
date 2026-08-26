@@ -9,6 +9,20 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
+option(LANCE_VANE_DISTRIBUTED "Build the Vane distributed Lance scan adapter"
+       OFF)
+
+if(LANCE_VANE_DISTRIBUTED)
+  if(NOT
+     EXISTS
+     "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp"
+  )
+    message(
+      FATAL_ERROR "LANCE_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
+  endif()
+  add_definitions(-DLANCE_VANE_DISTRIBUTED)
+endif()
+
 set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
                       src/lance_search.cpp src/lance_common.cpp
                       src/lance_dataset_cache.cpp
@@ -34,6 +48,12 @@ set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+if(LANCE_VANE_DISTRIBUTED)
+  # The static archive is linked into vane._native rather than a standalone
+  # extension binary.
+  set_target_properties(${EXTENSION_NAME} PROPERTIES POSITION_INDEPENDENT_CODE
+                                                     ON)
+endif()
 
 # Platform libs required by Rust deps (e.g., TLS, timezone)
 if(APPLE)
@@ -155,6 +175,10 @@ set(RUST_FFI_DEPENDS
 set(RUST_CARGO_ENV
     CARGO_TARGET_DIR=${RUST_TARGET_DIR}
     MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+set(RUST_CARGO_FEATURE_ARGS)
+if(LANCE_VANE_DISTRIBUTED)
+  list(APPEND RUST_CARGO_FEATURE_ARGS --features vane-distributed)
+endif()
 if(DEFINED VCPKG_ROOT)
   list(APPEND RUST_CARGO_ENV VCPKG_ROOT=${VCPKG_ROOT})
 endif()
@@ -201,11 +225,15 @@ if(CMAKE_CONFIGURATION_TYPES)
     COMMAND
       ${CMAKE_COMMAND} -E env
       ${RUST_CARGO_ENV}
-      cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
+      cargo build --locked
+      ${RUST_CARGO_FEATURE_ARGS}
+      --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
     COMMAND
       ${CMAKE_COMMAND} -E env
       ${RUST_CARGO_ENV}
-      cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
+      cargo build --locked
+      ${RUST_CARGO_FEATURE_ARGS}
+      --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
     WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
     DEPENDS ${RUST_FFI_DEPENDS}
     VERBATIM)
@@ -222,7 +250,9 @@ else()
       COMMAND
         ${CMAKE_COMMAND} -E env
         ${RUST_CARGO_ENV}
-        cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
+        cargo build --locked
+        ${RUST_CARGO_FEATURE_ARGS}
+        --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
       WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
       DEPENDS ${RUST_FFI_DEPENDS}
       VERBATIM)
@@ -234,7 +264,9 @@ else()
       COMMAND
         ${CMAKE_COMMAND} -E env
         ${RUST_CARGO_ENV}
-        cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
+        cargo build --locked
+        ${RUST_CARGO_FEATURE_ARGS}
+        --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
       WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
       DEPENDS ${RUST_FFI_DEPENDS}
       VERBATIM)

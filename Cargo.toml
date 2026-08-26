@@ -8,6 +8,9 @@ name = "lance_duckdb_ffi"
 crate-type = ["staticlib"]
 path = "rust/lib.rs"
 
+[features]
+vane-distributed = []
+
 [profile.release]
 lto = "thin"
 strip = true

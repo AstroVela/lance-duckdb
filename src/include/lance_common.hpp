@@ -15,6 +15,10 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
                         DataChunk &chunk, SelectionVector &sel);
 
 void *LanceOpenDataset(ClientContext &context, const string &path);
+#ifdef LANCE_VANE_DISTRIBUTED
+void *LanceOpenDatasetForDistributedScan(ClientContext &context,
+                                         const string &path);
+#endif
 
 string LanceNormalizeS3Scheme(const string &path);
 void LanceFillStorageOptionsFromSecrets(ClientContext &context,
@@ -25,6 +29,11 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
                                 string &out_open_path,
                                 vector<string> &out_option_keys,
                                 vector<string> &out_option_values);
+#ifdef LANCE_VANE_DISTRIBUTED
+void ResolveLanceStorageOptionsForDistributedRead(
+    ClientContext &context, const string &path, string &out_open_path,
+    vector<string> &out_option_keys, vector<string> &out_option_values);
+#endif
 void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
                                      const vector<string> &option_values,
                                      vector<const char *> &out_key_ptrs,

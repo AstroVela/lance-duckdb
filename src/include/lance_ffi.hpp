@@ -80,6 +80,11 @@ void *lance_open_dataset_in_namespace_with_session(
     const char *api_key, const char *delimiter, const char *headers_tsv,
     void *session, const char **out_table_uri);
 void lance_close_dataset(void *dataset);
+#ifdef LANCE_VANE_DISTRIBUTED
+uint64_t lance_dataset_version(void *dataset);
+const char *lance_dataset_generation_id(void *dataset);
+void *lance_dataset_checkout_version(void *dataset, uint64_t version);
+#endif
 
 void *lance_get_schema(void *dataset);
 void *lance_get_schema_for_scan(void *dataset);

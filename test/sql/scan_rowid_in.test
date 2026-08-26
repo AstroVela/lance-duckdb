@@ -26,3 +26,20 @@ SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (0, 999, 4)
 ----
 Alice
 Eve
+
+# Address-style row ids encode fragment id and row offset. They are not bounded
+# by the dataset's total row count.
+statement ok
+COPY (
+  SELECT i::BIGINT AS id FROM range(6) AS source(i)
+) TO 'test/.tmp/lance_rowid_fragments.lance'
+  (FORMAT lance, mode 'overwrite', max_rows_per_file 2);
+
+query I
+SELECT id FROM 'test/.tmp/lance_rowid_fragments.lance'
+WHERE _rowid IN (8589934592, 0, 4294967297, 4294967297, 4294967395)
+----
+4
+0
+3
+3

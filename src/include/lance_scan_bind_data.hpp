@@ -30,6 +30,18 @@ struct LanceScanBindData : public TableFunctionData {
   optional_ptr<TableCatalogEntry> table_entry = nullptr;
   unique_ptr<LanceNamespaceTableConfig> namespace_query_config;
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  uint64_t dataset_version = 0;
+  string dataset_generation_id;
+  bool distributed_replayable = false;
+  bool distributed_worker = false;
+  bool distributed_splits_applied = false;
+  bool distributed_authorization_restricted = false;
+  vector<string> distributed_authorized_split_ids;
+  vector<string> distributed_authorized_split_payloads;
+  vector<uint64_t> selected_fragment_ids;
+#endif
+
   bool sampling_pushed_down = false;
   double sample_percentage = 0.0;
   int64_t sample_seed = -1;
@@ -42,6 +54,9 @@ struct LanceScanBindData : public TableFunctionData {
 
   bool UsesNamespaceQuery() const { return namespace_query_config != nullptr; }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  unique_ptr<FunctionData> Copy() const override;
+#endif
   ~LanceScanBindData() override;
 };
 

@@ -45,6 +45,7 @@ duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'
 
 - Full SQL reference: [`docs/sql.md`](./docs/sql.md)
 - Cloud storage reference: [`docs/cloud.md`](./docs/cloud.md)
+- Vane distributed scan contract: [`docs/vane_distributed_scan.md`](./docs/vane_distributed_scan.md)
 
 ### Query a Lance dataset
 
