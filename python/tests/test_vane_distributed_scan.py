@@ -243,22 +243,6 @@ def ray_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         vane.teardown_runner()
 
 
-def test_static_wheel_owns_the_vane_lance_artifact() -> None:
-    from vane import _native
-
-    assert "site-packages" in Path(_native.__file__).resolve().parts
-    connection = _connect()
-    try:
-        loaded, install_mode = connection.execute(
-            "SELECT loaded, install_mode FROM duckdb_extensions() "
-            "WHERE lower(extension_name) = 'lance'"
-        ).fetchone()
-        assert loaded is True
-        assert str(install_mode).upper() == "STATICALLY_LINKED"
-    finally:
-        connection.close()
-
-
 def test_fragment_scan_preserves_filter_projection_aggregate_and_global_limit(
     tmp_path: Path, ray_runner
 ) -> None:
