@@ -14,11 +14,12 @@ scheduling task attempts, retries, and combining downstream operators. A large
 fragment is intentionally not subdivided by this contract.
 
 Point lookups produced from `rowid` or `_rowid` predicates use take splits
-instead. Each split preserves its row ID sequence and duplicates, and duplicate
-results survive distributed execution. As with all SQL queries, final result
-order is defined only when the query has `ORDER BY`. Vane's target split-count
-hint controls how the list is divided. An empty dataset produces an explicit
-empty distributed source rather than a singleton worker task.
+instead. SQL membership candidates are normalized before planning, so repeated
+values in an `IN` predicate do not duplicate input rows. Each split preserves
+the resulting row ID sequence. As with all SQL queries, final result order is
+defined only when the query has `ORDER BY`. Vane's target split-count hint
+controls how the list is divided. An empty dataset produces an explicit empty
+distributed source rather than a singleton worker task.
 
 The worker plan contains only portable scan state:
 
@@ -46,13 +47,28 @@ operators stay owned by Vane:
 This keeps fragment parallelism without changing the SQL result. Directory
 namespace tables are supported when they resolve to a replayable physical URI.
 Relative local paths are made absolute at bind time. In a multi-host cluster,
-that absolute local path must be visible at the same location on every worker;
-otherwise use shared object storage. Process-local `memory://` datasets and
-directory namespace attachments with explicit connection options are not
-distributed. Credentials are never put in worker binds or split payloads;
-workers resolve them locally. For S3 scans, Vane replays its captured query
-session into DuckDB's `s3_*` settings, which the worker-side adapter translates
-to Lance storage options when no more-specific `TYPE LANCE` secret is present.
+that absolute local path must refer to the same manifest inode, modification
+time, and contents on every worker; otherwise use shared object storage.
+Lance `memory://` object stores do not provide a dataset that can be reopened by
+an independent scan bind, so they cannot form a replayable worker snapshot.
+Directory namespace scans remain replayable when their physical URI is
+replayable, including when the coordinator used explicit connection options.
+Credentials are never put in worker binds or split payloads. For S3 scans, Vane
+replays its captured query session into DuckDB's `s3_*` settings, which the
+worker-side adapter translates to Lance storage options. Credentials may also
+be provisioned independently in every worker environment. Static access-key
+settings must describe a complete credential tuple: explicitly set
+`s3_session_token` to an empty string when the credentials do not use a session
+token, so an inherited process token cannot be paired with them. A temporary
+`TYPE LANCE` secret created only on the coordinator remains valid for local
+queries, but Vane does not replay that secret catalog entry to workers.
+Planning a distributed scan that matches such a secret therefore fails early
+with an actionable capability error.
+
+The Vane build disables Lance aggregate, limit/offset, and sampling pushdown at
+registration time, including for single-node queries made with that wheel.
+Vane owns those global operators so a plan cannot apply them independently in
+each fragment split. The official DuckDB build retains these pushdowns.
 
 ## Boundary
 

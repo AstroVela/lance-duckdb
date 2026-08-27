@@ -43,4 +43,3 @@ if(DEFINED ENV{VANE_VCPKG_INSTALLED_DIR}
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/extension_config.cmake)
-unset(LANCE_VANE_EXTENSION_CONFIG_VANE)

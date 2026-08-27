@@ -1,8 +1,5 @@
 #include "lance_common.hpp"
 
-#include "lance_ffi.hpp"
-#include "lance_session_state.hpp"
-#include "lance_table_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -13,7 +10,12 @@
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "lance_ffi.hpp"
+#include "lance_session_state.hpp"
+#include "lance_table_entry.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
 #include <cstdlib>
+#endif
 #include <cstring>
 
 namespace duckdb {
@@ -204,13 +206,72 @@ static bool ProcessHasLanceS3Environment() {
 }
 
 static bool TryGetLanceS3Setting(ClientContext &context, const string &name,
-                                 string &out_value) {
+                                 string &out_value,
+                                 SettingScope *out_scope = nullptr) {
   Value value;
-  if (!context.TryGetCurrentSetting(name, value) || value.IsNull()) {
+  auto lookup_result = context.TryGetCurrentSetting(name, value);
+  if (!lookup_result || value.IsNull()) {
     return false;
   }
   out_value = value.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
-  return !out_value.empty();
+  if (out_value.empty()) {
+    return false;
+  }
+  if (out_scope) {
+    *out_scope = lookup_result.GetScope();
+  }
+  return true;
+}
+
+static string LanceS3EnvironmentValue(const char *name) {
+  auto *value = std::getenv(name);
+  return value ? string(value) : string();
+}
+
+static bool LanceS3SettingsOverrideProcessEnvironment(ClientContext &context) {
+  string endpoint;
+  if (TryGetLanceS3Setting(context, "s3_endpoint", endpoint)) {
+    return true;
+  }
+
+  string access_key;
+  string secret_key;
+  auto has_access_key =
+      TryGetLanceS3Setting(context, "s3_access_key_id", access_key);
+  auto has_secret_key =
+      TryGetLanceS3Setting(context, "s3_secret_access_key", secret_key);
+  if (has_access_key && has_secret_key &&
+      (access_key != LanceS3EnvironmentValue("AWS_ACCESS_KEY_ID") ||
+       secret_key != LanceS3EnvironmentValue("AWS_SECRET_ACCESS_KEY"))) {
+    return true;
+  }
+
+  string session_token;
+  if (TryGetLanceS3Setting(context, "s3_session_token", session_token) &&
+      session_token != LanceS3EnvironmentValue("AWS_SESSION_TOKEN")) {
+    return true;
+  }
+
+  string region;
+  if (TryGetLanceS3Setting(context, "s3_region", region)) {
+    auto environment_region = LanceS3EnvironmentValue("AWS_REGION");
+    if (environment_region.empty()) {
+      environment_region = LanceS3EnvironmentValue("AWS_DEFAULT_REGION");
+    }
+    if (region != environment_region) {
+      return true;
+    }
+  }
+
+  string url_style;
+  if (TryGetLanceS3Setting(context, "s3_url_style", url_style) &&
+      !StringUtil::CIEquals(url_style, "vhost")) {
+    return true;
+  }
+
+  string use_ssl;
+  return TryGetLanceS3Setting(context, "s3_use_ssl", use_ssl) &&
+         !StringUtil::CIEquals(use_ssl, "true");
 }
 
 static void AppendLanceStorageOption(vector<string> &out_keys,
@@ -223,6 +284,73 @@ static void AppendLanceStorageOption(vector<string> &out_keys,
   out_values.push_back(value);
 }
 
+static bool IsLanceS3StorageOptionAlias(const string &key) {
+  return StringUtil::CIEquals(key, "access_key_id") ||
+         StringUtil::CIEquals(key, "secret_access_key") ||
+         StringUtil::CIEquals(key, "session_token") ||
+         StringUtil::CIEquals(key, "region") ||
+         StringUtil::CIEquals(key, "endpoint") ||
+         StringUtil::CIEquals(key, "virtual_hosted_style_request");
+}
+
+static string CanonicalLanceS3StorageOptionKey(const string &key) {
+  if (StringUtil::CIEquals(key, "access_key_id") ||
+      StringUtil::CIEquals(key, "aws_access_key_id")) {
+    return "aws_access_key_id";
+  }
+  if (StringUtil::CIEquals(key, "secret_access_key") ||
+      StringUtil::CIEquals(key, "aws_secret_access_key")) {
+    return "aws_secret_access_key";
+  }
+  if (StringUtil::CIEquals(key, "session_token") ||
+      StringUtil::CIEquals(key, "aws_session_token")) {
+    return "aws_session_token";
+  }
+  if (StringUtil::CIEquals(key, "region") ||
+      StringUtil::CIEquals(key, "aws_region")) {
+    return "aws_region";
+  }
+  if (StringUtil::CIEquals(key, "endpoint") ||
+      StringUtil::CIEquals(key, "aws_endpoint")) {
+    return "aws_endpoint";
+  }
+  if (StringUtil::CIEquals(key, "virtual_hosted_style_request") ||
+      StringUtil::CIEquals(key, "aws_virtual_hosted_style_request")) {
+    return "aws_virtual_hosted_style_request";
+  }
+  return key;
+}
+
+static void CanonicalizeLanceS3StorageOptions(vector<string> &out_keys,
+                                              vector<string> &out_values) {
+  vector<string> normalized_keys;
+  vector<string> normalized_values;
+  normalized_keys.reserve(out_keys.size());
+  normalized_values.reserve(out_values.size());
+
+  for (idx_t i = 0; i < out_keys.size(); i++) {
+    auto canonical_key = CanonicalLanceS3StorageOptionKey(out_keys[i]);
+    if (IsLanceS3StorageOptionAlias(out_keys[i])) {
+      auto has_explicit_canonical = false;
+      for (auto &candidate : out_keys) {
+        if (!IsLanceS3StorageOptionAlias(candidate) &&
+            StringUtil::CIEquals(candidate, canonical_key)) {
+          has_explicit_canonical = true;
+          break;
+        }
+      }
+      if (has_explicit_canonical) {
+        continue;
+      }
+    }
+    normalized_keys.push_back(std::move(canonical_key));
+    normalized_values.push_back(std::move(out_values[i]));
+  }
+
+  out_keys = std::move(normalized_keys);
+  out_values = std::move(normalized_values);
+}
+
 static void
 FillLanceStorageOptionsFromDuckDBS3Settings(ClientContext &context,
                                             vector<string> &out_keys,
@@ -231,17 +359,45 @@ FillLanceStorageOptionsFromDuckDBS3Settings(ClientContext &context,
   string secret_access_key;
   string session_token;
   string region;
-  TryGetLanceS3Setting(context, "s3_access_key_id", access_key_id);
-  TryGetLanceS3Setting(context, "s3_secret_access_key", secret_access_key);
-  TryGetLanceS3Setting(context, "s3_session_token", session_token);
+  auto access_key_scope = SettingScope::INVALID;
+  auto secret_key_scope = SettingScope::INVALID;
+  auto session_token_scope = SettingScope::INVALID;
+  auto has_access_key = TryGetLanceS3Setting(context, "s3_access_key_id",
+                                             access_key_id, &access_key_scope);
+  auto has_secret_key = TryGetLanceS3Setting(
+      context, "s3_secret_access_key", secret_access_key, &secret_key_scope);
+  auto has_session_token = TryGetLanceS3Setting(
+      context, "s3_session_token", session_token, &session_token_scope);
   TryGetLanceS3Setting(context, "s3_region", region);
-  AppendLanceStorageOption(out_keys, out_values, "access_key_id",
+  AppendLanceStorageOption(out_keys, out_values, "aws_access_key_id",
                            access_key_id);
-  AppendLanceStorageOption(out_keys, out_values, "secret_access_key",
+  AppendLanceStorageOption(out_keys, out_values, "aws_secret_access_key",
                            secret_access_key);
-  AppendLanceStorageOption(out_keys, out_values, "session_token",
-                           session_token);
-  AppendLanceStorageOption(out_keys, out_values, "region", region);
+  // DuckDB exposes AWS environment variables as GLOBAL settings. Do not merge
+  // an inherited session token into a connection-local static credential pair.
+  // Vane session replay can promote those values to LOCAL on a worker, so also
+  // recognize the inherited token by value when the static pair overrides the
+  // process credentials. A genuinely explicit token is still forwarded.
+  auto process_access_key = LanceS3EnvironmentValue("AWS_ACCESS_KEY_ID");
+  auto process_secret_key = LanceS3EnvironmentValue("AWS_SECRET_ACCESS_KEY");
+  auto process_session_token = LanceS3EnvironmentValue("AWS_SESSION_TOKEN");
+  auto static_credentials_override_process_environment =
+      has_access_key && has_secret_key &&
+      (access_key_id != process_access_key ||
+       secret_access_key != process_secret_key);
+  auto token_belongs_to_process_environment =
+      has_access_key && has_secret_key && has_session_token &&
+      ((access_key_scope == SettingScope::LOCAL &&
+        secret_key_scope == SettingScope::LOCAL &&
+        session_token_scope == SettingScope::GLOBAL) ||
+       (static_credentials_override_process_environment &&
+        !process_session_token.empty() &&
+        session_token == process_session_token));
+  if (!token_belongs_to_process_environment) {
+    AppendLanceStorageOption(out_keys, out_values, "aws_session_token",
+                             session_token);
+  }
+  AppendLanceStorageOption(out_keys, out_values, "aws_region", region);
 
   string endpoint;
   if (TryGetLanceS3Setting(context, "s3_endpoint", endpoint)) {
@@ -255,7 +411,7 @@ FillLanceStorageOptionsFromDuckDBS3Settings(ClientContext &context,
     if (endpoint.find("://") == string::npos) {
       endpoint = string(use_ssl ? "https://" : "http://") + endpoint;
     }
-    AppendLanceStorageOption(out_keys, out_values, "endpoint", endpoint);
+    AppendLanceStorageOption(out_keys, out_values, "aws_endpoint", endpoint);
     if (StringUtil::StartsWith(StringUtil::Lower(endpoint), "http://")) {
       AppendLanceStorageOption(out_keys, out_values, "allow_http", "true");
     }
@@ -265,10 +421,10 @@ FillLanceStorageOptionsFromDuckDBS3Settings(ClientContext &context,
   if (TryGetLanceS3Setting(context, "s3_url_style", url_style)) {
     if (StringUtil::CIEquals(url_style, "path")) {
       AppendLanceStorageOption(out_keys, out_values,
-                               "virtual_hosted_style_request", "false");
+                               "aws_virtual_hosted_style_request", "false");
     } else if (StringUtil::CIEquals(url_style, "vhost")) {
       AppendLanceStorageOption(out_keys, out_values,
-                               "virtual_hosted_style_request", "true");
+                               "aws_virtual_hosted_style_request", "true");
     }
   }
 }
@@ -373,6 +529,33 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
 }
 
 #ifdef LANCE_VANE_DISTRIBUTED
+bool LanceHasMatchingStorageSecret(ClientContext &context, const string &path) {
+  auto normalized_path = LanceNormalizeS3Scheme(path);
+  auto &secret_manager = SecretManager::Get(context);
+  auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+  auto secret_match =
+      secret_manager.LookupSecret(transaction, normalized_path, "lance");
+  if (!secret_match.HasMatch() || !secret_match.secret_entry ||
+      !secret_match.secret_entry->secret) {
+    return false;
+  }
+
+  auto *kv_secret = dynamic_cast<const KeyValueSecret *>(
+      secret_match.secret_entry->secret.get());
+  if (!kv_secret) {
+    return false;
+  }
+  for (auto &entry : kv_secret->secret_map) {
+    // Match the option-presence rule used by
+    // LanceFillStorageOptionsFromSecrets. Do not stringify secret values merely
+    // to decide distributed eligibility.
+    if (!entry.second.IsNull()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void ResolveLanceStorageOptionsForDistributedRead(ClientContext &context,
                                                   const string &path,
                                                   string &out_open_path,
@@ -380,11 +563,13 @@ void ResolveLanceStorageOptionsForDistributedRead(ClientContext &context,
                                                   vector<string> &out_values) {
   ResolveLanceStorageOptions(context, path, out_open_path, out_keys,
                              out_values);
-  if (out_keys.empty() && StringUtil::StartsWith(out_open_path, "s3://")) {
-    string replayed_endpoint;
-    auto has_replayed_endpoint =
-        TryGetLanceS3Setting(context, "s3_endpoint", replayed_endpoint);
-    if (!has_replayed_endpoint && ProcessHasLanceS3Environment()) {
+  if (!StringUtil::StartsWith(out_open_path, "s3://")) {
+    return;
+  }
+  CanonicalizeLanceS3StorageOptions(out_keys, out_values);
+  if (out_keys.empty()) {
+    if (ProcessHasLanceS3Environment() &&
+        !LanceS3SettingsOverrideProcessEnvironment(context)) {
       // The source connection can still use Lance's ordinary AWS environment
       // resolution. Avoid replacing that provider chain with DuckDB's default,
       // partially populated s3_* settings. Vane removes these variables from
@@ -646,9 +831,12 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
   return dataset;
 }
 
-static void *OpenLanceDatasetWithStorageOptions(
-    ClientContext &context, const string &open_path,
-    const vector<string> &option_keys, const vector<string> &option_values) {
+void *LanceOpenDataset(ClientContext &context, const string &path) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptions(context, path, open_path, option_keys,
+                             option_values);
   auto *session = LanceGetSessionHandle(context);
 
   if (option_keys.empty()) {
@@ -664,16 +852,6 @@ static void *OpenLanceDatasetWithStorageOptions(
       session);
 }
 
-void *LanceOpenDataset(ClientContext &context, const string &path) {
-  string open_path;
-  vector<string> option_keys;
-  vector<string> option_values;
-  ResolveLanceStorageOptions(context, path, open_path, option_keys,
-                             option_values);
-  return OpenLanceDatasetWithStorageOptions(context, open_path, option_keys,
-                                            option_values);
-}
-
 #ifdef LANCE_VANE_DISTRIBUTED
 void *LanceOpenDatasetForDistributedScan(ClientContext &context,
                                          const string &path) {
@@ -682,8 +860,19 @@ void *LanceOpenDatasetForDistributedScan(ClientContext &context,
   vector<string> option_values;
   ResolveLanceStorageOptionsForDistributedRead(context, path, open_path,
                                                option_keys, option_values);
-  return OpenLanceDatasetWithStorageOptions(context, open_path, option_keys,
-                                            option_values);
+  auto *session = LanceGetSessionHandle(context);
+
+  if (option_keys.empty()) {
+    return lance_open_dataset_with_session(open_path.c_str(), session);
+  }
+
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
+  return lance_open_dataset_with_storage_options_and_session(
+      open_path.c_str(), key_ptrs.data(), value_ptrs.data(), option_keys.size(),
+      session);
 }
 #endif
 

@@ -14,6 +14,8 @@ use crate::runtime;
 
 use super::session::record_dataset_open;
 use super::types::DatasetHandle;
+#[cfg(feature = "vane-distributed")]
+use super::util::with_explicit_aws_credentials;
 use super::util::{
     cstr_to_str, optional_session_handle, slice_from_ptr, to_c_string, FfiError, FfiResult,
 };
@@ -151,6 +153,10 @@ fn open_dataset_in_dir_namespace_inner(
                         format!("dir namespace describe '{root}/{table_name}': {err}"),
                     )
                 })?;
+        #[cfg(feature = "vane-distributed")]
+        {
+            builder = with_explicit_aws_credentials(builder, &storage_options);
+        }
         // Forward the caller's storage_options to the dataset open path.
         //
         // `DirectoryNamespace::describe_table` returns `storage_options: None`

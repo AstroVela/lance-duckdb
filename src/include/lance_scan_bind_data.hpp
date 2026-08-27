@@ -33,7 +33,9 @@ struct LanceScanBindData : public TableFunctionData {
 #ifdef LANCE_VANE_DISTRIBUTED
   uint64_t dataset_version = 0;
   string dataset_generation_id;
+  string distributed_scan_token;
   bool distributed_replayable = false;
+  bool distributed_requires_coordinator_secret = false;
   bool distributed_worker = false;
   bool distributed_splits_applied = false;
   bool distributed_authorization_restricted = false;

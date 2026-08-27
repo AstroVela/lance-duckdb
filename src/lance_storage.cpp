@@ -36,11 +36,11 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
@@ -1107,6 +1107,7 @@ public:
   using DuckCatalog::PlanDelete;
   using DuckCatalog::PlanMergeInto;
 
+#ifdef LANCE_VANE_DISTRIBUTED
   LanceDuckCatalog(AttachedDatabase &db,
                    shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
                    shared_ptr<LanceRestNamespaceConfig> rest_ns,
@@ -1116,6 +1117,13 @@ public:
 
   string GetCatalogType() override { return "lance"; }
   string GetDBPath() override { return attach_path; }
+#else
+  LanceDuckCatalog(AttachedDatabase &db,
+                   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
+                   shared_ptr<LanceRestNamespaceConfig> rest_ns)
+      : DuckCatalog(db), directory_ns(std::move(directory_ns)),
+        rest_ns(std::move(rest_ns)) {}
+#endif
 
   using DuckCatalog::PlanUpdate;
 
@@ -1707,7 +1715,9 @@ public:
 private:
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
+#ifdef LANCE_VANE_DISTRIBUTED
   string attach_path;
+#endif
 };
 
 PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
@@ -1805,10 +1815,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     rest_ns->headers_tsv = headers_tsv;
   }
 
-  // Back the attached catalog by an in-memory DuckCatalog that lazily
-  // materializes per-table entries mapping to internal scan / namespace scan,
-  // scan, and supports CREATE TABLE for directory namespaces.
-  //
+#ifdef LANCE_VANE_DISTRIBUTED
   // AttachedDatabase captured the caller-visible access mode before invoking
   // this callback. The ephemeral DuckCatalog backing store itself must always
   // be writable: DuckDB rejects read-only in-memory storage, which is otherwise
@@ -1817,6 +1824,13 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   info.path = ":memory:";
   auto catalog = make_uniq<LanceDuckCatalog>(db, directory_ns, rest_ns,
                                              std::move(attach_path));
+#else
+  // Back the attached catalog by an in-memory DuckCatalog that lazily
+  // materializes per-table entries mapping to internal scan / namespace scan,
+  // scan, and supports CREATE TABLE for directory namespaces.
+  info.path = ":memory:";
+  auto catalog = make_uniq<LanceDuckCatalog>(db, directory_ns, rest_ns);
+#endif
   catalog->Initialize(false);
 
   auto system_transaction =

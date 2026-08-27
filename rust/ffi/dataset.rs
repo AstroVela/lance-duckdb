@@ -25,6 +25,8 @@ use crate::runtime;
 use super::session::record_dataset_open;
 use super::types::DatasetHandle;
 use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
+#[cfg(feature = "vane-distributed")]
+use super::util::with_explicit_aws_credentials;
 use super::util::{
     cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
     FfiResult,
@@ -43,8 +45,7 @@ pub struct LanceFragmentStats {
     pub fragment_id: u64,
     /// Number of rows in the fragment. `-1` means unknown.
     pub num_rows: i64,
-    /// Sum of data file sizes in bytes. `0` is also the unknown sentinel when
-    /// any constituent file size is unavailable.
+    /// Sum of known data file sizes in bytes. Missing/unknown sizes are treated as 0.
     pub bytes_on_disk: u64,
 }
 
@@ -199,6 +200,14 @@ fn open_dataset_with_storage_options_inner(
     }
 
     let dataset = match runtime::block_on(async {
+        #[cfg(feature = "vane-distributed")]
+        let mut builder = DatasetBuilder::from_uri(path_str);
+        #[cfg(feature = "vane-distributed")]
+        {
+            builder = with_explicit_aws_credentials(builder, &storage_options);
+            builder = builder.with_storage_options(storage_options);
+        }
+        #[cfg(not(feature = "vane-distributed"))]
         let mut builder = DatasetBuilder::from_uri(path_str).with_storage_options(storage_options);
         if let Some(session) = session {
             builder = builder.with_session(session);
@@ -222,7 +231,6 @@ fn open_dataset_with_storage_options_inner(
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     if !dataset.is_null() {
-        // SAFETY: dataset was allocated by Box::into_raw in an open or checkout function.
         unsafe {
             let _ = Box::from_raw(dataset as *mut DatasetHandle);
         }
@@ -515,10 +523,13 @@ fn dataset_list_fragment_stats_inner(
         let mut bytes_on_disk = 0u64;
         let mut all_file_sizes_known = true;
         for file in frag.files.iter() {
-            if let Some(sz) = file.file_size_bytes.get() {
-                bytes_on_disk = bytes_on_disk.saturating_add(sz.get());
-            } else {
-                all_file_sizes_known = false;
+            match file.file_size_bytes.get() {
+                Some(size) => {
+                    bytes_on_disk = bytes_on_disk.saturating_add(size.get());
+                }
+                None => {
+                    all_file_sizes_known = false;
+                }
             }
         }
         if !all_file_sizes_known {

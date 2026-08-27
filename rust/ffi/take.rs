@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void};
 use std::ptr;
+use std::sync::Arc;
 
 use lance::dataset::ProjectionRequest;
+use lance_core::utils::deletion::DeletionVector;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
@@ -83,29 +85,41 @@ fn create_dataset_take_stream_inner(
     let row_ids = if !filter_out_of_range || row_ids.is_empty() {
         row_ids
     } else if handle.dataset.manifest.uses_stable_row_ids() {
-        // Lance resolves stable row IDs through its row ID index and omits IDs
-        // that are not present in the selected snapshot.
-        row_ids
+        // Stable row IDs are monotonically allocated. Lance's row ID index
+        // filters IDs that have been deleted, while next_row_id is the exact
+        // upper bound for IDs that could exist in this snapshot.
+        let max_row_id = handle.dataset.manifest.next_row_id;
+        if row_ids.iter().all(|id| *id < max_row_id) {
+            row_ids
+        } else {
+            row_ids_filtered = row_ids
+                .iter()
+                .copied()
+                .filter(|id| *id < max_row_id)
+                .collect::<Vec<_>>();
+            row_ids_filtered.as_slice()
+        }
     } else {
         // Address-style row IDs encode (fragment_id, row_offset), so a total
-        // dataset row count is not a valid upper bound once there is more than
-        // one fragment. Resolve physical lengths only for referenced fragments
-        // so legacy manifests without cached row counts retain the same
-        // missing-ID behavior without scanning the whole dataset.
-        let fragment_rows = match runtime::block_on(async {
-            let mut rows = HashMap::new();
+        // dataset row count is not a valid upper bound. Resolve only the
+        // referenced fragments and reject missing, out-of-range, and deleted
+        // addresses before calling Lance's lower-level take primitive.
+        let fragment_state = match runtime::block_on(async {
+            let mut state = HashMap::new();
             let fragment_ids = row_ids.iter().map(|id| *id >> 32).collect::<HashSet<_>>();
             for fragment_id in fragment_ids {
                 let Ok(fragment_idx) = usize::try_from(fragment_id) else {
                     continue;
                 };
                 if let Some(fragment) = handle.dataset.get_fragment(fragment_idx) {
-                    rows.insert(fragment_id, fragment.physical_rows().await? as u64);
+                    let physical_rows = fragment.physical_rows().await? as u64;
+                    let deletions = fragment.get_deletion_vector().await?;
+                    state.insert(fragment_id, (physical_rows, deletions));
                 }
             }
-            Ok::<HashMap<u64, u64>, lance::Error>(rows)
+            Ok::<HashMap<u64, (u64, Option<Arc<DeletionVector>>)>, lance::Error>(state)
         }) {
-            Ok(Ok(rows)) => rows,
+            Ok(Ok(state)) => state,
             Ok(Err(err)) => {
                 return Err(FfiError::new(
                     ErrorCode::DatasetTake,
@@ -114,18 +128,28 @@ fn create_dataset_take_stream_inner(
             }
             Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         };
-        row_ids_filtered = row_ids
-            .iter()
-            .copied()
-            .filter(|id| {
-                let fragment_id = *id >> 32;
-                let row_offset = *id & u32::MAX as u64;
-                fragment_rows
-                    .get(&fragment_id)
-                    .is_some_and(|physical_rows| row_offset < *physical_rows)
-            })
-            .collect::<Vec<_>>();
-        row_ids_filtered.as_slice()
+        let is_live_address = |id: &u64| {
+            let fragment_id = *id >> 32;
+            let row_offset = *id as u32;
+            fragment_state
+                .get(&fragment_id)
+                .is_some_and(|(physical_rows, deletions)| {
+                    u64::from(row_offset) < *physical_rows
+                        && !deletions
+                            .as_ref()
+                            .is_some_and(|deletion_vector| deletion_vector.contains(row_offset))
+                })
+        };
+        if row_ids.iter().all(is_live_address) {
+            row_ids
+        } else {
+            row_ids_filtered = row_ids
+                .iter()
+                .copied()
+                .filter(is_live_address)
+                .collect::<Vec<_>>();
+            row_ids_filtered.as_slice()
+        }
     };
 
     let projection_cols = unsafe { optional_cstr_array(columns, columns_len, "columns")? };

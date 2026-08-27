@@ -147,53 +147,10 @@ def run_command(cmd: Sequence[str], *, cwd: Path) -> None:
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
-def locked_lance_versions(repo_root: Path) -> dict[str, str]:
-    versions: dict[str, set[str]] = {crate_name: set() for crate_name in LANCE_CRATES}
-    current_name: str | None = None
-    for line in (repo_root / "Cargo.lock").read_text(encoding="utf-8").splitlines():
-        if line == "[[package]]":
-            current_name = None
-            continue
-        name_match = re.fullmatch(r'name = "([^"]+)"', line)
-        if name_match:
-            current_name = name_match.group(1)
-            continue
-        version_match = re.fullmatch(r'version = "([^"]+)"', line)
-        if version_match and current_name in versions:
-            versions[current_name].add(version_match.group(1))
-
-    ambiguous = {
-        crate_name: sorted(crate_versions)
-        for crate_name, crate_versions in versions.items()
-        if len(crate_versions) != 1
-    }
-    if ambiguous:
-        raise RuntimeError(f"Could not resolve unique Lance lock versions: {ambiguous}")
-    return {
-        crate_name: crate_versions.pop()
-        for crate_name, crate_versions in versions.items()
-    }
-
-
 def update_cargo_lock(repo_root: Path, version: str) -> None:
-    # Lance crates use exact versions for their internal dependencies. Update the
-    # directly declared crates as one transaction, then pin that resolved family
-    # to the requested patch release. Including the currently locked versions in
-    # the second command avoids an intermediate exact-version conflict.
-    run_command(["cargo", "update", *LANCE_CRATES], cwd=repo_root)
-    resolved = locked_lance_versions(repo_root)
-    if any(crate_version != version for crate_version in resolved.values()):
-        precise_specs = [
-            f"{crate_name}@{resolved[crate_name]}" for crate_name in LANCE_CRATES
-        ]
+    for crate_name in LANCE_CRATES:
         run_command(
-            ["cargo", "update", *precise_specs, "--precise", version], cwd=repo_root
-        )
-
-    final = locked_lance_versions(repo_root)
-    if any(crate_version != version for crate_version in final.values()):
-        raise RuntimeError(
-            f"Cargo.lock did not resolve all direct Lance crates to {version}: {final}"
+            ["cargo", "update", "-p", crate_name, "--precise", version], cwd=repo_root
         )
 
 

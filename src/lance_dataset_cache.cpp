@@ -120,8 +120,13 @@ string LanceBuildPathDatasetCacheKey(ClientContext &context,
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;
+#ifdef LANCE_VANE_DISTRIBUTED
+  ResolveLanceStorageOptionsForDistributedRead(context, path, open_path,
+                                               option_keys, option_values);
+#else
   ResolveLanceStorageOptions(context, path, open_path, option_keys,
                              option_values);
+#endif
   return LanceBuildResolvedPathDatasetCacheKey(open_path, option_keys,
                                                option_values);
 }
@@ -256,8 +261,13 @@ LanceGetOrOpenDatasetEntry(ClientContext &context, const string &path,
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;
+#ifdef LANCE_VANE_DISTRIBUTED
+  ResolveLanceStorageOptionsForDistributedRead(context, path, open_path,
+                                               option_keys, option_values);
+#else
   ResolveLanceStorageOptions(context, path, open_path, option_keys,
                              option_values);
+#endif
   auto cache_key = LanceBuildResolvedPathDatasetCacheKey(open_path, option_keys,
                                                          option_values);
 

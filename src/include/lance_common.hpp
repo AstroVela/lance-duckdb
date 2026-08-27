@@ -33,6 +33,7 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
 void ResolveLanceStorageOptionsForDistributedRead(
     ClientContext &context, const string &path, string &out_open_path,
     vector<string> &out_option_keys, vector<string> &out_option_values);
+bool LanceHasMatchingStorageSecret(ClientContext &context, const string &path);
 #endif
 void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
                                      const vector<string> &option_values,

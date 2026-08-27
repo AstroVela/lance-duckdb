@@ -61,8 +61,8 @@ GEN=ninja make clean
 GEN=ninja make clean_all
 
 # Rust-only checks (without a full DuckDB/CMake build)
-cargo check --manifest-path Cargo.toml
-cargo clippy --manifest-path Cargo.toml --all-targets
+cargo check --locked --manifest-path Cargo.toml
+cargo clippy --locked --manifest-path Cargo.toml --all-targets
 ```
 
 ### Formatting
@@ -141,7 +141,7 @@ Tests use DuckDB's `sqllogictest` format in `test/sql/`. S3/MinIO tests (`s3_*.t
 
 - **Extension loading**: Local builds are unsigned. Always use `duckdb -unsigned` when loading the extension manually.
 - **Debug vs release**: `D_ASSERT` checks are stripped in release builds. A test that passes in one configuration but fails in the other usually indicates an assertion violation or uninitialized-variable issue.
-- **Rust build diagnostics**: When Cargo fails inside the CMake build, error output is hard to read. Run `cargo check --manifest-path Cargo.toml` in isolation for clearer diagnostics.
+- **Rust build diagnostics**: When Cargo fails inside the CMake build, error output is hard to read. Run `cargo check --locked --manifest-path Cargo.toml` in isolation for clearer diagnostics.
 
 ## Implementation Guidelines
 

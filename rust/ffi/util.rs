@@ -4,7 +4,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
+#[cfg(feature = "vane-distributed")]
+use datafusion::object_store::{aws::AwsCredential, StaticCredentialProvider};
 use datafusion_expr::Expr;
+#[cfg(feature = "vane-distributed")]
+use lance::dataset::builder::DatasetBuilder;
 use lance::session::Session;
 use lance_core::datatypes::Schema as LanceSchema;
 
@@ -35,6 +39,37 @@ pub(crate) fn to_c_string(s: impl AsRef<str>) -> CString {
         Err(_) => CString::new(s.as_ref().replace('\0', "\\0"))
             .unwrap_or_else(|_| CString::new("invalid string").unwrap()),
     }
+}
+
+#[cfg(feature = "vane-distributed")]
+pub(crate) fn with_explicit_aws_credentials(
+    builder: DatasetBuilder,
+    storage_options: &std::collections::HashMap<String, String>,
+) -> DatasetBuilder {
+    let access_key_id = storage_options
+        .get("aws_access_key_id")
+        .or_else(|| storage_options.get("access_key_id"));
+    let secret_access_key = storage_options
+        .get("aws_secret_access_key")
+        .or_else(|| storage_options.get("secret_access_key"));
+    let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) else {
+        return builder;
+    };
+    if access_key_id.is_empty() || secret_access_key.is_empty() {
+        return builder;
+    }
+
+    let token = storage_options
+        .get("aws_session_token")
+        .or_else(|| storage_options.get("session_token"))
+        .filter(|value| !value.is_empty())
+        .cloned();
+    let credentials = AwsCredential {
+        key_id: access_key_id.clone(),
+        secret_key: secret_access_key.clone(),
+        token,
+    };
+    builder.with_aws_credentials_provider(Arc::new(StaticCredentialProvider::new(credentials)))
 }
 
 pub(crate) fn canonicalize_lance_field_path(

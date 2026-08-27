@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      DUCKDB_CI_TOOLS_VERSION: 401cc753a9251216567652ed06b456a20f74c9b0
+      DUCKDB_CI_TOOLS_VERSION: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
       VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
     steps:
       - name: Checkout CI inputs
@@ -36,7 +36,6 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json
           import re
           import tomllib
           from pathlib import Path
@@ -58,12 +57,7 @@ jobs:
               if not isinstance(value, str) or not Path(value).is_file():
                   raise SystemExit(f"{key} must identify a repository file")
 
-          vcpkg = json.loads(Path("vcpkg.json").read_text())
-          baseline = vcpkg.get("builtin-baseline")
-          if not isinstance(baseline, str) or not full_sha.fullmatch(baseline):
-              raise SystemExit("vcpkg.json builtin-baseline must be a full SHA")
           print(f"Vane revision: {revision}")
-          print(f"vcpkg baseline: {baseline}")
           PY
 
           verify_gitlink() {
@@ -83,11 +77,11 @@ jobs:
   code-quality:
     name: C++ code quality
     needs: preflight
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@401cc753a9251216567652ed06b456a20f74c9b0
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@de54d6cef550b4b54cc3e817eeb8c4415faf6c35
     with:
       extension_name: lance
       duckdb_version: v1.5-variegata
-      ci_tools_version: 401cc753a9251216567652ed06b456a20f74c9b0
+      ci_tools_version: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
 
   rust-quality:
     name: Rust code quality

@@ -4,6 +4,8 @@
 #include "duckdb/common/exception.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #endif
 #include "duckdb/common/string_util.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
@@ -54,9 +56,7 @@
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
 
-#ifdef LANCE_VANE_DISTRIBUTED
 #include <algorithm>
-#endif
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -65,9 +65,7 @@
 #include <limits>
 #include <mutex>
 #include <unordered_map>
-#ifdef LANCE_VANE_DISTRIBUTED
 #include <unordered_set>
-#endif
 
 // FFI ownership contract (Arrow C Data Interface):
 // `lance_get_schema` returns an opaque schema handle; caller frees it via
@@ -87,6 +85,10 @@
 namespace duckdb {
 
 static TableFunction LanceExecFunction();
+#ifdef LANCE_VANE_DISTRIBUTED
+static bool TryGetSelectedFragmentRowCount(const LanceScanBindData &bind_data,
+                                           idx_t &out_count);
+#endif
 
 static bool LanceFieldPathSegmentNeedsQuoting(const string &segment) {
   if (segment.empty()) {
@@ -206,14 +208,24 @@ LanceScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
   if (!bind_data.take_row_ids.empty()) {
     count = NumericCast<idx_t>(bind_data.take_row_ids.size());
   } else {
-    if (!bind_data.dataset) {
-      return nullptr;
+#ifdef LANCE_VANE_DISTRIBUTED
+    if (bind_data.distributed_splits_applied) {
+      if (!TryGetSelectedFragmentRowCount(bind_data, count)) {
+        return nullptr;
+      }
+    } else {
+#endif
+      if (!bind_data.dataset) {
+        return nullptr;
+      }
+      auto rows = lance_dataset_count_rows(bind_data.dataset);
+      if (rows < 0) {
+        return nullptr;
+      }
+      count = NumericCast<idx_t>(rows);
+#ifdef LANCE_VANE_DISTRIBUTED
     }
-    auto rows = lance_dataset_count_rows(bind_data.dataset);
-    if (rows < 0) {
-      return nullptr;
-    }
-    count = NumericCast<idx_t>(rows);
+#endif
   }
 
   if (bind_data.sampling_pushed_down) {
@@ -269,14 +281,24 @@ LanceScanGetPartitionStats(ClientContext &context,
   if (!bind_data.take_row_ids.empty()) {
     count = NumericCast<idx_t>(bind_data.take_row_ids.size());
   } else {
-    if (!bind_data.dataset) {
-      return {};
+#ifdef LANCE_VANE_DISTRIBUTED
+    if (bind_data.distributed_splits_applied) {
+      if (!TryGetSelectedFragmentRowCount(bind_data, count)) {
+        return {};
+      }
+    } else {
+#endif
+      if (!bind_data.dataset) {
+        return {};
+      }
+      auto rows = lance_dataset_count_rows(bind_data.dataset);
+      if (rows < 0) {
+        return {};
+      }
+      count = NumericCast<idx_t>(rows);
+#ifdef LANCE_VANE_DISTRIBUTED
     }
-    auto rows = lance_dataset_count_rows(bind_data.dataset);
-    if (rows < 0) {
-      return {};
-    }
-    count = NumericCast<idx_t>(rows);
+#endif
   }
 
   if (bind_data.sampling_pushed_down) {
@@ -311,9 +333,60 @@ LanceScanGetPartitionStats(ClientContext &context,
 static constexpr const char *LANCE_FRAGMENT_SPLIT_MAGIC = "LFS1";
 static constexpr const char *LANCE_TAKE_SPLIT_MAGIC = "LTS1";
 static constexpr idx_t LANCE_SPLIT_MAGIC_SIZE = 4;
+static constexpr idx_t LANCE_SCAN_TOKEN_SIZE = BaseUUID::STRING_SIZE;
 static constexpr idx_t LANCE_SCAN_PROTOCOL_VERSION = 1;
 static constexpr const char *LANCE_SCAN_SPLIT_CODEC = "lance.scan-split";
 static constexpr idx_t LANCE_SCAN_SPLIT_CODEC_VERSION = 1;
+
+static void ThrowCoordinatorSecretDistributedScanError() {
+  throw NotImplementedException(
+      "Distributed Lance scans cannot use a coordinator-only TYPE LANCE "
+      "secret; use replayable DuckDB session settings or provision "
+      "equivalent credentials in every worker environment");
+}
+
+static bool TryGetSelectedFragmentRowCount(const LanceScanBindData &bind_data,
+                                           idx_t &out_count) {
+  if (!bind_data.distributed_splits_applied || !bind_data.dataset ||
+      !bind_data.take_row_ids.empty()) {
+    return false;
+  }
+
+  size_t stats_len = 0;
+  auto *stats =
+      lance_dataset_list_fragment_stats(bind_data.dataset, &stats_len);
+  if (!stats) {
+    return false;
+  }
+  unordered_map<uint64_t, int64_t> rows_by_fragment;
+  rows_by_fragment.reserve(stats_len);
+  for (size_t stats_idx = 0; stats_idx < stats_len; stats_idx++) {
+    rows_by_fragment.emplace(stats[stats_idx].fragment_id,
+                             stats[stats_idx].num_rows);
+  }
+  lance_free_fragment_stats_list(stats, stats_len);
+
+  idx_t count = 0;
+  for (auto fragment_id : bind_data.selected_fragment_ids) {
+    auto entry = rows_by_fragment.find(fragment_id);
+    if (entry == rows_by_fragment.end() || entry->second < 0) {
+      return false;
+    }
+    auto fragment_rows = NumericCast<idx_t>(entry->second);
+    if (fragment_rows > NumericLimits<idx_t>::Maximum() - count) {
+      return false;
+    }
+    count += fragment_rows;
+  }
+  out_count = count;
+  return true;
+}
+
+static bool IsValidLanceScanToken(const string &token) {
+  hugeint_t parsed;
+  return token.size() == LANCE_SCAN_TOKEN_SIZE &&
+         BaseUUID::FromString(token, parsed, true);
+}
 
 static void AppendUint64LittleEndian(string &out, uint64_t value) {
   for (idx_t byte_idx = 0; byte_idx < sizeof(uint64_t); byte_idx++) {
@@ -334,24 +407,38 @@ static bool TryReadUint64LittleEndian(const string &input, idx_t offset,
   return true;
 }
 
-static string EncodeLanceFragmentSplit(uint64_t fragment_id) {
+static string EncodeLanceFragmentSplit(const string &scan_token,
+                                       uint64_t fragment_id) {
+  if (!IsValidLanceScanToken(scan_token)) {
+    throw InternalException("Invalid Lance coordinator scan token");
+  }
   string payload(LANCE_FRAGMENT_SPLIT_MAGIC, LANCE_SPLIT_MAGIC_SIZE);
+  payload.append(scan_token);
   AppendUint64LittleEndian(payload, fragment_id);
   return payload;
 }
 
-static bool DecodeLanceFragmentSplit(const string &payload,
+static bool DecodeLanceFragmentSplit(const string &payload, string &scan_token,
                                      uint64_t &fragment_id) {
-  return payload.size() == LANCE_SPLIT_MAGIC_SIZE + sizeof(uint64_t) &&
-         payload.compare(0, LANCE_SPLIT_MAGIC_SIZE, LANCE_FRAGMENT_SPLIT_MAGIC,
-                         LANCE_SPLIT_MAGIC_SIZE) == 0 &&
-         TryReadUint64LittleEndian(payload, LANCE_SPLIT_MAGIC_SIZE,
-                                   fragment_id);
+  const idx_t fragment_offset = LANCE_SPLIT_MAGIC_SIZE + LANCE_SCAN_TOKEN_SIZE;
+  if (payload.size() != fragment_offset + sizeof(uint64_t) ||
+      payload.compare(0, LANCE_SPLIT_MAGIC_SIZE, LANCE_FRAGMENT_SPLIT_MAGIC,
+                      LANCE_SPLIT_MAGIC_SIZE) != 0) {
+    return false;
+  }
+  scan_token.assign(payload, LANCE_SPLIT_MAGIC_SIZE, LANCE_SCAN_TOKEN_SIZE);
+  return IsValidLanceScanToken(scan_token) &&
+         TryReadUint64LittleEndian(payload, fragment_offset, fragment_id);
 }
 
-static string EncodeLanceTakeSplit(const vector<uint64_t> &row_ids, idx_t begin,
+static string EncodeLanceTakeSplit(const string &scan_token,
+                                   const vector<uint64_t> &row_ids, idx_t begin,
                                    idx_t end) {
+  if (!IsValidLanceScanToken(scan_token)) {
+    throw InternalException("Invalid Lance coordinator scan token");
+  }
   string payload(LANCE_TAKE_SPLIT_MAGIC, LANCE_SPLIT_MAGIC_SIZE);
+  payload.append(scan_token);
   AppendUint64LittleEndian(payload, begin);
   for (idx_t row_idx = begin; row_idx < end; row_idx++) {
     AppendUint64LittleEndian(payload, row_ids[row_idx]);
@@ -359,14 +446,19 @@ static string EncodeLanceTakeSplit(const vector<uint64_t> &row_ids, idx_t begin,
   return payload;
 }
 
-static bool DecodeLanceTakeSplit(const string &payload, uint64_t &begin,
-                                 vector<uint64_t> &row_ids) {
-  const idx_t header_size = LANCE_SPLIT_MAGIC_SIZE + sizeof(uint64_t);
+static bool DecodeLanceTakeSplit(const string &payload, string &scan_token,
+                                 uint64_t &begin, vector<uint64_t> &row_ids) {
+  const idx_t begin_offset = LANCE_SPLIT_MAGIC_SIZE + LANCE_SCAN_TOKEN_SIZE;
+  const idx_t header_size = begin_offset + sizeof(uint64_t);
   if (payload.size() <= header_size ||
       payload.compare(0, LANCE_SPLIT_MAGIC_SIZE, LANCE_TAKE_SPLIT_MAGIC,
                       LANCE_SPLIT_MAGIC_SIZE) != 0 ||
       (payload.size() - header_size) % sizeof(uint64_t) != 0 ||
-      !TryReadUint64LittleEndian(payload, LANCE_SPLIT_MAGIC_SIZE, begin)) {
+      !TryReadUint64LittleEndian(payload, begin_offset, begin)) {
+    return false;
+  }
+  scan_token.assign(payload, LANCE_SPLIT_MAGIC_SIZE, LANCE_SCAN_TOKEN_SIZE);
+  if (!IsValidLanceScanToken(scan_token)) {
     return false;
   }
   row_ids.clear();
@@ -396,6 +488,41 @@ static string LanceDatasetGenerationId(void *dataset) {
   return generation;
 }
 
+class LanceDistributedSnapshotCacheState final : public ClientContextState {
+public:
+  shared_ptr<LanceDatasetCacheEntry> Get(const string &key) {
+    lock_guard<mutex> guard(lock);
+    auto entry = entries.find(key);
+    return entry == entries.end() ? nullptr : entry->second;
+  }
+
+  shared_ptr<LanceDatasetCacheEntry>
+  PutOrGetExisting(const string &key,
+                   shared_ptr<LanceDatasetCacheEntry> entry) {
+    lock_guard<mutex> guard(lock);
+    auto existing = entries.find(key);
+    if (existing != entries.end()) {
+      return existing->second;
+    }
+    entries.emplace(key, entry);
+    return entry;
+  }
+
+private:
+  mutex lock;
+  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> entries;
+};
+
+static string LanceDistributedSnapshotCacheKey(ClientContext &context,
+                                               const string &path,
+                                               uint64_t version,
+                                               const string &generation_id) {
+  auto key = LanceBuildPathDatasetCacheKey(context, path);
+  key += "|fixed-snapshot|" + to_string(version) + "|" +
+         to_string(generation_id.size()) + ":" + generation_id;
+  return key;
+}
+
 static void CaptureLanceDistributedSnapshot(LanceScanBindData &bind_data) {
   bind_data.dataset_version = lance_dataset_version(bind_data.dataset);
   if (bind_data.dataset_version == 0) {
@@ -403,11 +530,21 @@ static void CaptureLanceDistributedSnapshot(LanceScanBindData &bind_data) {
                       LanceFormatErrorSuffix());
   }
   bind_data.dataset_generation_id = LanceDatasetGenerationId(bind_data.dataset);
+  bind_data.distributed_scan_token = UUID::ToString(UUID::GenerateRandomUUID());
 }
 
 static shared_ptr<LanceDatasetCacheEntry>
 OpenLanceDistributedSnapshot(ClientContext &context, const string &path,
                              uint64_t version, const string &generation_id) {
+  auto cache_key =
+      LanceDistributedSnapshotCacheKey(context, path, version, generation_id);
+  auto cache =
+      context.registered_state->GetOrCreate<LanceDistributedSnapshotCacheState>(
+          "lance_distributed_snapshot_cache_state");
+  if (auto cached = cache->Get(cache_key)) {
+    return cached;
+  }
+
   auto *latest_dataset = LanceOpenDatasetForDistributedScan(context, path);
   if (!latest_dataset) {
     throw IOException("Failed to reopen Lance dataset on worker" +
@@ -419,7 +556,7 @@ OpenLanceDistributedSnapshot(ClientContext &context, const string &path,
       throw IOException("Reopened Lance dataset generation does not match "
                         "the coordinator snapshot");
     }
-    return latest;
+    return cache->PutOrGetExisting(cache_key, latest);
   }
 
   auto *fixed_dataset = lance_dataset_checkout_version(latest_dataset, version);
@@ -432,7 +569,7 @@ OpenLanceDistributedSnapshot(ClientContext &context, const string &path,
     throw IOException("Reopened Lance dataset generation does not match the "
                       "coordinator snapshot");
   }
-  return fixed;
+  return cache->PutOrGetExisting(cache_key, fixed);
 }
 
 static string LanceDistributedReplayPath(ClientContext &context,
@@ -475,6 +612,8 @@ unique_ptr<FunctionData> LanceScanBindData::Copy() const {
   result->dataset_entry = dataset_entry;
   result->dataset = dataset;
   result->dataset_cache_hit = dataset_cache_hit;
+  // ArrowTableSchema owns shared schema state. The move-only ArrowSchemaWrapper
+  // roots are intentionally not copied and must not be read from a bind copy.
   result->arrow_table = arrow_table;
   result->scan_arrow_table = scan_arrow_table;
   result->names = names;
@@ -496,7 +635,10 @@ unique_ptr<FunctionData> LanceScanBindData::Copy() const {
   result->pushed_offset = pushed_offset;
   result->dataset_version = dataset_version;
   result->dataset_generation_id = dataset_generation_id;
+  result->distributed_scan_token = distributed_scan_token;
   result->distributed_replayable = distributed_replayable;
+  result->distributed_requires_coordinator_secret =
+      distributed_requires_coordinator_secret;
   result->distributed_worker = distributed_worker;
   result->distributed_splits_applied = distributed_splits_applied;
   result->distributed_authorization_restricted =
@@ -511,6 +653,9 @@ unique_ptr<FunctionData> LanceScanBindData::Copy() const {
 static vector<DistributedScanSplit> LancePlanDistributedScanSplits(
     const TableFunctionDistributedScanPlanningInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceScanBindData>();
+  if (bind_data.distributed_requires_coordinator_secret) {
+    ThrowCoordinatorSecretDistributedScanError();
+  }
   if (bind_data.UsesNamespaceQuery()) {
     throw NotImplementedException(
         "Distributed Lance REST namespace scans require a stable physical "
@@ -552,7 +697,8 @@ static vector<DistributedScanSplit> LancePlanDistributedScanSplits(
       auto end = MinValue<idx_t>(row_ids.size(), begin + rows_per_split);
       DistributedScanSplit split;
       split.split_id = "take:" + to_string(begin);
-      split.payload = EncodeLanceTakeSplit(row_ids, begin, end);
+      split.payload = EncodeLanceTakeSplit(bind_data.distributed_scan_token,
+                                           row_ids, begin, end);
       split.estimated_cardinality = optional_idx(end - begin);
       splits.push_back(std::move(split));
     }
@@ -572,7 +718,8 @@ static vector<DistributedScanSplit> LancePlanDistributedScanSplits(
     for (size_t stats_idx = 0; stats_idx < stats_len; stats_idx++) {
       DistributedScanSplit split;
       split.split_id = "fragment:" + to_string(stats[stats_idx].fragment_id);
-      split.payload = EncodeLanceFragmentSplit(stats[stats_idx].fragment_id);
+      split.payload = EncodeLanceFragmentSplit(bind_data.distributed_scan_token,
+                                               stats[stats_idx].fragment_id);
       if (stats[stats_idx].num_rows >= 0) {
         split.estimated_cardinality =
             optional_idx(NumericCast<idx_t>(stats[stats_idx].num_rows));
@@ -594,8 +741,12 @@ static vector<DistributedScanSplit> LancePlanDistributedScanSplits(
 static unique_ptr<FunctionData> LanceCreateDistributedScanWorkerBind(
     const TableFunctionDistributedScanInput &input) {
   auto &source = input.bind_data->Cast<LanceScanBindData>();
+  if (source.distributed_requires_coordinator_secret) {
+    ThrowCoordinatorSecretDistributedScanError();
+  }
   if (source.UsesNamespaceQuery() || !source.distributed_replayable ||
-      source.dataset_version == 0 || source.dataset_generation_id.empty()) {
+      source.dataset_version == 0 || source.dataset_generation_id.empty() ||
+      !IsValidLanceScanToken(source.distributed_scan_token)) {
     throw NotImplementedException(
         "Lance scan cannot create a replayable fixed-snapshot worker bind");
   }
@@ -608,6 +759,7 @@ static unique_ptr<FunctionData> LanceCreateDistributedScanWorkerBind(
   result->take_row_ids = source.take_row_ids;
   result->dataset_version = source.dataset_version;
   result->dataset_generation_id = source.dataset_generation_id;
+  result->distributed_scan_token = source.distributed_scan_token;
   result->distributed_replayable = true;
   result->distributed_worker = true;
   if (source.distributed_authorization_restricted) {
@@ -647,14 +799,17 @@ LanceApplyDistributedScanSplits(optional_ptr<FunctionData> worker_bind_p,
   vector<uint64_t> selected_take_row_ids;
   vector<pair<uint64_t, uint64_t>> take_ranges;
   vector<uint64_t> decoded_row_ids;
+  string split_scan_token;
   vector<pair<string, string>> authorization;
   authorization.reserve(splits.size());
   for (const auto &split : splits) {
     split.Validate();
     authorization.emplace_back(split.split_id, split.payload);
     uint64_t fragment_id = 0;
-    if (DecodeLanceFragmentSplit(split.payload, fragment_id)) {
+    if (DecodeLanceFragmentSplit(split.payload, split_scan_token,
+                                 fragment_id)) {
       if (mode == SplitMode::TAKE ||
+          split_scan_token != worker_bind.distributed_scan_token ||
           split.split_id != "fragment:" + to_string(fragment_id) ||
           !seen_fragments.insert(fragment_id).second ||
           (!authorization_restricted && !planned_take_row_ids.empty())) {
@@ -666,8 +821,10 @@ LanceApplyDistributedScanSplits(optional_ptr<FunctionData> worker_bind_p,
     }
 
     uint64_t begin = 0;
-    if (DecodeLanceTakeSplit(split.payload, begin, decoded_row_ids)) {
+    if (DecodeLanceTakeSplit(split.payload, split_scan_token, begin,
+                             decoded_row_ids)) {
       if (mode == SplitMode::FRAGMENT ||
+          split_scan_token != worker_bind.distributed_scan_token ||
           split.split_id != "take:" + to_string(begin) ||
           (!authorization_restricted && planned_take_row_ids.empty())) {
         throw InvalidInputException("Invalid Lance take scan split");
@@ -1045,6 +1202,21 @@ static void CastRowIdToDuckDBRowType(Vector &src, Vector &dst, idx_t count) {
   }
 }
 
+// Row IDs extracted from a SQL predicate are membership candidates, not a
+// positional take request. Keep first-occurrence order for deterministic split
+// planning while scheduling each matching input row at most once.
+static void NormalizeSqlTakeRowIds(vector<uint64_t> &row_ids) {
+  unordered_set<uint64_t> seen;
+  seen.reserve(row_ids.size());
+  idx_t write_idx = 0;
+  for (auto row_id : row_ids) {
+    if (seen.insert(row_id).second) {
+      row_ids[write_idx++] = row_id;
+    }
+  }
+  row_ids.resize(write_idx);
+}
+
 static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
                                            vector<uint64_t> &out_row_ids) {
   switch (filter.filter_type) {
@@ -1052,6 +1224,9 @@ static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
     auto &in = filter.Cast<InFilter>();
     out_row_ids.reserve(out_row_ids.size() + in.values.size());
     for (auto &v : in.values) {
+      if (v.IsNull()) {
+        continue;
+      }
       uint64_t row_id = 0;
       if (!TryParseRowIdValue(v, row_id)) {
         throw InvalidInputException("Lance point lookup requires non-negative "
@@ -1064,6 +1239,9 @@ static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
   case TableFilterType::CONSTANT_COMPARISON: {
     auto &cmp = filter.Cast<ConstantFilter>();
     if (cmp.comparison_type != ExpressionType::COMPARE_EQUAL) {
+      return false;
+    }
+    if (cmp.constant.IsNull()) {
       return false;
     }
     uint64_t row_id = 0;
@@ -1113,7 +1291,11 @@ static bool TryExtractTakeRowIdsFromFilters(const TableFilterSet &filters,
   if (it == filters.filters.end() || !it->second) {
     return false;
   }
-  return TryExtractTakeRowIdsFromFilter(*it->second, out_row_ids);
+  if (!TryExtractTakeRowIdsFromFilter(*it->second, out_row_ids)) {
+    return false;
+  }
+  NormalizeSqlTakeRowIds(out_row_ids);
+  return !out_row_ids.empty();
 }
 
 static void
@@ -1191,6 +1373,9 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         }
         uint64_t row_id = 0;
         auto &v = child->Cast<BoundConstantExpression>().value;
+        if (v.IsNull()) {
+          continue;
+        }
         if (!TryParseRowIdValue(v, row_id)) {
           throw InvalidInputException(
               "Lance point lookup requires non-negative integer rowid/_rowid "
@@ -1219,6 +1404,9 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         }
         uint64_t row_id = 0;
         auto &v = rhs.Cast<BoundConstantExpression>().value;
+        if (v.IsNull()) {
+          return false;
+        }
         if (!TryParseRowIdValue(v, row_id)) {
           throw InvalidInputException(
               "Lance point lookup requires non-negative integer rowid/_rowid "
@@ -1266,6 +1454,7 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
     if (!scan_bind.UsesNamespaceQuery() && scan_bind.take_row_ids.empty()) {
       vector<uint64_t> take_row_ids;
       if (try_extract_rowids(*expr, take_row_ids) && !take_row_ids.empty()) {
+        NormalizeSqlTakeRowIds(take_row_ids);
         scan_bind.take_row_ids = std::move(take_row_ids);
       }
     }
@@ -1383,9 +1572,13 @@ static void LanceScanSerialize(Serializer &serializer,
                                const optional_ptr<FunctionData> bind_data_p,
                                const TableFunction &) {
   auto &bind_data = bind_data_p->Cast<LanceScanBindData>();
+  if (bind_data.distributed_requires_coordinator_secret) {
+    ThrowCoordinatorSecretDistributedScanError();
+  }
   if (bind_data.UsesNamespaceQuery() || !bind_data.distributed_replayable ||
       bind_data.dataset_version == 0 ||
-      bind_data.dataset_generation_id.empty()) {
+      bind_data.dataset_generation_id.empty() ||
+      !IsValidLanceScanToken(bind_data.distributed_scan_token)) {
     throw SerializationException(
         "Lance scan does not have a replayable fixed dataset snapshot");
   }
@@ -1402,7 +1595,16 @@ static void LanceScanSerialize(Serializer &serializer,
                            bind_data.distributed_authorized_split_ids);
   serializer.WriteProperty(107, "authorized_split_payloads",
                            bind_data.distributed_authorized_split_payloads);
-  serializer.WriteProperty(108, "take_row_ids", bind_data.take_row_ids);
+  if (bind_data.distributed_authorization_restricted) {
+    // Restricted worker clones validate and rebuild their take rows from the
+    // authorized split payloads. Avoid serializing the same row IDs twice.
+    serializer.WriteProperty(108, "take_row_ids", vector<uint64_t>());
+  } else {
+    // The initial detached worker bind needs the coordinator's complete list to
+    // validate take-split ranges before it becomes authorization-restricted.
+    serializer.WriteProperty(108, "take_row_ids", bind_data.take_row_ids);
+  }
+  serializer.WriteProperty(109, "scan_token", bind_data.distributed_scan_token);
 }
 
 static unique_ptr<FunctionData> LanceScanDeserialize(Deserializer &deserializer,
@@ -1426,10 +1628,13 @@ static unique_ptr<FunctionData> LanceScanDeserialize(Deserializer &deserializer,
                                                 "authorized_split_payloads");
   result->take_row_ids =
       deserializer.ReadProperty<vector<uint64_t>>(108, "take_row_ids");
+  result->distributed_scan_token =
+      deserializer.ReadProperty<string>(109, "scan_token");
   if (result->file_path.empty() ||
       result->file_path.find('\0') != string::npos ||
       result->dataset_version == 0 || result->dataset_generation_id.empty() ||
       result->dataset_generation_id.find('\0') != string::npos ||
+      !IsValidLanceScanToken(result->distributed_scan_token) ||
       result->distributed_authorized_split_ids.size() !=
           result->distributed_authorized_split_payloads.size() ||
       (!result->distributed_authorization_restricted &&
@@ -1476,6 +1681,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 #ifdef LANCE_VANE_DISTRIBUTED
+  result->distributed_requires_coordinator_secret =
+      LanceHasMatchingStorageSecret(context, result->file_path);
   auto replay_path = LanceDistributedReplayPath(context, result->file_path);
   if (!replay_path.empty()) {
     result->file_path = std::move(replay_path);
@@ -1633,6 +1840,11 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     throw InvalidInputException(
         "Detached Lance worker scan requires an explicit split assignment");
   }
+  if (bind_data.distributed_worker && !bind_data.dataset) {
+    throw InternalException(
+        "Detached Lance worker bind was not rehydrated from its serialized "
+        "snapshot");
+  }
 #endif
   auto state = make_uniq_base<GlobalTableFunctionState, LanceScanGlobalState>();
   auto &scan_state = state->Cast<LanceScanGlobalState>();
@@ -1663,6 +1875,14 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.scan_converted_types.push_back(type);
     scan_idx_by_col_id.emplace(col_id, idx);
     return idx;
+  };
+  auto add_virtual_cardinality_column = [&]() {
+    if (!scan_state.scan_column_names.empty()) {
+      return;
+    }
+    scan_state.scan_includes_virtual_rowid = true;
+    add_scan_column(rowid_internal_index, LANCE_ROW_ID_COLUMN_NAME,
+                    LogicalType::UBIGINT);
   };
 
   for (auto col_id : input.column_ids) {
@@ -1786,21 +2006,6 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     return state;
   }
 
-#ifdef LANCE_VANE_DISTRIBUTED
-  if (bind_data.distributed_splits_applied &&
-      scan_state.scan_column_names.empty()) {
-    // Fragment and take streams need one Arrow column to carry row
-    // cardinality. DuckDB discards it for COLUMN_IDENTIFIER_EMPTY/count(*).
-    if (!bind_data.names.empty()) {
-      add_scan_column(0, bind_data.names[0], bind_data.types[0]);
-    } else {
-      scan_state.scan_includes_virtual_rowid = true;
-      add_scan_column(rowid_internal_index, LANCE_ROW_ID_COLUMN_NAME,
-                      LogicalType::UBIGINT);
-    }
-  }
-#endif
-
   if (!bind_data.take_row_ids.empty()) {
     if (scan_state.sampling_pushed_down) {
       // Sampling is applied before filtering, so do not combine it with point
@@ -1817,6 +2022,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.use_dataset_take = true;
     scan_state.max_threads = 1;
     scan_state.take_row_ids = bind_data.take_row_ids;
+    add_virtual_cardinality_column();
     return state;
   }
 
@@ -1848,22 +2054,32 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       scan_state.use_dataset_scanner = true;
       scan_state.use_dataset_take = true;
       scan_state.max_threads = 1;
+      add_virtual_cardinality_column();
       return state;
     }
   }
 
   if (scan_state.scan_column_names.empty() &&
       (!input.filters || input.filters->filters.empty()) &&
-      scan_state.lance_filter_ir.empty()
+      scan_state.lance_filter_ir.empty()) {
+    int64_t rows = 0;
 #ifdef LANCE_VANE_DISTRIBUTED
-      && !bind_data.distributed_splits_applied
+    if (bind_data.distributed_splits_applied) {
+      idx_t selected_rows = 0;
+      if (!TryGetSelectedFragmentRowCount(bind_data, selected_rows)) {
+        throw IOException("Failed to count assigned Lance fragments");
+      }
+      rows = NumericCast<int64_t>(selected_rows);
+    } else {
 #endif
-  ) {
-    auto rows = lance_dataset_count_rows(bind_data.dataset);
-    if (rows < 0) {
-      throw IOException("Failed to count Lance rows" +
-                        LanceFormatErrorSuffix());
+      rows = lance_dataset_count_rows(bind_data.dataset);
+      if (rows < 0) {
+        throw IOException("Failed to count Lance rows" +
+                          LanceFormatErrorSuffix());
+      }
+#ifdef LANCE_VANE_DISTRIBUTED
     }
+#endif
     if (scan_state.sampling_pushed_down) {
       auto pct = scan_state.sample_percentage / 100.0;
       pct = MaxValue<double>(0.0, MinValue<double>(1.0, pct));
@@ -1889,6 +2105,15 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.max_threads = 1;
     return state;
   }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (bind_data.distributed_splits_applied) {
+    // Filtered constant projections still need an Arrow column to carry row
+    // cardinality. Use Lance's virtual row ID instead of reading schema column
+    // zero, which may be a large vector or blob.
+    add_virtual_cardinality_column();
+  }
+#endif
 
   // -- Deferred materialization for heavy columns --
   // Activates when DuckDB has filters that were NOT fully pushed to Lance,
@@ -2884,6 +3109,9 @@ static bool TryExtractTakeRowIdsFromExpression(
   };
 
   auto parse_row_id = [&](const Value &v, uint64_t &out) {
+    if (v.IsNull()) {
+      return false;
+    }
     if (!TryParseRowIdValue(v, out)) {
       throw InvalidInputException("Lance point lookup requires non-negative "
                                   "integer rowid/_rowid values");
@@ -2908,8 +3136,9 @@ static bool TryExtractTakeRowIdsFromExpression(
         return false;
       }
       uint64_t row_id = 0;
-      parse_row_id(child->Cast<BoundConstantExpression>().value, row_id);
-      out_row_ids.push_back(row_id);
+      if (parse_row_id(child->Cast<BoundConstantExpression>().value, row_id)) {
+        out_row_ids.push_back(row_id);
+      }
     }
     return true;
   }
@@ -2926,13 +3155,12 @@ static bool TryExtractTakeRowIdsFromExpression(
 
     if (is_row_id(*cmp.left) &&
         cmp.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-      parse_row_id(cmp.right->Cast<BoundConstantExpression>().value, out);
-      return true;
+      return parse_row_id(cmp.right->Cast<BoundConstantExpression>().value,
+                          out);
     }
     if (is_row_id(*cmp.right) &&
         cmp.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-      parse_row_id(cmp.left->Cast<BoundConstantExpression>().value, out);
-      return true;
+      return parse_row_id(cmp.left->Cast<BoundConstantExpression>().value, out);
     }
     return false;
   };
@@ -2997,42 +3225,25 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
     }
 
     vector<uint64_t> row_ids;
-    bool can_take = scan_bind.take_row_ids.empty() &&
-                    TryExtractTakeRowIdsFromFilter(*it->second, row_ids) &&
-                    !row_ids.empty();
+    auto can_take = TryExtractTakeRowIdsFromFilter(*it->second, row_ids);
+    NormalizeSqlTakeRowIds(row_ids);
+    can_take = can_take && !row_ids.empty();
     if (can_take) {
+      // Complex-filter pushdown may already have populated take_row_ids from
+      // the same SQL predicate. The TableFilter is the final DuckDB-normalized
+      // membership set, so replace the earlier candidates and remove the now
+      // redundant residual filter.
       scan_bind.take_row_ids = std::move(row_ids);
       get.table_filters.filters.erase(it);
       return op;
     }
 
-    auto &col_ids = get.GetColumnIds();
-    optional_idx col_pos = optional_idx::Invalid();
-    for (idx_t i = 0; i < col_ids.size(); i++) {
-      if (col_ids[i].GetPrimaryIndex() == filter_col_id) {
-        col_pos = optional_idx(i);
-        break;
-      }
-    }
-    if (!col_pos.IsValid()) {
-      throw InternalException(
-          "Lance scan found a rowid table filter without a rowid column");
-    }
-
-    auto col_type = filter_col_id == COLUMN_IDENTIFIER_ROW_ID
-                        ? LogicalType::ROW_TYPE
-                        : LogicalType::UBIGINT;
-    auto colref = make_uniq<BoundColumnRefExpression>(
-        col_type, ColumnBinding(get.table_index, col_pos.GetIndex()));
-    auto filter_expr = it->second->ToExpression(*colref);
-    get.table_filters.filters.erase(it);
-
-    auto estimated = op->estimated_cardinality;
-    auto filter = make_uniq<LogicalFilter>();
-    filter->expressions.push_back(std::move(filter_expr));
-    filter->children.push_back(std::move(op));
-    filter->estimated_cardinality = estimated;
-    return std::move(filter);
+    // Keep non-take rowid filters on the table scan. Rebuilding a
+    // LogicalFilter here is unsafe after DuckDB has populated projection_ids:
+    // the rowid may be filter-only and therefore absent from the LogicalGet's
+    // output bindings. LanceScanInitGlobal already retains filter columns and
+    // applies unsupported table filters through DuckDB's fallback path.
+    return op;
   }
 
   if (op->type != LogicalOperatorType::LOGICAL_FILTER ||
@@ -3076,6 +3287,10 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
     return op;
   }
 
+  NormalizeSqlTakeRowIds(row_ids);
+  if (row_ids.empty()) {
+    return op;
+  }
   scan_bind.take_row_ids = row_ids;
   filter_op.expressions.erase(filter_op.expressions.begin() +
                               NumericCast<std::ptrdiff_t>(idx));
@@ -3662,6 +3877,16 @@ LanceCardinalityFixup(ClientContext &context, unique_ptr<LogicalOperator> op) {
     get.SetEstimatedCardinality(scan_bind.take_row_ids.size());
     return op;
   }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (scan_bind.distributed_splits_applied) {
+    idx_t selected_rows = 0;
+    if (TryGetSelectedFragmentRowCount(scan_bind, selected_rows)) {
+      get.SetEstimatedCardinality(selected_rows);
+    }
+    return op;
+  }
+#endif
 
   if (!scan_bind.dataset) {
     return op;
@@ -4497,13 +4722,10 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 #ifdef LANCE_VANE_DISTRIBUTED
-  bool has_connection_options = false;
-  if (IsNamespaceBacked() && NamespaceConfig().IsDirectory()) {
-    has_connection_options = !NamespaceConfig().option_keys.empty() ||
-                             !NamespaceConfig().option_values.empty();
-  }
+  result->distributed_requires_coordinator_secret =
+      LanceHasMatchingStorageSecret(context, result->file_path);
   auto replay_path = LanceDistributedReplayPath(context, result->file_path);
-  if (!has_connection_options && !replay_path.empty()) {
+  if (!replay_path.empty()) {
     result->file_path = std::move(replay_path);
     result->distributed_replayable = true;
     CaptureLanceDistributedSnapshot(*result);

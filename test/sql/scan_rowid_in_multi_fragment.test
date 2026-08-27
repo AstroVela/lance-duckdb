@@ -1,0 +1,52 @@
+# name: test/sql/scan_rowid_in_multi_fragment.test
+# description: Point lookup validates address-style row IDs per fragment
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(12) AS source(i))
+TO '__TEST_DIR__/rowid_multi.lance'
+(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 3)
+
+# Every fragment contributes a valid address, including addresses above 2^32.
+query I rowsort
+SELECT id FROM '__TEST_DIR__/rowid_multi.lance'
+WHERE _rowid IN (0, 4294967296, 8589934592, 12884901888)
+----
+0
+3
+6
+9
+
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(12) AS source(i))
+TO '__TEST_DIR__/rowid_deleted.lance'
+(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 3)
+
+statement ok
+ATTACH '__TEST_DIR__' AS rowid_delete_ns (TYPE LANCE, READ_ONLY false)
+
+statement ok
+DELETE FROM rowid_delete_ns.main.rowid_deleted WHERE id IN (1, 4, 7, 10)
+
+# Deleted addresses are omitted while later live offsets in every fragment
+# remain addressable.
+query I
+SELECT id FROM '__TEST_DIR__/rowid_deleted.lance'
+WHERE _rowid IN (
+  0, 1, 2,
+  4294967296, 4294967297, 4294967298,
+  8589934592, 8589934593, 8589934594,
+  12884901888, 12884901889, 12884901890
+)
+ORDER BY id
+----
+0
+2
+3
+5
+6
+8
+9
+11
