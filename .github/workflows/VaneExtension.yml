@@ -147,22 +147,22 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check the default Rust feature set
-        run: cargo check --locked --no-default-features
+        run: cargo check --no-default-features
 
       - name: Check the Vane Rust feature set
-        run: cargo check --locked --all-features
+        run: cargo check --all-features
 
       - name: Run Rust clippy without Vane support
-        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: Run Rust clippy with Vane support
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run Rust unit tests without Vane support
-        run: cargo test --locked --lib --no-default-features
+        run: cargo test --lib --no-default-features
 
       - name: Run Rust unit tests with Vane support
-        run: cargo test --locked --lib --all-features
+        run: cargo test --lib --all-features
 
   python-quality:
     name: Python test quality

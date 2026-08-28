@@ -243,12 +243,12 @@ if(CMAKE_CONFIGURATION_TYPES)
   add_custom_command(
     OUTPUT "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}"
     COMMAND
-      ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build --locked
+      ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
       ${RUST_CARGO_FEATURE_ARGS}
       --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
       --target=${RUST_PLATFORM_TARGET}
     COMMAND
-      ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build --locked
+      ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
       ${RUST_CARGO_FEATURE_ARGS}
       --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release
       --target=${RUST_PLATFORM_TARGET}
@@ -267,7 +267,7 @@ else()
     add_custom_command(
       OUTPUT "${RUST_DEBUG_LIB}"
       COMMAND
-        ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build --locked
+        ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
         ${RUST_CARGO_FEATURE_ARGS}
         --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
         --target=${RUST_PLATFORM_TARGET}
@@ -280,7 +280,7 @@ else()
     add_custom_command(
       OUTPUT "${RUST_RELEASE_LIB}"
       COMMAND
-        ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build --locked
+        ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
         ${RUST_CARGO_FEATURE_ARGS}
         --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release
         --target=${RUST_PLATFORM_TARGET}
