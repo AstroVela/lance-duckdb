@@ -19,9 +19,9 @@ struct LanceNamespaceTableConfig {
   vector<string> option_keys;
   vector<string> option_values;
 #ifdef LANCE_VANE_DISTRIBUTED
-  // Directory namespace options may contain coordinator-owned TYPE LANCE
-  // secrets captured at ATTACH time. Preserve only the provenance bit across
-  // catalog-entry copies; secret values are never serialized to workers.
+  // TYPE LANCE secrets remain coordinator-local in Vane distributed scans.
+  // Preserve only this provenance bit across catalog-entry copies so planning
+  // can reject the scan; secret values are never serialized to workers.
   bool uses_coordinator_storage_secret = false;
   // Preserve whether the original ATTACH path contained private URI
   // components even if namespace resolution normalized them into a local path.

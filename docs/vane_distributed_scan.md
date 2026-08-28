@@ -69,12 +69,17 @@ handoff. Credentials may also be captured from a Vane session credential
 provider. Static access-key settings must describe a complete credential tuple:
 explicitly set
 `s3_session_token` to an empty string when the credentials do not use a session
-token, so an inherited process token cannot be paired with them. A temporary
-`TYPE LANCE` secret created only on the coordinator remains valid for local
-queries, but Vane does not replay that secret catalog entry to workers.
-Planning a distributed scan that matches such a secret therefore fails early
-with an actionable capability error. If the secret-backed namespace remains
-attached while an unrelated plan is transported, the connection snapshot uses
+token, so an inherited process token cannot be paired with them. A `TYPE LANCE`
+secret remains valid for ordinary local queries, including when the extension
+is built with Vane support. Its contract is intentionally not extended to
+distributed execution: Vane neither serializes nor discovers DuckDB
+secret-catalog entries on workers, and independently creating an equivalent
+worker secret is not a supported replay mechanism. Distributed credentials
+must instead come from the replayable query-session settings or credential
+provider described above. Planning a distributed scan that matches a
+coordinator `TYPE LANCE` secret therefore fails early with an actionable
+capability error. If the secret-backed namespace remains attached while an
+unrelated plan is transported, the connection snapshot uses
 an internal credential-free placeholder catalog. Directory roots containing
 URI userinfo, a query string, or a fragment use the same placeholder because
 those components can contain credentials and are not safe to serialize. This
@@ -119,7 +124,8 @@ point-lookups, aggregates, sampling, global limits, empty datasets, and
 directory namespace tables. It deliberately excludes vector search, full-text
 search, hybrid search, and all index planning. REST namespace query scans are
 also excluded until that control plane can provide a stable replayable physical
-snapshot. Distributed writes are a separate feature.
+snapshot. Distributed writes and distributed replay of `TYPE LANCE` secret
+catalog entries are separate features and are not part of this contract.
 
 The official DuckDB build keeps its existing scan optimizers and behavior when
 `LANCE_VANE_DISTRIBUTED` is disabled.

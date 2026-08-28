@@ -342,6 +342,9 @@ static constexpr const char *LANCE_SCAN_SPLIT_CODEC = "lance.scan-split";
 static constexpr idx_t LANCE_SCAN_SPLIT_CODEC_VERSION = 1;
 
 static void ThrowCoordinatorSecretDistributedScanError() {
+  // TYPE LANCE remains valid for ordinary local scans, but Vane does not
+  // replay DuckDB secret-catalog entries to workers. Distributed credentials
+  // must come from replayable query-session state instead.
   throw NotImplementedException(
       "Distributed Lance scans cannot use a coordinator-only TYPE LANCE "
       "secret; use replayable DuckDB session settings captured by Vane");
@@ -819,7 +822,7 @@ static vector<DistributedScanSplit> LancePlanDistributedScanSplits(
   if (!bind_data.distributed_replayable) {
     throw NotImplementedException(
         "Distributed Lance scans require a replayable dataset URI and "
-        "worker-local credentials");
+        "credentials captured in Vane's replayable query-session state");
   }
   if (bind_data.distributed_authorization_restricted) {
     if (bind_data.distributed_authorized_split_ids.size() !=
@@ -1408,9 +1411,10 @@ static void CastRowIdToDuckDBRowType(Vector &src, Vector &dst, idx_t count) {
   }
 }
 
-// Row IDs extracted from a SQL predicate are membership candidates, not a
-// positional take request. Keep first-occurrence order for deterministic split
-// planning while scheduling each matching input row at most once.
+#ifdef LANCE_VANE_DISTRIBUTED
+// Row IDs extracted from a distributed SQL predicate are membership candidates,
+// not a positional take request. Keep first-occurrence order for deterministic
+// split planning while scheduling each matching input row at most once.
 static void NormalizeSqlTakeRowIds(vector<uint64_t> &row_ids) {
   unordered_set<uint64_t> seen;
   seen.reserve(row_ids.size());
@@ -1422,6 +1426,7 @@ static void NormalizeSqlTakeRowIds(vector<uint64_t> &row_ids) {
   }
   row_ids.resize(write_idx);
 }
+#endif
 
 static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
                                            vector<uint64_t> &out_row_ids) {
@@ -1430,9 +1435,11 @@ static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
     auto &in = filter.Cast<InFilter>();
     out_row_ids.reserve(out_row_ids.size() + in.values.size());
     for (auto &v : in.values) {
+#ifdef LANCE_VANE_DISTRIBUTED
       if (v.IsNull()) {
         continue;
       }
+#endif
       uint64_t row_id = 0;
       if (!TryParseRowIdValue(v, row_id)) {
         throw InvalidInputException("Lance point lookup requires non-negative "
@@ -1447,9 +1454,11 @@ static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
     if (cmp.comparison_type != ExpressionType::COMPARE_EQUAL) {
       return false;
     }
+#ifdef LANCE_VANE_DISTRIBUTED
     if (cmp.constant.IsNull()) {
       return false;
     }
+#endif
     uint64_t row_id = 0;
     if (!TryParseRowIdValue(cmp.constant, row_id)) {
       throw InvalidInputException("Lance point lookup requires non-negative "
@@ -1497,11 +1506,15 @@ static bool TryExtractTakeRowIdsFromFilters(const TableFilterSet &filters,
   if (it == filters.filters.end() || !it->second) {
     return false;
   }
+#ifdef LANCE_VANE_DISTRIBUTED
   if (!TryExtractTakeRowIdsFromFilter(*it->second, out_row_ids)) {
     return false;
   }
   NormalizeSqlTakeRowIds(out_row_ids);
   return !out_row_ids.empty();
+#else
+  return TryExtractTakeRowIdsFromFilter(*it->second, out_row_ids);
+#endif
 }
 
 static void
@@ -1579,9 +1592,11 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         }
         uint64_t row_id = 0;
         auto &v = child->Cast<BoundConstantExpression>().value;
+#ifdef LANCE_VANE_DISTRIBUTED
         if (v.IsNull()) {
           continue;
         }
+#endif
         if (!TryParseRowIdValue(v, row_id)) {
           throw InvalidInputException(
               "Lance point lookup requires non-negative integer rowid/_rowid "
@@ -1610,9 +1625,11 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         }
         uint64_t row_id = 0;
         auto &v = rhs.Cast<BoundConstantExpression>().value;
+#ifdef LANCE_VANE_DISTRIBUTED
         if (v.IsNull()) {
           return false;
         }
+#endif
         if (!TryParseRowIdValue(v, row_id)) {
           throw InvalidInputException(
               "Lance point lookup requires non-negative integer rowid/_rowid "
@@ -1660,7 +1677,9 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
     if (!scan_bind.UsesNamespaceQuery() && scan_bind.take_row_ids.empty()) {
       vector<uint64_t> take_row_ids;
       if (try_extract_rowids(*expr, take_row_ids) && !take_row_ids.empty()) {
+#ifdef LANCE_VANE_DISTRIBUTED
         NormalizeSqlTakeRowIds(take_row_ids);
+#endif
         scan_bind.take_row_ids = std::move(take_row_ids);
       }
     }
@@ -3644,9 +3663,11 @@ static bool TryExtractTakeRowIdsFromExpression(
   };
 
   auto parse_row_id = [&](const Value &v, uint64_t &out) {
+#ifdef LANCE_VANE_DISTRIBUTED
     if (v.IsNull()) {
       return false;
     }
+#endif
     if (!TryParseRowIdValue(v, out)) {
       throw InvalidInputException("Lance point lookup requires non-negative "
                                   "integer rowid/_rowid values");
@@ -3671,9 +3692,14 @@ static bool TryExtractTakeRowIdsFromExpression(
         return false;
       }
       uint64_t row_id = 0;
+#ifdef LANCE_VANE_DISTRIBUTED
       if (parse_row_id(child->Cast<BoundConstantExpression>().value, row_id)) {
         out_row_ids.push_back(row_id);
       }
+#else
+      parse_row_id(child->Cast<BoundConstantExpression>().value, row_id);
+      out_row_ids.push_back(row_id);
+#endif
     }
     return true;
   }
@@ -3690,12 +3716,22 @@ static bool TryExtractTakeRowIdsFromExpression(
 
     if (is_row_id(*cmp.left) &&
         cmp.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+#ifdef LANCE_VANE_DISTRIBUTED
       return parse_row_id(cmp.right->Cast<BoundConstantExpression>().value,
                           out);
+#else
+      parse_row_id(cmp.right->Cast<BoundConstantExpression>().value, out);
+      return true;
+#endif
     }
     if (is_row_id(*cmp.right) &&
         cmp.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+#ifdef LANCE_VANE_DISTRIBUTED
       return parse_row_id(cmp.left->Cast<BoundConstantExpression>().value, out);
+#else
+      parse_row_id(cmp.left->Cast<BoundConstantExpression>().value, out);
+      return true;
+#endif
     }
     return false;
   };
@@ -3760,25 +3796,63 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
     }
 
     vector<uint64_t> row_ids;
+#ifdef LANCE_VANE_DISTRIBUTED
     auto can_take = TryExtractTakeRowIdsFromFilter(*it->second, row_ids);
     NormalizeSqlTakeRowIds(row_ids);
     can_take = can_take && !row_ids.empty();
+#else
+    bool can_take = scan_bind.take_row_ids.empty() &&
+                    TryExtractTakeRowIdsFromFilter(*it->second, row_ids) &&
+                    !row_ids.empty();
+#endif
     if (can_take) {
+#ifdef LANCE_VANE_DISTRIBUTED
       // Complex-filter pushdown may already have populated take_row_ids from
       // the same SQL predicate. The TableFilter is the final DuckDB-normalized
       // membership set, so replace the earlier candidates and remove the now
       // redundant residual filter.
+#endif
       scan_bind.take_row_ids = std::move(row_ids);
       get.table_filters.filters.erase(it);
       return op;
     }
 
+#ifdef LANCE_VANE_DISTRIBUTED
     // Keep non-take rowid filters on the table scan. Rebuilding a
     // LogicalFilter here is unsafe after DuckDB has populated projection_ids:
     // the rowid may be filter-only and therefore absent from the LogicalGet's
     // output bindings. LanceScanInitGlobal already retains filter columns and
     // applies unsupported table filters through DuckDB's fallback path.
     return op;
+#else
+    auto &col_ids = get.GetColumnIds();
+    optional_idx col_pos = optional_idx::Invalid();
+    for (idx_t i = 0; i < col_ids.size(); i++) {
+      if (col_ids[i].GetPrimaryIndex() == filter_col_id) {
+        col_pos = optional_idx(i);
+        break;
+      }
+    }
+    if (!col_pos.IsValid()) {
+      throw InternalException(
+          "Lance scan found a rowid table filter without a rowid column");
+    }
+
+    auto col_type = filter_col_id == COLUMN_IDENTIFIER_ROW_ID
+                        ? LogicalType::ROW_TYPE
+                        : LogicalType::UBIGINT;
+    auto colref = make_uniq<BoundColumnRefExpression>(
+        col_type, ColumnBinding(get.table_index, col_pos.GetIndex()));
+    auto filter_expr = it->second->ToExpression(*colref);
+    get.table_filters.filters.erase(it);
+
+    auto estimated = op->estimated_cardinality;
+    auto filter = make_uniq<LogicalFilter>();
+    filter->expressions.push_back(std::move(filter_expr));
+    filter->children.push_back(std::move(op));
+    filter->estimated_cardinality = estimated;
+    return std::move(filter);
+#endif
   }
 
   if (op->type != LogicalOperatorType::LOGICAL_FILTER ||
@@ -3822,10 +3896,12 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
     return op;
   }
 
+#ifdef LANCE_VANE_DISTRIBUTED
   NormalizeSqlTakeRowIds(row_ids);
   if (row_ids.empty()) {
     return op;
   }
+#endif
   scan_bind.take_row_ids = row_ids;
   filter_op.expressions.erase(filter_op.expressions.begin() +
                               NumericCast<std::ptrdiff_t>(idx));

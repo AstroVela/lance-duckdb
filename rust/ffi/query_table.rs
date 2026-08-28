@@ -689,6 +689,8 @@ mod tests {
             columns: columns.iter().map(|column| (*column).to_string()).collect(),
             filter: None,
             k: 0,
+            #[cfg(feature = "vane-distributed")]
+            version: None,
             prefilter: true,
         }
     }

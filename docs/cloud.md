@@ -11,6 +11,13 @@ This integration is intentionally thin:
 
 For the upstream Lance object store options and provider behavior, see https://lance.org/guide/object_store/.
 
+`TYPE LANCE` secrets are the credential contract for ordinary local DuckDB
+queries. Vane distributed scans do not serialize or recreate DuckDB secret
+catalog entries on workers. They use credentials captured in Vane's replayable
+query-session state instead, and reject a distributed scan that depends on a
+coordinator `TYPE LANCE` secret. See the
+[`Vane distributed scan contract`](./vane_distributed_scan.md) for details.
+
 ## Supported Backends
 
 Backends are supported if they are supported by the linked Lance build (see `Cargo.toml` features).

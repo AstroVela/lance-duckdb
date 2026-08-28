@@ -1,10 +1,4 @@
-# This file is included by DuckDB's build system. It specifies which extension
-# to load. Keep official DuckDB builds isolated from a stale Vane CMake cache.
-if(NOT DEFINED LANCE_VANE_EXTENSION_CONFIG_VANE)
-  set(LANCE_VANE_DISTRIBUTED
-      OFF
-      CACHE BOOL "Build the Vane distributed Lance scan adapter" FORCE)
-endif()
+# This file is included by DuckDB's build system. It specifies which extension to load
 
 # Extension from this repo
 duckdb_extension_load(lance

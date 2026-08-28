@@ -4,7 +4,6 @@ on:
     paths-ignore:
       - "**.md"
   push:
-    branches: [main]
     paths-ignore:
       - "**.md"
   workflow_dispatch:
@@ -13,14 +12,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
   code-quality:
     name: Code Quality
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
       extension_name: lance
       duckdb_version: v1.5-variegata
-      ci_tools_version: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+      ci_tools_version: v1.5-variegata

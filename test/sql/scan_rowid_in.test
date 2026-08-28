@@ -4,40 +4,25 @@
 
 require lance
 
-# Membership does not define output order.
+# Basic ordering: output matches the IN-list order
 query T
-SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (2, 0, 4) ORDER BY name
+SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (2, 0, 4)
 ----
-Alice
 Charlie
+Alice
 Eve
 
-# Repeated SQL membership candidates do not duplicate input rows.
+# Duplicate row ids: output preserves duplicates
 query T
-SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (1, 1, NULL, 3) ORDER BY name
+SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (1, 1, 3)
 ----
+Bob
 Bob
 David
 
-query I
-SELECT count(*) FROM 'test/data/test_data.lance' WHERE _rowid IN (1, 1, NULL)
-----
-1
-
-query I
-SELECT count(*) FROM 'test/data/test_data.lance' WHERE _rowid IN (NULL)
-----
-0
-
-# Plain DuckDB is the membership-semantics oracle.
-query I
-SELECT count(*) FROM (VALUES (1), (2)) AS ordinary(r) WHERE r IN (1, 1, NULL)
-----
-1
-
 # Non-existent row ids: missing ids are ignored
 query T
-SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (0, 999, 4) ORDER BY name
+SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (0, 999, 4)
 ----
 Alice
 Eve

@@ -486,8 +486,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
 #ifdef LANCE_VANE_DISTRIBUTED
-    result->dataset_entry = LanceGetOrOpenDatasetEntryForTable(
-        context, *table, result->file_path);
+    result->dataset_entry =
+        LanceGetOrOpenDatasetEntryForTable(context, *table, result->file_path);
     result->dataset =
         result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
     if (!result->dataset) {
@@ -1312,8 +1312,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
 #ifdef LANCE_VANE_DISTRIBUTED
-    result->dataset_entry = LanceGetOrOpenDatasetEntryForTable(
-        context, *table, result->file_path);
+    result->dataset_entry =
+        LanceGetOrOpenDatasetEntryForTable(context, *table, result->file_path);
     result->dataset =
         result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
     if (!result->dataset) {

@@ -532,19 +532,10 @@ fn dataset_list_fragment_stats_inner(
     let mut out: Vec<LanceFragmentStats> = Vec::with_capacity(handle.dataset.fragments().len());
     for frag in handle.dataset.fragments().iter() {
         let mut bytes_on_disk = 0u64;
-        let mut all_file_sizes_known = true;
         for file in frag.files.iter() {
-            match file.file_size_bytes.get() {
-                Some(size) => {
-                    bytes_on_disk = bytes_on_disk.saturating_add(size.get());
-                }
-                None => {
-                    all_file_sizes_known = false;
-                }
+            if let Some(sz) = file.file_size_bytes.get() {
+                bytes_on_disk = bytes_on_disk.saturating_add(sz.get());
             }
-        }
-        if !all_file_sizes_known {
-            bytes_on_disk = 0;
         }
         let num_rows = match frag.num_rows() {
             Some(v) => i64::try_from(v).unwrap_or(-1),

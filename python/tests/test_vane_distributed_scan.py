@@ -1872,7 +1872,6 @@ def test_rest_namespace_named_secret_drop_and_recreate_is_recoverable(
         connection.close()
 
 
-
 def test_remote_object_store_errors_do_not_echo_resolved_secrets() -> None:
     access_key = "object-store-test-access-key"
     secret_key = "object-store-test-secret-key"
@@ -1978,8 +1977,7 @@ def test_unsafe_directory_namespace_uri_is_not_serialized(
     try:
         for catalog_name, unsafe_uri in unsafe_uris.items():
             source_connection.execute(
-                f"ATTACH {_sql_literal(unsafe_uri)} AS {catalog_name} "
-                "(TYPE LANCE)"
+                f"ATTACH {_sql_literal(unsafe_uri)} AS {catalog_name} " "(TYPE LANCE)"
             )
         for catalog_name in (
             "query_ns",
