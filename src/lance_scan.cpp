@@ -2246,6 +2246,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_idx_by_col_id.emplace(col_id, idx);
     return idx;
   };
+#ifdef LANCE_VANE_DISTRIBUTED
   auto add_virtual_cardinality_column = [&]() {
     if (!scan_state.scan_column_names.empty()) {
       return;
@@ -2254,6 +2255,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     add_scan_column(rowid_internal_index, LANCE_ROW_ID_COLUMN_NAME,
                     LogicalType::UBIGINT);
   };
+#endif
 
   for (auto col_id : input.column_ids) {
     if (col_id == COLUMN_IDENTIFIER_EMPTY) {
@@ -2392,7 +2394,9 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.use_dataset_take = true;
     scan_state.max_threads = 1;
     scan_state.take_row_ids = bind_data.take_row_ids;
+#ifdef LANCE_VANE_DISTRIBUTED
     add_virtual_cardinality_column();
+#endif
     return state;
   }
 
@@ -2424,7 +2428,9 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       scan_state.use_dataset_scanner = true;
       scan_state.use_dataset_take = true;
       scan_state.max_threads = 1;
+#ifdef LANCE_VANE_DISTRIBUTED
       add_virtual_cardinality_column();
+#endif
       return state;
     }
   }

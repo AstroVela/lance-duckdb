@@ -133,9 +133,11 @@ The official DuckDB build keeps its existing scan optimizers and behavior when
 ## Validation
 
 The Vane workflow builds both a native ABI compatibility harness and the custom
-static wheel at the exact revision recorded in `vane-extension.toml`. The wheel
-tests run from a fresh non-editable installation on a local Ray cluster with a
-coordinator-only head node and two execution workers. They cover split
+static wheel at the exact Vane and vcpkg revisions recorded in
+`vane-extension.toml`. The Vane-only vcpkg pin does not alter the root manifest
+used by official DuckDB builds. The wheel tests run from a fresh non-editable
+installation on a local Ray cluster with a coordinator-only head node and two
+execution workers. They cover split
 parallelism, point lookups, sampling, global limits, fixed snapshots,
 replacement detection, empty scans, directory namespaces, and MinIO-backed S3
 session replay, including static and temporary-profile credentials.

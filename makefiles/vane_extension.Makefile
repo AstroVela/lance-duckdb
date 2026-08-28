@@ -89,16 +89,16 @@ vane_wheel_dependencies: vane_prepare
 		test "$$(getconf LONG_BIT)" = "64" || \
 		{ echo "Vane wheel builds require 64-bit x86 Linux" >&2; exit 2; }
 	@set -eu; \
-	extension_baseline=$$("$(VANE_PYTHON)" -c \
-		'import json, sys; print(json.load(open(sys.argv[1]))["builtin-baseline"])' \
-		"$(VANE_EXTENSION_ROOT)/vcpkg.json"); \
-	case "$$extension_baseline" in \
+	extension_vcpkg_commit=$$("$(VANE_PYTHON)" -c \
+		'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["vcpkg_commit"])' \
+		"$(VANE_MANIFEST)"); \
+	case "$$extension_vcpkg_commit" in \
 		''|*[!0-9a-f]*) \
-			echo "vcpkg builtin-baseline must be a full lowercase commit SHA" >&2; \
+			echo "vcpkg_commit must be a full lowercase commit SHA" >&2; \
 			exit 2 ;; \
 	esac; \
-	test "$${#extension_baseline}" -eq 40 || { \
-		echo "vcpkg builtin-baseline must be a full lowercase commit SHA" >&2; \
+	test "$${#extension_vcpkg_commit}" -eq 40 || { \
+		echo "vcpkg_commit must be a full lowercase commit SHA" >&2; \
 		exit 2; \
 	}; \
 	if test -e "$(VANE_EXTENSION_VCPKG_ROOT)" && \
@@ -118,12 +118,12 @@ vane_wheel_dependencies: vane_prepare
 		exit 2; \
 	}; \
 	if ! git -C "$(VANE_EXTENSION_VCPKG_ROOT)" cat-file -e \
-		"$$extension_baseline^{commit}" 2>/dev/null; then \
+		"$$extension_vcpkg_commit^{commit}" 2>/dev/null; then \
 		git -C "$(VANE_EXTENSION_VCPKG_ROOT)" fetch --depth=1 origin \
-			"$$extension_baseline"; \
+			"$$extension_vcpkg_commit"; \
 	fi; \
 	git -C "$(VANE_EXTENSION_VCPKG_ROOT)" \
-		-c advice.detachedHead=false checkout --quiet --detach "$$extension_baseline"; \
+		-c advice.detachedHead=false checkout --quiet --detach "$$extension_vcpkg_commit"; \
 	extension_vcpkg_status=$$(git -C "$(VANE_EXTENSION_VCPKG_ROOT)" status --porcelain); \
 	test -z "$$extension_vcpkg_status" || { \
 		echo "VANE_EXTENSION_VCPKG_ROOT must be a clean checkout" >&2; \
