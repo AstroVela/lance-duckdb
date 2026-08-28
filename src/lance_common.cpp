@@ -4,6 +4,9 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "duckdb/common/file_system.hpp"
+#endif
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -74,6 +77,9 @@ void FillLanceNamespaceQueryConfig(
   out_config = {};
   out_config.table_id = cfg.table_id.c_str();
   out_config.k = k;
+#ifdef LANCE_VANE_DISTRIBUTED
+  out_config.version = NumericCast<int64_t>(cfg.snapshot_version);
+#endif
   out_config.prefilter = prefilter ? 1 : 0;
   out_config.filter = filter.empty() ? nullptr : filter.c_str();
 
@@ -115,15 +121,144 @@ void FillLanceNamespaceQueryConfig(
   out_config.api_key = api_key.empty() ? nullptr : api_key.c_str();
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static bool IsLanceVaneUriSchemeFirstChar(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static bool IsLanceVaneUriSchemeChar(char c) {
+  return IsLanceVaneUriSchemeFirstChar(c) || (c >= '0' && c <= '9') ||
+         c == '+' || c == '-' || c == '.';
+}
+
+string LanceVaneCanonicalizeSecretScope(const string &scope) {
+  auto delimiter = scope.find("://");
+  if (delimiter == string::npos || delimiter == 0 ||
+      !IsLanceVaneUriSchemeFirstChar(scope[0])) {
+    return scope;
+  }
+  for (idx_t i = 1; i < delimiter; i++) {
+    if (!IsLanceVaneUriSchemeChar(scope[i])) {
+      return scope;
+    }
+  }
+
+  string scheme;
+  scheme.reserve(delimiter);
+  for (idx_t i = 0; i < delimiter; i++) {
+    auto c = scope[i];
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c + ('a' - 'A'));
+    }
+    scheme.push_back(c);
+  }
+  if (scheme == "s3a" || scheme == "s3n") {
+    scheme = "s3";
+  }
+  return scheme + scope.substr(delimiter);
+}
+#endif
+
 string LanceNormalizeS3Scheme(const string &path) {
+#ifdef LANCE_VANE_DISTRIBUTED
+  // URL schemes are ASCII case-insensitive. Canonicalize all supported S3
+  // spellings before secret matching and connection-setting replay so a
+  // coordinator cannot succeed from ambient credentials while an isolated
+  // worker misses the captured DuckDB s3_* state.
+  if (path.size() >= 5 && StringUtil::CIEquals(path.substr(0, 5), "s3://")) {
+    return "s3://" + path.substr(5);
+  }
+  if (path.size() >= 6 && (StringUtil::CIEquals(path.substr(0, 6), "s3a://") ||
+                           StringUtil::CIEquals(path.substr(0, 6), "s3n://"))) {
+    return "s3://" + path.substr(6);
+  }
+#else
   if (StringUtil::StartsWith(path, "s3a://")) {
     return "s3://" + path.substr(6);
   }
   if (StringUtil::StartsWith(path, "s3n://")) {
     return "s3://" + path.substr(6);
   }
+#endif
   return path;
 }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+static uint8_t LanceVaneClassifyPath(const string &path) {
+  return lance_vane_classify_path(
+      reinterpret_cast<const uint8_t *>(path.data()), path.size());
+}
+
+bool LanceVanePathHasPrivateUriComponents(const string &path) {
+  auto classification = LanceVaneClassifyPath(path);
+  return classification &
+         (LANCE_VANE_PATH_HAS_PRIVATE_COMPONENTS | LANCE_VANE_PATH_INVALID);
+}
+
+bool LanceVanePathIsRemote(const string &path) {
+  return LanceVaneClassifyPath(path) & LANCE_VANE_PATH_IS_REMOTE;
+}
+
+bool LanceVanePathRequiresRedaction(ClientContext &context,
+                                    const string &path) {
+  auto classification = LanceVaneClassifyPath(path);
+  if (classification & (LANCE_VANE_PATH_HAS_PRIVATE_COMPONENTS |
+                        LANCE_VANE_PATH_INVALID | LANCE_VANE_PATH_IS_REMOTE)) {
+    return true;
+  }
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptionsForDistributedRead(context, path, open_path,
+                                               option_keys, option_values);
+  // Backend errors can repeat any resolved option, including temporary
+  // credentials or a private endpoint. The values themselves are never
+  // retained here; option presence is sufficient to fail closed.
+  return !option_keys.empty();
+}
+
+bool LanceVanePathIsLanceDataset(const string &path) {
+  return LanceVaneClassifyPath(path) & LANCE_VANE_PATH_IS_LANCE_DATASET;
+}
+
+string LanceVaneDiagnosticPath(const string &path, bool force_redaction) {
+  if (force_redaction || LanceVanePathHasPrivateUriComponents(path) ||
+      LanceVanePathIsRemote(path)) {
+    return "<redacted-private-uri>";
+  }
+  return path;
+}
+
+string LanceVaneFormatErrorSuffix(const string &path, bool force_redaction) {
+  if (!force_redaction && !LanceVanePathHasPrivateUriComponents(path) &&
+      !LanceVanePathIsRemote(path)) {
+    return LanceFormatErrorSuffix();
+  }
+  auto error = LanceConsumeLastError();
+  return error.empty() ? "" : " (Lance error details redacted)";
+}
+
+string LanceVaneReplayPath(ClientContext &context, const string &path) {
+  if (path.find('\0') != string::npos) {
+    return "";
+  }
+  auto classification = LanceVaneClassifyPath(path);
+  if (classification &
+      (LANCE_VANE_PATH_HAS_PRIVATE_COMPONENTS |
+       LANCE_VANE_PATH_IS_PROCESS_LOCAL | LANCE_VANE_PATH_INVALID)) {
+    return "";
+  }
+  if (!(classification & LANCE_VANE_PATH_IS_URI)) {
+    auto &file_system = FileSystem::GetFileSystem(context);
+    auto expanded = file_system.ExpandPath(path);
+    if (file_system.IsPathAbsolute(expanded)) {
+      return expanded;
+    }
+    return file_system.JoinPath(FileSystem::GetWorkingDirectory(), expanded);
+  }
+  return path;
+}
+#endif
 
 string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg) {
   if (!cfg.display_uri.empty()) {
@@ -145,6 +280,47 @@ string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg) {
   return LanceNormalizeS3Scheme(uri);
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+bool LanceVaneTablePathRequiresRedaction(const LanceTableEntry &table,
+                                         const string &path) {
+  if (LanceVanePathHasPrivateUriComponents(path) ||
+      LanceVanePathHasPrivateUriComponents(table.DatasetUri()) ||
+      LanceVanePathIsRemote(path) ||
+      LanceVanePathIsRemote(table.DatasetUri())) {
+    return true;
+  }
+  if (!table.IsNamespaceBacked()) {
+    return false;
+  }
+
+  auto &cfg = table.NamespaceConfig();
+  if (cfg.IsDirectory()) {
+    return cfg.distributed_replay_path_restricted ||
+           cfg.uses_coordinator_storage_secret || !cfg.option_keys.empty() ||
+           LanceVanePathHasPrivateUriComponents(cfg.root) ||
+           LanceVanePathHasPrivateUriComponents(cfg.display_uri) ||
+           LanceVanePathIsRemote(cfg.root) ||
+           LanceVanePathIsRemote(cfg.display_uri);
+  }
+  // REST namespace implementations can return opaque, short-lived storage
+  // options internally. Even an otherwise public endpoint can therefore make
+  // a backend error repeat credentials that C++ never observes directly.
+  return true;
+}
+
+string LanceVaneTableDiagnosticPath(const LanceTableEntry &table,
+                                    const string &path) {
+  return LanceVaneDiagnosticPath(
+      path, LanceVaneTablePathRequiresRedaction(table, path));
+}
+
+string LanceVaneTableFormatErrorSuffix(const LanceTableEntry &table,
+                                       const string &path) {
+  return LanceVaneFormatErrorSuffix(
+      path, LanceVaneTablePathRequiresRedaction(table, path));
+}
+#endif
+
 static string SecretValueToString(const Value &value) {
   if (value.IsNull()) {
     return "";
@@ -158,7 +334,13 @@ void LanceFillStorageOptionsFromSecrets(ClientContext &context,
                                         vector<string> &out_values) {
   auto &secret_manager = SecretManager::Get(context);
   auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto lookup_path = LanceVaneCanonicalizeSecretScope(path);
+  auto secret_match =
+      secret_manager.LookupSecret(transaction, lookup_path, "lance");
+#else
   auto secret_match = secret_manager.LookupSecret(transaction, path, "lance");
+#endif
   if (!secret_match.HasMatch() || !secret_match.secret_entry ||
       !secret_match.secret_entry->secret) {
     return;
@@ -205,21 +387,38 @@ static bool ProcessHasLanceS3Environment() {
   return false;
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static bool TryGetLanceS3Setting(ClientContext &context, const string &name,
+                                 string &out_value,
+                                 SettingScope *out_scope = nullptr,
+                                 bool accept_empty_local = false) {
+#else
 static bool TryGetLanceS3Setting(ClientContext &context, const string &name,
                                  string &out_value,
                                  SettingScope *out_scope = nullptr) {
+#endif
   Value value;
   auto lookup_result = context.TryGetCurrentSetting(name, value);
   if (!lookup_result || value.IsNull()) {
     return false;
   }
   out_value = value.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto scope = lookup_result.GetScope();
+  if (out_scope) {
+    *out_scope = scope;
+  }
+  if (out_value.empty()) {
+    return accept_empty_local && scope == SettingScope::LOCAL;
+  }
+#else
   if (out_value.empty()) {
     return false;
   }
   if (out_scope) {
     *out_scope = lookup_result.GetScope();
   }
+#endif
   return true;
 }
 
@@ -236,10 +435,33 @@ static bool LanceS3SettingsOverrideProcessEnvironment(ClientContext &context) {
 
   string access_key;
   string secret_key;
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto access_key_scope = SettingScope::INVALID;
+  auto secret_key_scope = SettingScope::INVALID;
+  auto has_access_key = TryGetLanceS3Setting(context, "s3_access_key_id",
+                                             access_key, &access_key_scope);
+  auto has_secret_key = TryGetLanceS3Setting(context, "s3_secret_access_key",
+                                             secret_key, &secret_key_scope);
+  auto has_local_access_key = access_key_scope == SettingScope::LOCAL;
+  auto has_local_secret_key = secret_key_scope == SettingScope::LOCAL;
+  if (has_local_access_key != has_local_secret_key) {
+    throw InvalidInputException(
+        "Connection-local S3 credentials must set both s3_access_key_id and "
+        "s3_secret_access_key");
+  }
+  if (has_local_access_key && (!has_access_key || !has_secret_key)) {
+    throw InvalidInputException(
+        "Connection-local S3 access and secret keys must be non-empty");
+  }
+  if (has_local_access_key) {
+    return true;
+  }
+#else
   auto has_access_key =
       TryGetLanceS3Setting(context, "s3_access_key_id", access_key);
   auto has_secret_key =
       TryGetLanceS3Setting(context, "s3_secret_access_key", secret_key);
+#endif
   if (has_access_key && has_secret_key &&
       (access_key != LanceS3EnvironmentValue("AWS_ACCESS_KEY_ID") ||
        secret_key != LanceS3EnvironmentValue("AWS_SECRET_ACCESS_KEY"))) {
@@ -247,10 +469,21 @@ static bool LanceS3SettingsOverrideProcessEnvironment(ClientContext &context) {
   }
 
   string session_token;
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto session_token_scope = SettingScope::INVALID;
+  auto has_session_token = TryGetLanceS3Setting(
+      context, "s3_session_token", session_token, &session_token_scope, true);
+  if (has_session_token &&
+      (session_token_scope == SettingScope::LOCAL ||
+       session_token != LanceS3EnvironmentValue("AWS_SESSION_TOKEN"))) {
+    return true;
+  }
+#else
   if (TryGetLanceS3Setting(context, "s3_session_token", session_token) &&
       session_token != LanceS3EnvironmentValue("AWS_SESSION_TOKEN")) {
     return true;
   }
+#endif
 
   string region;
   if (TryGetLanceS3Setting(context, "s3_region", region)) {
@@ -366,8 +599,24 @@ FillLanceStorageOptionsFromDuckDBS3Settings(ClientContext &context,
                                              access_key_id, &access_key_scope);
   auto has_secret_key = TryGetLanceS3Setting(
       context, "s3_secret_access_key", secret_access_key, &secret_key_scope);
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto has_session_token = TryGetLanceS3Setting(
+      context, "s3_session_token", session_token, &session_token_scope, true);
+  auto has_local_access_key = access_key_scope == SettingScope::LOCAL;
+  auto has_local_secret_key = secret_key_scope == SettingScope::LOCAL;
+  if (has_local_access_key != has_local_secret_key) {
+    throw InvalidInputException(
+        "Connection-local S3 credentials must set both s3_access_key_id and "
+        "s3_secret_access_key");
+  }
+  if (has_local_access_key && (!has_access_key || !has_secret_key)) {
+    throw InvalidInputException(
+        "Connection-local S3 access and secret keys must be non-empty");
+  }
+#else
   auto has_session_token = TryGetLanceS3Setting(
       context, "s3_session_token", session_token, &session_token_scope);
+#endif
   TryGetLanceS3Setting(context, "s3_region", region);
   AppendLanceStorageOption(out_keys, out_values, "aws_access_key_id",
                            access_key_id);
@@ -393,10 +642,24 @@ FillLanceStorageOptionsFromDuckDBS3Settings(ClientContext &context,
        (static_credentials_override_process_environment &&
         !process_session_token.empty() &&
         session_token == process_session_token));
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (has_session_token && !token_belongs_to_process_environment) {
+    if (session_token_scope == SettingScope::LOCAL) {
+      // Presence is meaningful even when the value is empty: it explicitly
+      // clears an inherited process session token for static credentials.
+      out_keys.push_back("aws_session_token");
+      out_values.push_back(session_token);
+    } else {
+      AppendLanceStorageOption(out_keys, out_values, "aws_session_token",
+                               session_token);
+    }
+  }
+#else
   if (!token_belongs_to_process_environment) {
     AppendLanceStorageOption(out_keys, out_values, "aws_session_token",
                              session_token);
   }
+#endif
   AppendLanceStorageOption(out_keys, out_values, "aws_region", region);
 
   string endpoint;
@@ -439,8 +702,14 @@ static void FillLanceNamespaceAuthFromSecrets(ClientContext &context,
 
   auto &secret_manager = SecretManager::Get(context);
   auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto lookup_endpoint = LanceVaneCanonicalizeSecretScope(endpoint);
+  auto secret_match = secret_manager.LookupSecret(transaction, lookup_endpoint,
+                                                  "lance_namespace");
+#else
   auto secret_match =
       secret_manager.LookupSecret(transaction, endpoint, "lance_namespace");
+#endif
   if (!secret_match.HasMatch() || !secret_match.secret_entry ||
       !secret_match.secret_entry->secret) {
     return;
@@ -452,11 +721,21 @@ static void FillLanceNamespaceAuthFromSecrets(ClientContext &context,
     return;
   }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto token = SecretValueToString(kv_secret->TryGetValue("token"));
+  auto bearer_token =
+      SecretValueToString(kv_secret->TryGetValue("bearer_token"));
+  out_bearer_token = std::move(token);
+  if (!bearer_token.empty()) {
+    out_bearer_token = std::move(bearer_token);
+  }
+#else
   out_bearer_token = SecretValueToString(kv_secret->TryGetValue("token"));
   if (out_bearer_token.empty()) {
     out_bearer_token =
         SecretValueToString(kv_secret->TryGetValue("bearer_token"));
   }
+#endif
   out_api_key = SecretValueToString(kv_secret->TryGetValue("api_key"));
 }
 
@@ -500,6 +779,31 @@ void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
 void ResolveLanceNamespaceAuthOverrides(
     const unordered_map<string, Value> &options, string &out_bearer_token,
     string &out_api_key) {
+#ifdef LANCE_VANE_DISTRIBUTED
+  // Resolve aliases in a fixed order. BEARER_TOKEN is the canonical spelling
+  // and wins over TOKEN regardless of unordered-map iteration order.
+  const Value *token = nullptr;
+  const Value *bearer_token = nullptr;
+  const Value *api_key = nullptr;
+  for (auto &kv : options) {
+    if (StringUtil::CIEquals(kv.first, "token")) {
+      token = &kv.second;
+    } else if (StringUtil::CIEquals(kv.first, "bearer_token")) {
+      bearer_token = &kv.second;
+    } else if (StringUtil::CIEquals(kv.first, "api_key")) {
+      api_key = &kv.second;
+    }
+  }
+  if (token) {
+    ApplyAuthOverrideValue(*token, out_bearer_token);
+  }
+  if (bearer_token) {
+    ApplyAuthOverrideValue(*bearer_token, out_bearer_token);
+  }
+  if (api_key) {
+    ApplyAuthOverrideValue(*api_key, out_api_key);
+  }
+#else
   for (auto &kv : options) {
     if (StringUtil::CIEquals(kv.first, "token")) {
       ApplyAuthOverrideValue(kv.second, out_bearer_token);
@@ -514,6 +818,7 @@ void ResolveLanceNamespaceAuthOverrides(
       continue;
     }
   }
+#endif
 }
 
 void ResolveLanceStorageOptions(ClientContext &context, const string &path,
@@ -530,7 +835,7 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
 
 #ifdef LANCE_VANE_DISTRIBUTED
 bool LanceHasMatchingStorageSecret(ClientContext &context, const string &path) {
-  auto normalized_path = LanceNormalizeS3Scheme(path);
+  auto normalized_path = LanceVaneCanonicalizeSecretScope(path);
   auto &secret_manager = SecretManager::Get(context);
   auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
   auto secret_match =
@@ -601,6 +906,35 @@ void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
   }
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static string LanceVaneNamespaceError(const string &endpoint,
+                                      const string &bearer_token,
+                                      const string &api_key,
+                                      const string &headers_tsv) {
+  (void)endpoint;
+  (void)bearer_token;
+  (void)api_key;
+  (void)headers_tsv;
+  auto error = LanceConsumeLastError();
+  // A namespace implementation can include opaque storage credentials or a
+  // presigned URL in any remote error body, even when the public endpoint was
+  // contacted without client-side authentication. Vane must therefore treat
+  // all REST namespace backend diagnostics as private.
+  return error.empty() ? "unknown error" : "details redacted";
+}
+
+static string
+LanceVaneDirectoryNamespaceError(const string &root,
+                                 const vector<string> &option_keys) {
+  auto error = LanceConsumeLastError();
+  if (!option_keys.empty() || LanceVanePathHasPrivateUriComponents(root) ||
+      LanceVanePathIsRemote(root)) {
+    return error.empty() ? "unknown error" : "details redacted";
+  }
+  return error.empty() ? "unknown error" : error;
+}
+#endif
+
 bool TryLanceNamespaceListTables(
     ClientContext &context, const string &endpoint, const string &namespace_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
@@ -618,10 +952,15 @@ bool TryLanceNamespaceListTables(
       endpoint.c_str(), namespace_id.c_str(), bearer_ptr, api_key_ptr,
       delimiter_ptr, headers_ptr);
   if (!ptr) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    out_error =
+        LanceVaneNamespaceError(endpoint, bearer_token, api_key, headers_tsv);
+#else
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
       out_error = "unknown error";
     }
+#endif
     return false;
   }
   string joined = ptr;
@@ -683,10 +1022,15 @@ bool TryLanceNamespaceDescribeTable(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
       delimiter_ptr, headers_ptr, &location_ptr, &options_ptr);
   if (rc != 0) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    out_error =
+        LanceVaneNamespaceError(endpoint, bearer_token, api_key, headers_tsv);
+#else
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
       out_error = "unknown error";
     }
+#endif
     return false;
   }
   if (location_ptr) {
@@ -788,10 +1132,14 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
       open_root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
   if (!ptr) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    out_error = LanceVaneDirectoryNamespaceError(root, option_keys);
+#else
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
       out_error = "unknown error";
     }
+#endif
     return false;
   }
 

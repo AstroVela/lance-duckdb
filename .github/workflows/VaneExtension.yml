@@ -1,0 +1,725 @@
+name: Vane Extension CI
+
+on:
+  pull_request:
+    branches: [main_vane]
+    paths-ignore:
+      - "**.md"
+  push:
+    branches: [main_vane]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: CI contract preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      DUCKDB_CI_TOOLS_VERSION: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+      VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
+    steps:
+      - name: Checkout CI inputs
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Checkout exact Vane CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane-extension-ci-tools
+          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
+          path: vane-ci-tools
+          persist-credentials: false
+
+      - name: Validate manifests and pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          import tomllib
+          from pathlib import Path
+
+          full_sha = re.compile(r"[0-9a-f]{40}")
+          manifest = tomllib.loads(Path("vane-extension.toml").read_text())
+          if manifest.get("schema_version") != 1:
+              raise SystemExit("vane-extension.toml schema_version must be 1")
+          vane = manifest.get("vane")
+          if not isinstance(vane, dict):
+              raise SystemExit("vane-extension.toml must contain a [vane] table")
+          if vane.get("repository") != "AstroVela/vane":
+              raise SystemExit("vane.repository must be AstroVela/vane")
+          revision = vane.get("revision")
+          if not isinstance(revision, str) or not full_sha.fullmatch(revision):
+              raise SystemExit("vane.revision must be a full lowercase commit SHA")
+          for key in ("extension_config", "native_test_selection"):
+              value = manifest.get(key)
+              if not isinstance(value, str) or not Path(value).is_file():
+                  raise SystemExit(f"{key} must identify a repository file")
+
+          vcpkg = json.loads(Path("vcpkg.json").read_text())
+          expected_baseline = "84bab45d415d22042bd0b9081aea57f362da3f35"
+          if vcpkg.get("builtin-baseline") != expected_baseline:
+              raise SystemExit(
+                  "vcpkg builtin-baseline must match the pinned DuckDB toolchain"
+              )
+
+          print(f"Vane revision: {revision}")
+          PY
+
+          verify_gitlink() {
+            local path="$1"
+            local expected="$2"
+            local entry mode type actual actual_path
+            entry="$(git ls-tree HEAD -- "${path}")"
+            read -r mode type actual actual_path <<< "${entry}"
+            test "${mode}" = "160000"
+            test "${type}" = "commit"
+            test "${actual_path}" = "${path}"
+            test "${actual}" = "${expected}"
+          }
+          verify_gitlink extension-ci-tools "${DUCKDB_CI_TOOLS_VERSION}"
+
+          python3 vane-ci-tools/scripts/vane_extension.py \
+            --manifest "${GITHUB_WORKSPACE}/vane-extension.toml" \
+            --extension-root "${GITHUB_WORKSPACE}" \
+            verify-ci-tools \
+            --ci-tools-source "${GITHUB_WORKSPACE}/vane-ci-tools" \
+            --expected-sha "${VANE_CI_TOOLS_VERSION}"
+
+  rust-quality:
+    name: Rust code quality
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Reclaim hosted-runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          for preinstalled_path in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL; do
+            if [ -e "$preinstalled_path" ]; then
+              sudo rm -rf -- "$preinstalled_path"
+            fi
+          done
+          sudo apt-get clean
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')"
+          minimum_kib=$((35 * 1024 * 1024))
+          if [ "$available_kib" -lt "$minimum_kib" ]; then
+            df -h "$GITHUB_WORKSPACE"
+            echo "Rust quality requires at least 35 GiB of free disk" >&2
+            exit 1
+          fi
+
+      - name: Checkout Rust sources
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev protobuf-compiler
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Check the default Rust feature set
+        run: cargo check --locked --no-default-features
+
+      - name: Check the Vane Rust feature set
+        run: cargo check --locked --all-features
+
+      - name: Run Rust clippy without Vane support
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
+      - name: Run Rust clippy with Vane support
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run Rust unit tests without Vane support
+        run: cargo test --locked --lib --no-default-features
+
+      - name: Run Rust unit tests with Vane support
+        run: cargo test --locked --lib --all-features
+
+  python-quality:
+    name: Python test quality
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Python tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Check Python test formatting and syntax
+        run: |
+          python -m pip install "black==24.10.0"
+          python -m black --check python/tests
+          python -m compileall -q python/tests
+
+  vane-native-build:
+    name: Build and test Vane ABI
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 750M
+      VANE_BUILD_JOBS: "8"
+      VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
+      DUCKDB_CI_TOOLS_VERSION: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_NATIVE_BUILD_DIR: ${{ github.workspace }}/build/vane-native
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VCPKG_TARGET_TRIPLET: x64-linux
+    steps:
+      - name: Reclaim hosted-runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          for preinstalled_path in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL; do
+            if [ -e "$preinstalled_path" ]; then
+              sudo rm -rf -- "$preinstalled_path"
+            fi
+          done
+          sudo apt-get clean
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')"
+          minimum_kib=$((35 * 1024 * 1024))
+          if [ "$available_kib" -lt "$minimum_kib" ]; then
+            df -h "$GITHUB_WORKSPACE"
+            echo "Vane native build requires at least 35 GiB of free disk" >&2
+            exit 1
+          fi
+
+      - name: Checkout extension
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout exact DuckDB extension CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: duckdb/extension-ci-tools
+          ref: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+          path: extension/extension-ci-tools
+          persist-credentials: false
+
+      - name: Checkout exact Vane CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane-extension-ci-tools
+          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
+          path: vane-ci-tools
+          persist-credentials: false
+
+      - name: Verify exact official Vane CI tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C "$VANE_EXTENSION_ROOT/extension-ci-tools" rev-parse HEAD)" = \
+            "$DUCKDB_CI_TOOLS_VERSION"
+          test -d "$VANE_EXTENSION_ROOT/extension-ci-tools/vcpkg_ports"
+          python3 vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools \
+            --ci-tools-source "${GITHUB_WORKSPACE}/vane-ci-tools" \
+            --expected-sha "$VANE_CI_TOOLS_VERSION"
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Read integration manifest
+        id: manifest
+        run: |
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate Vane identity
+        run: |
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            identity \
+            --vane-source "$VANE_SOURCE_DIR"
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ccache
+          python -m pip install "cmake>=3.29" "ninja>=1.10"
+
+      - name: Read extension vcpkg baseline
+        id: vcpkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$(python -c 'import json; print(json.load(open("extension/vcpkg.json"))["builtin-baseline"])')"
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Set up native vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Restore Vane native compiler cache
+        id: native-ccache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/.cache/vane-native-ccache
+          key: vane-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ steps.manifest.outputs.vane_revision }}
+
+      - name: Build and test extension against Vane DuckDB
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.cache/vane-native-ccache
+          VANE_CMAKE_COMPILER_LAUNCHER: ccache
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            native \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --build-dir "$VANE_NATIVE_BUILD_DIR" \
+            --jobs "$VANE_BUILD_JOBS"
+
+      - name: Report Vane native compiler cache
+        if: always()
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.cache/vane-native-ccache
+          VANE_CCACHE_ACTION_HIT: ${{ steps.native-ccache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions ccache restore hit: %s\n' "${VANE_CCACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+  vane-wheel-build:
+    name: Build and verify static Vane wheel
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 750M
+      DUCKDB_CI_TOOLS_VERSION: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+      VANE_BUILD_JOBS: "8"
+      VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
+      VANE_WHEEL_BUILD_DIR: ${{ github.workspace }}/build/vane-wheel
+      VANE_WHEEL_DIST_DIR: ${{ github.workspace }}/build/vane-wheel/dist
+      VCPKG_TARGET_TRIPLET: x64-linux
+    steps:
+      - name: Reclaim hosted-runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          for preinstalled_path in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL; do
+            if [ -e "$preinstalled_path" ]; then
+              sudo rm -rf -- "$preinstalled_path"
+            fi
+          done
+          sudo apt-get clean
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')"
+          minimum_kib=$((35 * 1024 * 1024))
+          if [ "$available_kib" -lt "$minimum_kib" ]; then
+            df -h "$GITHUB_WORKSPACE"
+            echo "Vane wheel build requires at least 35 GiB of free disk" >&2
+            exit 1
+          fi
+
+      - name: Checkout extension
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout exact DuckDB extension CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: duckdb/extension-ci-tools
+          ref: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+          path: extension/extension-ci-tools
+          persist-credentials: false
+
+      - name: Checkout exact Vane CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane-extension-ci-tools
+          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
+          path: vane-ci-tools
+          persist-credentials: false
+
+      - name: Verify exact CI tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C "$VANE_EXTENSION_ROOT/extension-ci-tools" rev-parse HEAD)" = \
+            "$DUCKDB_CI_TOOLS_VERSION"
+          test -d "$VANE_EXTENSION_ROOT/extension-ci-tools/vcpkg_ports"
+          python3 vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools \
+            --ci-tools-source "${GITHUB_WORKSPACE}/vane-ci-tools" \
+            --expected-sha "$VANE_CI_TOOLS_VERSION"
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Read integration manifest
+        id: manifest
+        run: |
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate Vane identity
+        run: |
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            identity \
+            --vane-source "$VANE_SOURCE_DIR"
+
+      - name: Install wheel build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            libtool \
+            ninja-build \
+            pkg-config \
+            tar \
+            unzip \
+            zip
+          python -m pip install \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0"
+
+      - name: Read extension vcpkg baseline
+        id: vcpkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$(python -c 'import json; print(json.load(open("extension/vcpkg.json"))["builtin-baseline"])')"
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Set up extension vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Bootstrap exact Vane wheel dependencies
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}/vane-vcpkg-archives
+          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+          VCPKG_INSTALLED_DIR: ${{ env.VANE_VCPKG_INSTALLED_DIR }}
+          VCPKG_ROOT: ${{ env.VANE_VCPKG_ROOT }}
+        run: |
+          bash "$VANE_SOURCE_DIR/scripts/bootstrap_vcpkg.sh" "$VANE_SOURCE_DIR"
+
+      - name: Prune Vane vcpkg build intermediates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$VANE_VCPKG_ROOT" = "$GITHUB_WORKSPACE/vane-vcpkg"
+          for intermediate_path in \
+            "$VANE_VCPKG_ROOT/buildtrees" \
+            "$VANE_VCPKG_ROOT/downloads" \
+            "$VANE_VCPKG_ROOT/packages" \
+            "$RUNNER_TEMP/vane-vcpkg-archives"; do
+            if [ -e "$intermediate_path" ]; then
+              rm -rf -- "$intermediate_path"
+            fi
+          done
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')"
+          minimum_kib=$((20 * 1024 * 1024))
+          if [ "$available_kib" -lt "$minimum_kib" ]; then
+            df -h "$GITHUB_WORKSPACE"
+            echo "Vane wheel compilation requires at least 20 GiB of free disk" >&2
+            exit 1
+          fi
+
+      - name: Restore Vane wheel compiler cache
+        id: wheel-ccache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/.cache/vane-wheel-ccache
+          key: vane-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ steps.manifest.outputs.vane_revision }}
+
+      - name: Build and verify extension-bearing Vane wheel
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.cache/vane-wheel-ccache
+          VANE_CMAKE_COMPILER_LAUNCHER: ccache
+          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            wheel \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --build-dir "$VANE_WHEEL_BUILD_DIR" \
+            --dist-dir "$VANE_WHEEL_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS"
+
+      - name: Report Vane wheel compiler cache
+        if: always()
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.cache/vane-wheel-ccache
+          VANE_CCACHE_ACTION_HIT: ${{ steps.wheel-ccache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions ccache restore hit: %s\n' "${VANE_CCACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload verified Vane wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-${{ steps.manifest.outputs.extension_name }}-wheel
+          path: ${{ env.VANE_WHEEL_DIST_DIR }}/*.whl
+          if-no-files-found: error
+
+  vane-single-test:
+    name: Vane single-node scan
+    needs: [rust-quality, python-quality, vane-native-build, vane-wheel-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download the verified static wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: vane-lance-wheel
+          path: ${{ runner.temp }}/vane-lance-wheel
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact wheel in a fresh environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "${RUNNER_TEMP}/vane-lance-single"
+          mapfile -t wheels < <(find "${RUNNER_TEMP}/vane-lance-wheel" \
+            -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected exactly one Vane Lance wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          "${RUNNER_TEMP}/vane-lance-single/bin/python" -m pip install \
+            "${wheels[0]}" \
+            "pytest>=8" \
+            "ray==2.58.0"
+
+      - name: Run Vane single-node scan tests
+        shell: bash
+        env:
+          PYTHONSAFEPATH: "1"
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/vane-lance-single/bin/python" -m pytest -q \
+            "${GITHUB_WORKSPACE}/python/tests/test_vane_single_scan.py"
+
+  vane-distributed-test:
+    name: Vane two-worker distributed scan
+    needs: [rust-quality, python-quality, vane-native-build, vane-wheel-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_ALLOW_HTTP: "true"
+      AWS_ENDPOINT_URL: http://127.0.0.1:9000
+      AWS_REGION: us-east-1
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      LANCE_S3_BUCKET: lance-vane-test
+      LANCE_TEST_S3: "1"
+      RAY_DEDUP_LOGS: "0"
+      VANE_RUNNER: ray
+    steps:
+      - name: Checkout tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download the verified static wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: vane-lance-wheel
+          path: ${{ runner.temp }}/vane-lance-wheel
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact wheel in a fresh environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "${RUNNER_TEMP}/vane-lance-distributed"
+          mapfile -t wheels < <(find "${RUNNER_TEMP}/vane-lance-wheel" \
+            -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected exactly one Vane Lance wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          "${RUNNER_TEMP}/vane-lance-distributed/bin/python" -m pip install \
+            "${wheels[0]}" \
+            "grpcio>=1.42.0" \
+            "pytest>=8" \
+            "ray==2.58.0"
+
+      - name: Start MinIO
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --rm \
+            --name lance-vane-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio@sha256:03a0bdbcefdac884210e9a5881085fb9b1c555e292a83987e5e110368f78ab96 \
+            server /data
+
+      - name: Wait for MinIO and create the test bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if curl -fsS "${AWS_ENDPOINT_URL}/minio/health/ready" >/dev/null; then
+              break
+            fi
+            if [ "${attempt}" -eq 60 ]; then
+              echo "MinIO did not become ready" >&2
+              docker logs lance-vane-minio
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --retry 5 --retry-delay 1 --retry-all-errors -fsSL \
+            "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-01-17T23-25-50Z" \
+            -o "${RUNNER_TEMP}/mc"
+          mc_sha256="2da8a55896bccb7cb5a29a7f907455c3b1a83eb9f51b10e4b4fbc9bff206e43d"
+          echo "${mc_sha256}  ${RUNNER_TEMP}/mc" | sha256sum --check -
+          chmod +x "${RUNNER_TEMP}/mc"
+          "${RUNNER_TEMP}/mc" alias set local "${AWS_ENDPOINT_URL}" \
+            "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}"
+          "${RUNNER_TEMP}/mc" mb --ignore-existing "local/${LANCE_S3_BUCKET}"
+
+      - name: Run distributed scan contracts
+        shell: bash
+        env:
+          PYTHONSAFEPATH: "1"
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/vane-lance-distributed/bin/python" -m pytest -q \
+            "${GITHUB_WORKSPACE}/python/tests/test_vane_distributed_scan.py"
+
+      - name: Stop MinIO
+        if: always()
+        shell: bash
+        run: |
+          docker logs lance-vane-minio || true
+          docker rm -f lance-vane-minio || true

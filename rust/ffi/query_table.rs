@@ -18,8 +18,12 @@ use lance_namespace_impls::{DirectoryNamespaceBuilder, RestNamespaceBuilder};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+#[cfg(feature = "vane-distributed")]
+use super::dir_namespace::with_explicit_aws_namespace_session;
 use super::types::StreamHandle;
 use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
+#[cfg(feature = "vane-distributed")]
+use super::util::{vane_external_location_error, vane_rest_namespace_error};
 
 const NAMESPACE_KIND_DIRECTORY: u8 = 0;
 const NAMESPACE_KIND_REST: u8 = 1;
@@ -41,6 +45,8 @@ pub struct LanceNamespaceQueryConfig {
     columns_len: usize,
     filter: *const c_char,
     k: u64,
+    #[cfg(feature = "vane-distributed")]
+    version: i64,
     prefilter: u8,
 }
 
@@ -80,6 +86,8 @@ struct ParsedNamespaceQueryConfig {
     columns: Vec<String>,
     filter: Option<String>,
     k: i32,
+    #[cfg(feature = "vane-distributed")]
+    version: Option<i64>,
     prefilter: bool,
 }
 
@@ -226,6 +234,8 @@ unsafe fn parse_config(
         columns,
         filter,
         k,
+        #[cfg(feature = "vane-distributed")]
+        version: (config.version > 0).then_some(config.version),
         prefilter: config.prefilter != 0,
     })
 }
@@ -243,6 +253,10 @@ fn apply_base_request(config: &ParsedNamespaceQueryConfig, request: &mut QueryTa
         NamespaceBackend::Directory { .. } => vec![config.table_id.clone()],
     });
     request.prefilter = Some(config.prefilter);
+    #[cfg(feature = "vane-distributed")]
+    {
+        request.version = config.version;
+    }
     if !config.columns.is_empty() {
         let mut columns = QueryTableRequestColumns::new();
         columns.column_names = Some(config.columns.clone());
@@ -263,10 +277,28 @@ async fn execute_query_table(
             storage_options,
         } => {
             let mut builder = DirectoryNamespaceBuilder::new(&root).manifest_enabled(false);
+            #[cfg(feature = "vane-distributed")]
+            {
+                if !storage_options.is_empty() {
+                    builder = builder.storage_options(storage_options.clone());
+                }
+                builder = with_explicit_aws_namespace_session(builder, &storage_options);
+            }
+            #[cfg(not(feature = "vane-distributed"))]
             if !storage_options.is_empty() {
                 builder = builder.storage_options(storage_options);
             }
             let namespace = builder.build().await.map_err(|err| {
+                #[cfg(feature = "vane-distributed")]
+                {
+                    vane_external_location_error(
+                        ErrorCode::NamespaceQueryTable,
+                        "dir namespace build",
+                        &root,
+                        err,
+                    )
+                }
+                #[cfg(not(feature = "vane-distributed"))]
                 FfiError::new(
                     ErrorCode::NamespaceQueryTable,
                     format!("dir namespace build '{root}': {err}"),
@@ -277,6 +309,16 @@ async fn execute_query_table(
                 .await
                 .map(|bytes| bytes.to_vec())
                 .map_err(|err| {
+                    #[cfg(feature = "vane-distributed")]
+                    {
+                        vane_external_location_error(
+                            ErrorCode::NamespaceQueryTable,
+                            "dir namespace query_table",
+                            &root,
+                            err,
+                        )
+                    }
+                    #[cfg(not(feature = "vane-distributed"))]
                     FfiError::new(
                         ErrorCode::NamespaceQueryTable,
                         format!("dir namespace query_table: {err}"),
@@ -309,6 +351,15 @@ async fn execute_query_table(
                 .await
                 .map(|bytes| bytes.to_vec())
                 .map_err(|err| {
+                    #[cfg(feature = "vane-distributed")]
+                    {
+                        vane_rest_namespace_error(
+                            ErrorCode::NamespaceQueryTable,
+                            "namespace query_table",
+                            err,
+                        )
+                    }
+                    #[cfg(not(feature = "vane-distributed"))]
                     FfiError::new(
                         ErrorCode::NamespaceQueryTable,
                         format!("namespace query_table: {err}"),

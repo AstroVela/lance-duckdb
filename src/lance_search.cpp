@@ -251,6 +251,9 @@ static void PopulateNamespaceSearchSchema(
 
 struct LanceKnnBindData : public TableFunctionData {
   string file_path;
+#ifdef LANCE_VANE_DISTRIBUTED
+  bool private_uri_diagnostics = false;
+#endif
   string vector_column;
   vector<float> query;
   uint64_t k = 0;
@@ -404,6 +407,10 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   }
 
   auto result = make_uniq<LanceKnnBindData>();
+#ifdef LANCE_VANE_DISTRIBUTED
+  result->private_uri_diagnostics = LanceVanePathRequiresRedaction(
+      context, input.inputs[0].GetValue<string>());
+#endif
   result->vector_column = input.inputs[1].GetValue<string>();
   result->query = ParseQueryVector(input.inputs[2], "lance_vector_search");
   result->prefilter = false;
@@ -478,6 +485,28 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
     result->namespace_backed = true;
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
+#ifdef LANCE_VANE_DISTRIBUTED
+    result->dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+        context, *table, result->file_path);
+    result->dataset =
+        result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
+    if (!result->dataset) {
+      throw IOException(
+          "Failed to open an exact Lance namespace search snapshot: " +
+          LanceVaneTableDiagnosticPath(*table, result->file_path) +
+          LanceVaneTableFormatErrorSuffix(*table, result->file_path));
+    }
+    auto snapshot_version = lance_dataset_version(result->dataset);
+    if (snapshot_version == 0 ||
+        snapshot_version > NumericLimits<int64_t>::Maximum()) {
+      throw IOException(
+          "Failed to resolve an exact Lance namespace search version" +
+          LanceVaneTableFormatErrorSuffix(*table, result->file_path));
+    }
+    result->namespace_config.snapshot_version = snapshot_version;
+    result->private_uri_diagnostics =
+        LanceVaneTablePathRequiresRedaction(*table, result->file_path);
+#endif
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");
     if (result->prefilter && result->namespace_filter.empty()) {
@@ -501,12 +530,31 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   result->dataset_entry =
       OpenSearchDatasetEntry(context, input.inputs[0], "lance_vector_search",
                              result->file_path, &result->dataset_cache_hit);
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (auto *table = TryResolveLanceTableEntry(
+          context, input.inputs[0].GetValue<string>())) {
+    result->private_uri_diagnostics =
+        LanceVaneTablePathRequiresRedaction(*table, result->file_path);
+  } else {
+    result->private_uri_diagnostics =
+        result->private_uri_diagnostics ||
+        LanceVanePathRequiresRedaction(context, result->file_path);
+  }
+#endif
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
   if (!result->dataset) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException("Failed to open Lance dataset: " +
+                      LanceVaneDiagnosticPath(result->file_path,
+                                              result->private_uri_diagnostics) +
+                      LanceVaneFormatErrorSuffix(
+                          result->file_path, result->private_uri_diagnostics));
+#else
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
+#endif
   }
 
   auto *schema_handle = lance_get_knn_schema(
@@ -514,8 +562,16 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
       result->query.size(), result->k, result->nprobes, result->refine_factor,
       result->prefilter ? 1 : 0, result->use_index ? 1 : 0);
   if (!schema_handle) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException("Failed to get Lance KNN schema: " +
+                      LanceVaneDiagnosticPath(result->file_path,
+                                              result->private_uri_diagnostics) +
+                      LanceVaneFormatErrorSuffix(
+                          result->file_path, result->private_uri_diagnostics));
+#else
     throw IOException("Failed to get Lance KNN schema: " + result->file_path +
                       LanceFormatErrorSuffix());
+#endif
   }
 
   memset(&result->schema_root.arrow_schema, 0,
@@ -523,9 +579,16 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
       0) {
     lance_free_schema(schema_handle);
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException(
+        "Failed to export Lance KNN schema to Arrow C Data Interface" +
+        LanceVaneFormatErrorSuffix(result->file_path,
+                                   result->private_uri_diagnostics));
+#else
     throw IOException(
         "Failed to export Lance KNN schema to Arrow C Data Interface" +
         LanceFormatErrorSuffix());
+#endif
   }
   lance_free_schema(schema_handle);
   LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
@@ -631,9 +694,16 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     result->stream =
         lance_create_namespace_vector_search_stream(&config, &options);
     if (!result->stream) {
+#ifdef LANCE_VANE_DISTRIBUTED
+      throw IOException(
+          "Failed to create Lance namespace vector search stream" +
+          LanceVaneFormatErrorSuffix(bind_data.file_path,
+                                     bind_data.private_uri_diagnostics));
+#else
       throw IOException("Failed to create Lance namespace vector search "
                         "stream" +
                         LanceFormatErrorSuffix());
+#endif
     }
     return std::move(result);
   }
@@ -661,14 +731,26 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
         bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
   }
   if (!result->stream) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException(
+        "Failed to create Lance KNN stream" +
+        LanceVaneFormatErrorSuffix(bind_data.file_path,
+                                   bind_data.private_uri_diagnostics));
+#else
     throw IOException("Failed to create Lance KNN stream" +
                       LanceFormatErrorSuffix());
+#endif
   }
 
   return std::move(result);
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state,
+                                  const LanceKnnBindData &bind_data) {
+#else
 static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
+#endif
   if (!local_state.stream) {
     return false;
   }
@@ -681,8 +763,15 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
     return false;
   }
   if (rc != 0) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException(
+        "Failed to read next Lance RecordBatch" +
+        LanceVaneFormatErrorSuffix(bind_data.file_path,
+                                   bind_data.private_uri_diagnostics));
+#else
     throw IOException("Failed to read next Lance RecordBatch" +
                       LanceFormatErrorSuffix());
+#endif
   }
 
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
@@ -692,9 +781,16 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
 
   if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
     lance_free_batch(batch);
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException(
+        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
+        LanceVaneFormatErrorSuffix(bind_data.file_path,
+                                   bind_data.private_uri_diagnostics));
+#else
     throw IOException(
         "Failed to export Lance RecordBatch to Arrow C Data Interface" +
         LanceFormatErrorSuffix());
+#endif
   }
 
   lance_free_batch(batch);
@@ -730,7 +826,11 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
   while (true) {
     if (local_state.chunk_offset >=
         NumericCast<idx_t>(local_state.chunk->arrow_array.length)) {
+#ifdef LANCE_VANE_DISTRIBUTED
+      if (!LanceKnnLoadNextBatch(local_state, bind_data)) {
+#else
       if (!LanceKnnLoadNextBatch(local_state)) {
+#endif
         return;
       }
     }
@@ -778,7 +878,12 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   InsertionOrderPreservingMap<string> result;
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  result["Lance Path"] = LanceVaneDiagnosticPath(
+      bind_data.file_path, bind_data.private_uri_diagnostics);
+#else
   result["Lance Path"] = bind_data.file_path;
+#endif
   result["Lance Search Backend"] =
       bind_data.namespace_backed ? "namespace_query_table" : "dataset_scan";
   result["Lance Vector Column"] = bind_data.vector_column;
@@ -799,6 +904,11 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   if (bind_data.namespace_backed) {
     return result;
   }
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (bind_data.private_uri_diagnostics) {
+    return result;
+  }
+#endif
 
   result["Lance Pushed Filter Parts"] =
       to_string(bind_data.lance_pushed_filter_ir_parts.size());
@@ -830,7 +940,12 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto &global_state = input.global_state->Cast<LanceKnnGlobalState>();
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  result["Lance Path"] = LanceVaneDiagnosticPath(
+      bind_data.file_path, bind_data.private_uri_diagnostics);
+#else
   result["Lance Path"] = bind_data.file_path;
+#endif
   result["Lance Search Backend"] =
       bind_data.namespace_backed ? "namespace_query_table" : "dataset_scan";
   result["Lance Vector Column"] = bind_data.vector_column;
@@ -864,6 +979,11 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
   if (bind_data.namespace_backed) {
     return result;
   }
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (bind_data.private_uri_diagnostics) {
+    return result;
+  }
+#endif
 
   if (!global_state.explain_computed.load()) {
     std::lock_guard<std::mutex> guard(global_state.explain_mutex);
@@ -938,6 +1058,9 @@ struct LanceSearchBindData : public TableFunctionData {
   LanceSearchMode mode = LanceSearchMode::Fts;
 
   string file_path;
+#ifdef LANCE_VANE_DISTRIBUTED
+  bool private_uri_diagnostics = false;
+#endif
   bool prefilter = false;
   bool namespace_backed = false;
   LanceNamespaceTableConfig namespace_config;
@@ -1024,8 +1147,15 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
       local_state.stream =
           lance_create_namespace_fts_search_stream(&config, &options);
       if (!local_state.stream) {
+#ifdef LANCE_VANE_DISTRIBUTED
+        throw IOException(
+            "Failed to create Lance namespace FTS stream" +
+            LanceVaneFormatErrorSuffix(bind_data.file_path,
+                                       bind_data.private_uri_diagnostics));
+#else
         throw IOException("Failed to create Lance namespace FTS stream" +
                           LanceFormatErrorSuffix());
+#endif
       }
     } else {
       const uint8_t *filter_ir = global.lance_filter_ir.empty()
@@ -1061,8 +1191,15 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
         local_state.stream = create_stream(nullptr, 0);
       }
       if (!local_state.stream) {
+#ifdef LANCE_VANE_DISTRIBUTED
+        throw IOException(
+            "Failed to create Lance search stream" +
+            LanceVaneFormatErrorSuffix(bind_data.file_path,
+                                       bind_data.private_uri_diagnostics));
+#else
         throw IOException("Failed to create Lance search stream" +
                           LanceFormatErrorSuffix());
+#endif
       }
     }
   }
@@ -1075,8 +1212,15 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
     return false;
   }
   if (rc != 0) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException(
+        "Failed to read next Lance RecordBatch" +
+        LanceVaneFormatErrorSuffix(bind_data.file_path,
+                                   bind_data.private_uri_diagnostics));
+#else
     throw IOException("Failed to read next Lance RecordBatch" +
                       LanceFormatErrorSuffix());
+#endif
   }
 
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
@@ -1086,9 +1230,16 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
 
   if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
     lance_free_batch(batch);
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException(
+        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
+        LanceVaneFormatErrorSuffix(bind_data.file_path,
+                                   bind_data.private_uri_diagnostics));
+#else
     throw IOException(
         "Failed to export Lance RecordBatch to Arrow C Data Interface" +
         LanceFormatErrorSuffix());
+#endif
   }
   lance_free_batch(batch);
 
@@ -1128,6 +1279,10 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
 
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Fts;
+#ifdef LANCE_VANE_DISTRIBUTED
+  result->private_uri_diagnostics = LanceVanePathRequiresRedaction(
+      context, input.inputs[0].GetValue<string>());
+#endif
   result->text_column = input.inputs[1].GetValue<string>();
   result->query = input.inputs[2].GetValue<string>();
   result->namespace_filter = ParseOptionalNamedString(input, "filter");
@@ -1156,6 +1311,28 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
     result->namespace_backed = true;
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
+#ifdef LANCE_VANE_DISTRIBUTED
+    result->dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+        context, *table, result->file_path);
+    result->dataset =
+        result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
+    if (!result->dataset) {
+      throw IOException(
+          "Failed to open an exact Lance namespace search snapshot: " +
+          LanceVaneTableDiagnosticPath(*table, result->file_path) +
+          LanceVaneTableFormatErrorSuffix(*table, result->file_path));
+    }
+    auto snapshot_version = lance_dataset_version(result->dataset);
+    if (snapshot_version == 0 ||
+        snapshot_version > NumericLimits<int64_t>::Maximum()) {
+      throw IOException(
+          "Failed to resolve an exact Lance namespace search version" +
+          LanceVaneTableFormatErrorSuffix(*table, result->file_path));
+    }
+    result->namespace_config.snapshot_version = snapshot_version;
+    result->private_uri_diagnostics =
+        LanceVaneTablePathRequiresRedaction(*table, result->file_path);
+#endif
     result->text_column = RequireNamespaceSearchColumn(
         *table, result->text_column, "lance_fts", "text_column");
     if (result->prefilter && result->namespace_filter.empty()) {
@@ -1179,20 +1356,47 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   result->dataset_entry =
       OpenSearchDatasetEntry(context, input.inputs[0], "lance_fts",
                              result->file_path, &result->dataset_cache_hit);
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (auto *table = TryResolveLanceTableEntry(
+          context, input.inputs[0].GetValue<string>())) {
+    result->private_uri_diagnostics =
+        LanceVaneTablePathRequiresRedaction(*table, result->file_path);
+  } else {
+    result->private_uri_diagnostics =
+        result->private_uri_diagnostics ||
+        LanceVanePathRequiresRedaction(context, result->file_path);
+  }
+#endif
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
   if (!result->dataset) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException("Failed to open Lance dataset: " +
+                      LanceVaneDiagnosticPath(result->file_path,
+                                              result->private_uri_diagnostics) +
+                      LanceVaneFormatErrorSuffix(
+                          result->file_path, result->private_uri_diagnostics));
+#else
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
+#endif
   }
 
   auto *schema_handle = lance_get_fts_schema(
       result->dataset, result->text_column.c_str(), result->query.c_str(),
       result->k, result->prefilter ? 1 : 0);
   if (!schema_handle) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException("Failed to get Lance FTS schema: " +
+                      LanceVaneDiagnosticPath(result->file_path,
+                                              result->private_uri_diagnostics) +
+                      LanceVaneFormatErrorSuffix(
+                          result->file_path, result->private_uri_diagnostics));
+#else
     throw IOException("Failed to get Lance FTS schema: " + result->file_path +
                       LanceFormatErrorSuffix());
+#endif
   }
 
   memset(&result->schema_root.arrow_schema, 0,
@@ -1200,9 +1404,16 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
       0) {
     lance_free_schema(schema_handle);
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException(
+        "Failed to export Lance FTS schema to Arrow C Data Interface" +
+        LanceVaneFormatErrorSuffix(result->file_path,
+                                   result->private_uri_diagnostics));
+#else
     throw IOException(
         "Failed to export Lance FTS schema to Arrow C Data Interface" +
         LanceFormatErrorSuffix());
+#endif
   }
   lance_free_schema(schema_handle);
   LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
@@ -1245,10 +1456,25 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
 
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
+#ifdef LANCE_VANE_DISTRIBUTED
+  result->private_uri_diagnostics = LanceVanePathRequiresRedaction(
+      context, input.inputs[0].GetValue<string>());
+#endif
   result->file_path.clear();
   result->dataset_entry =
       OpenSearchDatasetEntry(context, input.inputs[0], "lance_hybrid_search",
                              result->file_path, &result->dataset_cache_hit);
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (auto *table = TryResolveLanceTableEntry(
+          context, input.inputs[0].GetValue<string>())) {
+    result->private_uri_diagnostics =
+        LanceVaneTablePathRequiresRedaction(*table, result->file_path);
+  } else {
+    result->private_uri_diagnostics =
+        result->private_uri_diagnostics ||
+        LanceVanePathRequiresRedaction(context, result->file_path);
+  }
+#endif
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->vector_column = input.inputs[1].GetValue<string>();
@@ -1331,14 +1557,30 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   }
 
   if (!result->dataset) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException("Failed to open Lance dataset: " +
+                      LanceVaneDiagnosticPath(result->file_path,
+                                              result->private_uri_diagnostics) +
+                      LanceVaneFormatErrorSuffix(
+                          result->file_path, result->private_uri_diagnostics));
+#else
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
+#endif
   }
 
   auto *schema_handle = lance_get_hybrid_schema(result->dataset);
   if (!schema_handle) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException("Failed to get Lance hybrid schema: " +
+                      LanceVaneDiagnosticPath(result->file_path,
+                                              result->private_uri_diagnostics) +
+                      LanceVaneFormatErrorSuffix(
+                          result->file_path, result->private_uri_diagnostics));
+#else
     throw IOException("Failed to get Lance hybrid schema: " +
                       result->file_path + LanceFormatErrorSuffix());
+#endif
   }
 
   memset(&result->schema_root.arrow_schema, 0,
@@ -1346,9 +1588,16 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
       0) {
     lance_free_schema(schema_handle);
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException(
+        "Failed to export Lance hybrid schema to Arrow C Data Interface" +
+        LanceVaneFormatErrorSuffix(result->file_path,
+                                   result->private_uri_diagnostics));
+#else
     throw IOException(
         "Failed to export Lance hybrid schema to Arrow C Data Interface" +
         LanceFormatErrorSuffix());
+#endif
   }
   lance_free_schema(schema_handle);
   LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
@@ -1489,7 +1738,12 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
 static InsertionOrderPreservingMap<string>
 LanceSearchBindToString(const LanceSearchBindData &bind_data) {
   InsertionOrderPreservingMap<string> result;
+#ifdef LANCE_VANE_DISTRIBUTED
+  result["Lance Path"] = LanceVaneDiagnosticPath(
+      bind_data.file_path, bind_data.private_uri_diagnostics);
+#else
   result["Lance Path"] = bind_data.file_path;
+#endif
   result["Lance Search Backend"] =
       bind_data.namespace_backed ? "namespace_query_table" : "dataset_scan";
   result["Lance Search Mode"] =

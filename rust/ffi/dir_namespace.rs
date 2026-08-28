@@ -1,24 +1,112 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
+#[cfg(feature = "vane-distributed")]
+use std::fmt;
 use std::ptr;
 use std::sync::Arc;
 
 use lance::dataset::builder::DatasetBuilder;
+#[cfg(feature = "vane-distributed")]
+use lance::session::Session;
 use lance_core::Error as LanceError;
+#[cfg(feature = "vane-distributed")]
+use lance_io::object_store::providers::{aws::AwsStoreProvider, ObjectStoreProvider};
+#[cfg(feature = "vane-distributed")]
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_namespace::models::{DropTableRequest, ListTablesRequest};
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::DirectoryNamespaceBuilder;
+#[cfg(feature = "vane-distributed")]
+use object_store::aws::AwsCredentialProvider;
+#[cfg(feature = "vane-distributed")]
+use object_store::path::Path as ObjectStorePath;
+#[cfg(feature = "vane-distributed")]
+use url::Url;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::record_dataset_open;
 use super::types::DatasetHandle;
-#[cfg(feature = "vane-distributed")]
-use super::util::with_explicit_aws_credentials;
 use super::util::{
     cstr_to_str, optional_session_handle, slice_from_ptr, to_c_string, FfiError, FfiResult,
 };
+#[cfg(feature = "vane-distributed")]
+use super::util::{
+    explicit_aws_credentials, vane_external_location_error, with_explicit_aws_credentials,
+};
+
+#[cfg(feature = "vane-distributed")]
+struct StaticAwsStoreProvider {
+    delegate: Arc<dyn ObjectStoreProvider>,
+    credentials: AwsCredentialProvider,
+}
+
+#[cfg(feature = "vane-distributed")]
+impl fmt::Debug for StaticAwsStoreProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StaticAwsStoreProvider")
+            .field("credentials", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[async_trait::async_trait]
+impl ObjectStoreProvider for StaticAwsStoreProvider {
+    async fn new_store(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<ObjectStore, LanceError> {
+        if params
+            .storage_options()
+            .and_then(|options| options.get("use_opendal"))
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            return Err(LanceError::invalid_input(
+                "Vane-replayed static AWS credentials do not support use_opendal=true",
+            ));
+        }
+        let mut params = params.clone();
+        params.aws_credentials = Some(self.credentials.clone());
+        self.delegate.new_store(base_path, &params).await
+    }
+
+    fn extract_path(&self, url: &Url) -> Result<ObjectStorePath, LanceError> {
+        self.delegate.extract_path(url)
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String, LanceError> {
+        self.delegate
+            .calculate_object_store_prefix(url, storage_options)
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+pub(super) fn with_explicit_aws_namespace_session(
+    builder: DirectoryNamespaceBuilder,
+    storage_options: &HashMap<String, String>,
+) -> DirectoryNamespaceBuilder {
+    let Some(credentials) = explicit_aws_credentials(storage_options) else {
+        return builder;
+    };
+    let session = Arc::new(Session::default());
+    let registry = session.store_registry();
+    let credentials = Arc::new(object_store::StaticCredentialProvider::new(credentials));
+    let provider = Arc::new(StaticAwsStoreProvider {
+        delegate: Arc::new(AwsStoreProvider),
+        credentials,
+    });
+    registry.insert("s3", provider.clone());
+    registry.insert("s3+ddb", provider);
+    builder.session(session)
+}
 
 fn parse_storage_options(
     option_keys: *const *const c_char,
@@ -73,10 +161,28 @@ fn dir_namespace_list_tables_inner(
 
     let tables = runtime::block_on(async move {
         let mut builder = DirectoryNamespaceBuilder::new(root).manifest_enabled(false);
+        #[cfg(feature = "vane-distributed")]
+        {
+            if !storage_options.is_empty() {
+                builder = builder.storage_options(storage_options.clone());
+            }
+            builder = with_explicit_aws_namespace_session(builder, &storage_options);
+        }
+        #[cfg(not(feature = "vane-distributed"))]
         if !storage_options.is_empty() {
             builder = builder.storage_options(storage_options);
         }
         let namespace = builder.build().await.map_err(|err| {
+            #[cfg(feature = "vane-distributed")]
+            {
+                vane_external_location_error(
+                    ErrorCode::DirNamespaceListTables,
+                    "dir namespace build",
+                    root,
+                    err,
+                )
+            }
+            #[cfg(not(feature = "vane-distributed"))]
             FfiError::new(
                 ErrorCode::DirNamespaceListTables,
                 format!("dir namespace build '{root}': {err}"),
@@ -86,6 +192,16 @@ fn dir_namespace_list_tables_inner(
         let mut req = ListTablesRequest::new();
         req.id = Some(Vec::new());
         let resp = namespace.list_tables(req).await.map_err(|err| {
+            #[cfg(feature = "vane-distributed")]
+            {
+                vane_external_location_error(
+                    ErrorCode::DirNamespaceListTables,
+                    "dir namespace list_tables",
+                    root,
+                    err,
+                )
+            }
+            #[cfg(not(feature = "vane-distributed"))]
             FfiError::new(
                 ErrorCode::DirNamespaceListTables,
                 format!("dir namespace list_tables '{root}': {err}"),
@@ -135,10 +251,30 @@ fn open_dataset_in_dir_namespace_inner(
 
     let dataset = runtime::block_on(async {
         let mut ns_builder = DirectoryNamespaceBuilder::new(&root).manifest_enabled(false);
+        #[cfg(feature = "vane-distributed")]
+        {
+            if !storage_options.is_empty() {
+                ns_builder = ns_builder.storage_options(storage_options.clone());
+            }
+            ns_builder = with_explicit_aws_namespace_session(ns_builder, &storage_options);
+        }
+        #[cfg(not(feature = "vane-distributed"))]
         if !storage_options.is_empty() {
+            // The same map is also consumed by DatasetBuilder below. Both the
+            // namespace discovery and dataset open paths need these options.
             ns_builder = ns_builder.storage_options(storage_options.clone());
         }
         let namespace = ns_builder.build().await.map_err(|err| {
+            #[cfg(feature = "vane-distributed")]
+            {
+                vane_external_location_error(
+                    ErrorCode::DatasetOpen,
+                    "dir namespace build",
+                    &root,
+                    err,
+                )
+            }
+            #[cfg(not(feature = "vane-distributed"))]
             FfiError::new(
                 ErrorCode::DatasetOpen,
                 format!("dir namespace build '{root}': {err}"),
@@ -148,6 +284,16 @@ fn open_dataset_in_dir_namespace_inner(
             DatasetBuilder::from_namespace(Arc::new(namespace), vec![table_name.to_string()])
                 .await
                 .map_err(|err| {
+                    #[cfg(feature = "vane-distributed")]
+                    {
+                        vane_external_location_error(
+                            ErrorCode::DatasetOpen,
+                            "dir namespace describe",
+                            &format!("{root}/{table_name}"),
+                            err,
+                        )
+                    }
+                    #[cfg(not(feature = "vane-distributed"))]
                     FfiError::new(
                         ErrorCode::DatasetOpen,
                         format!("dir namespace describe '{root}/{table_name}': {err}"),
@@ -179,6 +325,16 @@ fn open_dataset_in_dir_namespace_inner(
             builder = builder.with_session(session);
         }
         builder.load().await.map_err(|err| {
+            #[cfg(feature = "vane-distributed")]
+            {
+                vane_external_location_error(
+                    ErrorCode::DatasetOpen,
+                    "dir namespace dataset open",
+                    &root,
+                    err,
+                )
+            }
+            #[cfg(not(feature = "vane-distributed"))]
             FfiError::new(
                 ErrorCode::DatasetOpen,
                 format!("dir namespace dataset open: {err}"),
@@ -329,5 +485,98 @@ pub unsafe extern "C" fn lance_dir_namespace_drop_table(
             set_last_error(err.code, err.message);
             -1
         }
+    }
+}
+
+#[cfg(all(test, feature = "vane-distributed"))]
+mod tests {
+    use std::sync::Mutex;
+
+    use lance_io::object_store::StorageOptionsAccessor;
+    use object_store::aws::AwsCredential;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct CaptureStoreProvider {
+        credentials: Arc<Mutex<Option<AwsCredentialProvider>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for CaptureStoreProvider {
+        async fn new_store(
+            &self,
+            _base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore, LanceError> {
+            *self.credentials.lock().unwrap() = params.aws_credentials.clone();
+            Err(LanceError::invalid_input("captured object-store params"))
+        }
+    }
+
+    fn static_provider(delegate: Arc<dyn ObjectStoreProvider>) -> StaticAwsStoreProvider {
+        let credentials = AwsCredential {
+            key_id: "test-access".to_string(),
+            secret_key: "test-secret".to_string(),
+            token: None,
+        };
+        StaticAwsStoreProvider {
+            delegate,
+            credentials: Arc::new(object_store::StaticCredentialProvider::new(credentials)),
+        }
+    }
+
+    #[test]
+    fn static_provider_injects_tokenless_credentials_and_redacts_debug() {
+        let captured = Arc::new(Mutex::new(None));
+        let provider = static_provider(Arc::new(CaptureStoreProvider {
+            credentials: captured.clone(),
+        }));
+        let options = HashMap::from([("aws_session_token".to_string(), String::new())]);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+
+        let result =
+            runtime::block_on(provider.new_store(Url::parse("s3://bucket/root").unwrap(), &params))
+                .unwrap();
+        assert!(result.is_err());
+        let credentials = captured.lock().unwrap().clone().unwrap();
+        let credentials = runtime::block_on(credentials.get_credential())
+            .unwrap()
+            .unwrap();
+        assert_eq!(credentials.key_id, "test-access");
+        assert_eq!(credentials.secret_key, "test-secret");
+        assert_eq!(credentials.token, None);
+
+        let debug = format!("{provider:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("test-access"));
+        assert!(!debug.contains("test-secret"));
+    }
+
+    #[test]
+    fn static_provider_rejects_opendal_before_delegation() {
+        let captured = Arc::new(Mutex::new(None));
+        let provider = static_provider(Arc::new(CaptureStoreProvider {
+            credentials: captured.clone(),
+        }));
+        let options = HashMap::from([("use_opendal".to_string(), "true".to_string())]);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+
+        let error =
+            runtime::block_on(provider.new_store(Url::parse("s3://bucket/root").unwrap(), &params))
+                .unwrap()
+                .unwrap_err();
+        assert!(error.to_string().contains("use_opendal=true"));
+        assert!(captured.lock().unwrap().is_none());
     }
 }

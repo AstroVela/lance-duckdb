@@ -3954,16 +3954,19 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "lance-index",
+ "lance-io",
  "lance-linalg",
  "lance-namespace",
  "lance-namespace-impls",
  "lance-table",
+ "object_store",
  "rand 0.8.7",
  "roaring",
  "serde",
  "serde_json",
  "snafu 0.8.9",
  "tokio",
+ "url",
 ]
 
 [[package]]

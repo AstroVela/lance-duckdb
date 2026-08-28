@@ -1,9 +1,12 @@
+#[cfg(feature = "vane-distributed")]
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void};
 use std::ptr;
+#[cfg(feature = "vane-distributed")]
 use std::sync::Arc;
 
 use lance::dataset::ProjectionRequest;
+#[cfg(feature = "vane-distributed")]
 use lance_core::utils::deletion::DeletionVector;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -81,7 +84,38 @@ fn create_dataset_take_stream_inner(
     } else {
         unsafe { slice_from_ptr(row_ids, row_ids_len, "row_ids")? }
     };
+    #[cfg(not(feature = "vane-distributed"))]
     let row_ids_filtered;
+    #[cfg(not(feature = "vane-distributed"))]
+    let row_ids = if !filter_out_of_range || row_ids.is_empty() {
+        row_ids
+    } else {
+        let max_row_id = if handle.dataset.manifest.uses_stable_row_ids() {
+            handle.dataset.manifest.next_row_id
+        } else {
+            handle
+                .dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.num_rows().unwrap_or_default() as u64)
+                .sum::<u64>()
+        };
+        if row_ids.iter().all(|id| *id < max_row_id) {
+            row_ids
+        } else {
+            row_ids_filtered = row_ids
+                .iter()
+                .copied()
+                .filter(|id| *id < max_row_id)
+                .collect::<Vec<_>>();
+            row_ids_filtered.as_slice()
+        }
+    };
+
+    #[cfg(feature = "vane-distributed")]
+    let row_ids_filtered;
+    #[cfg(feature = "vane-distributed")]
     let row_ids = if !filter_out_of_range || row_ids.is_empty() {
         row_ids
     } else if handle.dataset.manifest.uses_stable_row_ids() {

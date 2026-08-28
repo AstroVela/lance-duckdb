@@ -18,6 +18,8 @@ use crate::runtime;
 
 use super::session::{record_dataset_open, record_namespace_describe};
 use super::types::DatasetHandle;
+#[cfg(feature = "vane-distributed")]
+use super::util::vane_rest_namespace_error;
 use super::util::{
     cstr_to_str, optional_session_handle, schema_to_ffi_arrow_schema, to_c_string, FfiError,
     FfiResult,
@@ -124,6 +126,15 @@ fn list_tables_inner(
             req.page_token = page_token.clone();
             req.limit = Some(1000);
             let resp = namespace.list_tables(req).await.map_err(|err| {
+                #[cfg(feature = "vane-distributed")]
+                {
+                    vane_rest_namespace_error(
+                        ErrorCode::NamespaceListTables,
+                        "namespace list_tables",
+                        err,
+                    )
+                }
+                #[cfg(not(feature = "vane-distributed"))]
                 FfiError::new(
                     ErrorCode::NamespaceListTables,
                     format!("namespace list_tables: {err}"),
@@ -210,6 +221,15 @@ fn describe_table_info_inner(
         );
         req.with_table_uri = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
+            #[cfg(feature = "vane-distributed")]
+            {
+                vane_rest_namespace_error(
+                    ErrorCode::NamespaceDescribeTableInfo,
+                    "namespace describe_table",
+                    err,
+                )
+            }
+            #[cfg(not(feature = "vane-distributed"))]
             FfiError::new(
                 ErrorCode::NamespaceDescribeTableInfo,
                 format!("namespace describe_table: {err}"),
@@ -506,6 +526,15 @@ fn describe_table_with_schema_inner(
         req.with_table_uri = Some(true);
         req.load_detailed_metadata = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
+            #[cfg(feature = "vane-distributed")]
+            {
+                vane_rest_namespace_error(
+                    ErrorCode::NamespaceDescribeTable,
+                    "namespace describe_table",
+                    err,
+                )
+            }
+            #[cfg(not(feature = "vane-distributed"))]
             FfiError::new(
                 ErrorCode::NamespaceDescribeTable,
                 format!("namespace describe_table: {err}"),
@@ -611,6 +640,15 @@ fn open_dataset_in_namespace_inner(
         let mut builder = DatasetBuilder::from_namespace(Arc::new(namespace), table_id_segments)
             .await
             .map_err(|err| {
+                #[cfg(feature = "vane-distributed")]
+                {
+                    vane_rest_namespace_error(
+                        ErrorCode::NamespaceDescribeTable,
+                        "namespace describe_table",
+                        err,
+                    )
+                }
+                #[cfg(not(feature = "vane-distributed"))]
                 FfiError::new(
                     ErrorCode::NamespaceDescribeTable,
                     format!("namespace describe_table: {err}"),
@@ -620,6 +658,11 @@ fn open_dataset_in_namespace_inner(
             builder = builder.with_session(session);
         }
         let dataset = builder.load().await.map_err(|err| {
+            #[cfg(feature = "vane-distributed")]
+            {
+                vane_rest_namespace_error(ErrorCode::DatasetOpen, "namespace dataset open", err)
+            }
+            #[cfg(not(feature = "vane-distributed"))]
             FfiError::new(
                 ErrorCode::DatasetOpen,
                 format!("namespace dataset open: {err}"),

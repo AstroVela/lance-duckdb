@@ -18,6 +18,18 @@ struct LanceNamespaceTableConfig {
   string root;
   vector<string> option_keys;
   vector<string> option_values;
+#ifdef LANCE_VANE_DISTRIBUTED
+  // Directory namespace options may contain coordinator-owned TYPE LANCE
+  // secrets captured at ATTACH time. Preserve only the provenance bit across
+  // catalog-entry copies; secret values are never serialized to workers.
+  bool uses_coordinator_storage_secret = false;
+  // Preserve whether the original ATTACH path contained private URI
+  // components even if namespace resolution normalized them into a local path.
+  bool distributed_replay_path_restricted = false;
+  // REST credentials resolved on the coordinator (including named secrets)
+  // must taint diagnostics even when the endpoint itself is public.
+  bool uses_coordinator_auth_secret = false;
+#endif
 
   string endpoint;
   string table_id;
@@ -26,6 +38,11 @@ struct LanceNamespaceTableConfig {
   string api_key_override;
   string headers_tsv;
   string display_uri;
+#ifdef LANCE_VANE_DISTRIBUTED
+  // Bind-local exact version for namespace query-table execution. Catalog
+  // entries leave this unset so ordinary non-distributed reads remain fresh.
+  uint64_t snapshot_version = 0;
+#endif
 
   bool IsDirectory() const { return kind == LanceNamespaceKind::Directory; }
   bool IsRest() const { return kind == LanceNamespaceKind::Rest; }

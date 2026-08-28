@@ -4,6 +4,9 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_common.hpp"
+#endif
 #include "lance_table_entry.hpp"
 
 #include <algorithm>
@@ -143,6 +146,13 @@ string LanceDatasetResolverRegistry::Resolve(ClientContext &context,
   switch (policy) {
   case LanceResolvePolicy::STRICT:
     // In STRICT mode, throw an exception with the last error
+#ifdef LANCE_VANE_DISTRIBUTED
+    if (LanceVanePathRequiresRedaction(context, input_str)) {
+      throw BinderException(function_name +
+                            ": could not resolve <redacted-private-uri> to a "
+                            "Lance dataset");
+    }
+#endif
     if (last_error.empty()) {
       last_error = "Could not resolve '" + input_str + "' to a Lance dataset";
     }

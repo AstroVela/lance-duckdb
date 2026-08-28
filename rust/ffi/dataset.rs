@@ -270,18 +270,16 @@ async fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiResult<String
     // object metadata. Fill only missing fields: metadata retained by an old
     // handle is what distinguishes it from a same-version replacement.
     if size.is_none() || e_tag.is_none() {
-        let store = dataset.object_store(None).await.map_err(|_| {
+        let store = dataset.object_store(None).await.map_err(|err| {
             FfiError::new(
                 ErrorCode::DatasetOpen,
-                "resolve object store for dataset snapshot identity",
+                format!(
+                    "resolve object store for dataset snapshot identity at '{}': {err}",
+                    location.path
+                ),
             )
         })?;
-        let metadata = store.inner.head(&location.path).await.map_err(|_| {
-            FfiError::new(
-                ErrorCode::DatasetOpen,
-                "inspect manifest for dataset snapshot identity",
-            )
-        })?;
+        let metadata = manifest_snapshot_metadata(store.inner.as_ref(), &location.path).await?;
         size.get_or_insert(metadata.size);
         if e_tag.is_none() {
             e_tag = metadata.e_tag;
@@ -299,6 +297,19 @@ async fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiResult<String
         FfiError::new(
             ErrorCode::DatasetOpen,
             format!("serialize dataset snapshot identity: {err}"),
+        )
+    })
+}
+
+#[cfg(feature = "vane-distributed")]
+async fn manifest_snapshot_metadata(
+    store: &dyn object_store::ObjectStore,
+    path: &object_store::path::Path,
+) -> FfiResult<object_store::ObjectMeta> {
+    store.head(path).await.map_err(|err| {
+        FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("inspect manifest '{path}' for dataset snapshot identity: {err}"),
         )
     })
 }
@@ -510,6 +521,73 @@ pub unsafe extern "C" fn lance_dataset_list_fragment_stats(
 }
 
 fn dataset_list_fragment_stats_inner(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> FfiResult<*mut LanceFragmentStats> {
+    if out_len.is_null() {
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
+    }
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+
+    let mut out: Vec<LanceFragmentStats> = Vec::with_capacity(handle.dataset.fragments().len());
+    for frag in handle.dataset.fragments().iter() {
+        let mut bytes_on_disk = 0u64;
+        let mut all_file_sizes_known = true;
+        for file in frag.files.iter() {
+            match file.file_size_bytes.get() {
+                Some(size) => {
+                    bytes_on_disk = bytes_on_disk.saturating_add(size.get());
+                }
+                None => {
+                    all_file_sizes_known = false;
+                }
+            }
+        }
+        if !all_file_sizes_known {
+            bytes_on_disk = 0;
+        }
+        let num_rows = match frag.num_rows() {
+            Some(v) => i64::try_from(v).unwrap_or(-1),
+            None => -1,
+        };
+        out.push(LanceFragmentStats {
+            fragment_id: frag.id,
+            num_rows,
+            bytes_on_disk,
+        });
+    }
+
+    let mut boxed = out.into_boxed_slice();
+    let len = boxed.len();
+    let data = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+
+    unsafe {
+        std::ptr::write_unaligned(out_len, len);
+    }
+    Ok(data)
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_list_distributed_fragment_stats(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> *mut LanceFragmentStats {
+    match dataset_list_distributed_fragment_stats_inner(dataset, out_len) {
+        Ok(ptr) => {
+            clear_last_error();
+            ptr
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+fn dataset_list_distributed_fragment_stats_inner(
     dataset: *mut c_void,
     out_len: *mut usize,
 ) -> FfiResult<*mut LanceFragmentStats> {
@@ -1043,4 +1121,26 @@ fn dataset_delete_inner(
         std::ptr::write_unaligned(out_deleted_rows, deleted_rows_i64);
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "vane-distributed"))]
+mod tests {
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+
+    use super::manifest_snapshot_metadata;
+    use crate::runtime;
+
+    #[test]
+    fn snapshot_manifest_head_error_preserves_path_and_cause() {
+        let path = Path::from("_versions/42.manifest");
+        let store = InMemory::new();
+
+        let error = runtime::block_on(manifest_snapshot_metadata(&store, &path))
+            .unwrap()
+            .unwrap_err();
+
+        assert!(error.message.contains(path.as_ref()));
+        assert!(error.message.to_ascii_lowercase().contains("not found"));
+    }
 }
