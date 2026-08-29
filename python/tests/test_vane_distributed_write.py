@@ -458,6 +458,53 @@ def _exercise_stale_target_type_rejection(
         evolution_connection.close()
 
 
+def _exercise_not_null_target(
+    connection,
+    capture: DistributedWriteCapture,
+    *,
+    catalog: str,
+    target_path: str | Path,
+) -> None:
+    connection.execute(f"CREATE TABLE {catalog}.main.required_target (id INTEGER)")
+    connection.execute(
+        f"ALTER TABLE {catalog}.main.required_target ALTER COLUMN id SET NOT NULL"
+    )
+    assert connection.execute(
+        "SELECT is_nullable FROM duckdb_columns() "
+        f"WHERE database_name = {_sql_literal(catalog)} "
+        "AND schema_name = 'main' AND table_name = 'required_target' "
+        "AND column_name = 'id'"
+    ).fetchone() == (False,)
+
+    source = connection.sql("SELECT i::INTEGER AS id FROM range(3) AS source(i)")
+    capture.require_write(
+        "distributed Lance INSERT into a NOT NULL target",
+        lambda: source.insert_into(f"{catalog}.main.required_target"),
+        expected_name="insert",
+        expected_rows=3,
+        minimum_task_results=1,
+    )
+    assert connection.execute(
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT "
+        f"FROM {catalog}.main.required_target"
+    ).fetchone() == (3, 3)
+
+    manifest_count = _manifest_count(connection, target_path)
+    data_file_count = _data_file_count(connection, target_path)
+    previous_count = capture.dispatch_count
+    null_source = connection.sql("SELECT NULL::INTEGER AS id")
+    with pytest.raises(Exception, match="NOT NULL constraint failed"):
+        null_source.insert_into(f"{catalog}.main.required_target")
+    assert capture.dispatch_count == previous_count + 1
+    assert _manifest_count(connection, target_path) == manifest_count
+    assert _data_file_count(connection, target_path) == data_file_count
+    assert _attempt_manifest_count(connection, target_path) == 0
+    assert connection.execute(
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT "
+        f"FROM {catalog}.main.required_target"
+    ).fetchone() == (3, 3)
+
+
 def test_two_worker_local_shared_lance_insert_and_ctas(
     tmp_path: Path, write_capture: DistributedWriteCapture
 ) -> None:
@@ -472,6 +519,7 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
     failed_ctas_path = root / "failed_ctas_target.lance"
     explicit_ctas_path = root / "explicit_ctas_target.lance"
     stale_type_path = root / "stale_target.lance"
+    required_target_path = root / "required_target.lance"
     try:
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
@@ -504,6 +552,12 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
             root=root,
             target_path=stale_type_path,
         )
+        _exercise_not_null_target(
+            connection,
+            write_capture,
+            catalog="lance_write",
+            target_path=required_target_path,
+        )
     finally:
         connection.close()
 
@@ -526,6 +580,7 @@ def test_two_worker_s3_lance_insert_and_ctas(
         empty_ctas_path = f"{root}/empty_ctas_target.lance"
         failed_ctas_path = f"{root}/failed_ctas_target.lance"
         explicit_ctas_path = f"{root}/explicit_ctas_target.lance"
+        required_target_path = f"{root}/required_target.lance"
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
         connection.execute(
@@ -553,6 +608,12 @@ def test_two_worker_s3_lance_insert_and_ctas(
             catalog="lance_s3_write",
             insert_path=insert_path,
             ctas_path=explicit_ctas_path,
+        )
+        _exercise_not_null_target(
+            connection,
+            write_capture,
+            catalog="lance_s3_write",
+            target_path=required_target_path,
         )
     finally:
         connection.close()

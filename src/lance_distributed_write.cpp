@@ -18,12 +18,14 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/distributed_write.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 
@@ -37,7 +39,7 @@ namespace duckdb {
 
 namespace {
 
-static constexpr uint32_t LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION = 1;
+static constexpr uint32_t LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION = 2;
 static constexpr const char *LANCE_DISTRIBUTED_INSERT_OPERATOR = "insert";
 static constexpr const char *LANCE_DISTRIBUTED_CTAS_OPERATOR = "ctas";
 static constexpr const char *LANCE_DISTRIBUTED_WRITE_FRAGMENT_CODEC =
@@ -60,6 +62,7 @@ struct LanceDistributedWriteTransport {
   string schema_fingerprint;
   vector<string> input_names;
   vector<LogicalType> input_types;
+  vector<uint8_t> target_field_nullable;
   string data_storage_version;
 };
 
@@ -151,15 +154,60 @@ static const char *WriteOperatorName(LanceDistributedWriteKind write_kind) {
   }
 }
 
+static vector<uint8_t>
+TargetFieldNullability(const ColumnList &columns,
+                       const vector<unique_ptr<Constraint>> &constraints) {
+  unordered_set<idx_t> required_columns;
+  for (const auto &constraint : constraints) {
+    if (constraint->type == ConstraintType::NOT_NULL) {
+      required_columns.insert(
+          constraint->Cast<NotNullConstraint>().index.index);
+    }
+  }
+
+  vector<uint8_t> result;
+  result.reserve(columns.PhysicalColumnCount());
+  for (idx_t index = 0; index < columns.PhysicalColumnCount(); index++) {
+    const auto logical_index =
+        columns.PhysicalToLogical(PhysicalIndex(index)).index;
+    result.push_back(required_columns.count(logical_index) == 0 ? 1 : 0);
+  }
+  return result;
+}
+
+static void
+ApplyTargetFieldNullability(ArrowSchema &schema,
+                            const vector<uint8_t> &target_field_nullable) {
+  if (schema.n_children < 0 ||
+      static_cast<idx_t>(schema.n_children) != target_field_nullable.size()) {
+    throw InternalException(
+        "Distributed Lance Arrow schema has an invalid field count");
+  }
+  for (idx_t index = 0; index < target_field_nullable.size(); index++) {
+    auto *field = schema.children[index];
+    if (!field) {
+      throw InternalException(
+          "Distributed Lance Arrow schema has a null field");
+    }
+    if (target_field_nullable[index] != 0) {
+      field->flags |= ARROW_FLAG_NULLABLE;
+    } else {
+      field->flags &= ~ARROW_FLAG_NULLABLE;
+    }
+  }
+}
+
 static string SchemaFingerprint(const vector<string> &names,
                                 const vector<LogicalType> &types,
+                                const vector<uint8_t> &target_field_nullable,
                                 const string &data_storage_version) {
   MemoryStream stream(Allocator::DefaultAllocator());
   BinarySerializer serializer(stream);
   serializer.Begin();
   serializer.WriteProperty(1, "field_names", names);
   serializer.WriteProperty(2, "field_types", types);
-  serializer.WriteProperty(3, "data_storage_version", data_storage_version);
+  serializer.WriteProperty(3, "target_field_nullable", target_field_nullable);
+  serializer.WriteProperty(4, "data_storage_version", data_storage_version);
   serializer.End();
   MD5Context context;
   context.Add(stream.GetData(), stream.GetPosition());
@@ -173,7 +221,8 @@ static void ValidateTransport(const LanceDistributedWriteTransport &transport) {
       transport.expected_version == 0 ||
       transport.schema_fingerprint.size() != 32 ||
       transport.input_names.empty() ||
-      transport.input_names.size() != transport.input_types.size()) {
+      transport.input_names.size() != transport.input_types.size() ||
+      transport.input_names.size() != transport.target_field_nullable.size()) {
     throw SerializationException(
         "Distributed Lance write bind has incomplete target state");
   }
@@ -194,6 +243,7 @@ static void ValidateTransport(const LanceDistributedWriteTransport &transport) {
   for (idx_t index = 0; index < transport.input_names.size(); index++) {
     if (transport.input_names[index].empty() ||
         transport.input_types[index].id() == LogicalTypeId::INVALID ||
+        transport.target_field_nullable[index] > 1 ||
         !names.insert(transport.input_names[index]).second) {
       throw SerializationException(
           "Distributed Lance write bind has an invalid input schema");
@@ -225,6 +275,8 @@ SerializeTransport(const LanceDistributedWriteTransport &transport) {
   serializer.WriteProperty(13, "input_types", transport.input_types);
   serializer.WriteProperty(14, "data_storage_version",
                            transport.data_storage_version);
+  serializer.WriteProperty(15, "target_field_nullable",
+                           transport.target_field_nullable);
   serializer.End();
   return string(reinterpret_cast<const char *>(stream.GetData()),
                 stream.GetPosition());
@@ -267,6 +319,8 @@ DeserializeTransport(const string &bytes) {
       deserializer.ReadProperty<vector<LogicalType>>(13, "input_types");
   result.data_storage_version =
       deserializer.ReadProperty<string>(14, "data_storage_version");
+  result.target_field_nullable =
+      deserializer.ReadProperty<vector<uint8_t>>(15, "target_field_nullable");
   deserializer.End();
   ValidateTransport(result);
   return result;
@@ -584,6 +638,7 @@ public:
   vector<string> column_names;
   vector<LogicalType> column_types;
   vector<LogicalType> input_types;
+  vector<uint8_t> target_field_nullable;
   string root;
   vector<string> attached_option_keys;
   vector<string> attached_option_values;
@@ -738,10 +793,11 @@ void LanceDistributedWriteProvider::Impl::InitializeInsert() {
   transport.dataset_uri = std::move(dataset_path);
   transport.expected_version = snapshot.first;
   transport.generation_id = std::move(snapshot.second);
-  transport.schema_fingerprint =
-      SchemaFingerprint(column_names, column_types, string());
+  transport.schema_fingerprint = SchemaFingerprint(
+      column_names, column_types, target_field_nullable, string());
   transport.input_names = column_names;
   transport.input_types = column_types;
+  transport.target_field_nullable = target_field_nullable;
 }
 
 void LanceDistributedWriteProvider::Impl::InitializeCTAS() {
@@ -767,10 +823,11 @@ void LanceDistributedWriteProvider::Impl::InitializeCTAS() {
   transport.dataset_uri = ResolveReplayPath(*context, dataset_path);
   transport.expected_version = 1;
   transport.creation_uuid = transport.operation_id;
-  transport.schema_fingerprint =
-      SchemaFingerprint(column_names, column_types, data_storage_version);
+  transport.schema_fingerprint = SchemaFingerprint(
+      column_names, column_types, target_field_nullable, data_storage_version);
   transport.input_names = column_names;
   transport.input_types = column_types;
+  transport.target_field_nullable = target_field_nullable;
   transport.data_storage_version = data_storage_version;
 }
 
@@ -854,6 +911,8 @@ void LanceDistributedWriteProvider::Impl::PrepareCTAS(
   auto properties = context_p.GetClientProperties();
   ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, column_types,
                                 column_names, properties);
+  ApplyTargetFieldNullability(schema_root.arrow_schema,
+                              transport.target_field_nullable);
   auto *writer = lance_open_uncommitted_writer_with_storage_options(
       open_path.c_str(), "create", key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
@@ -1214,6 +1273,8 @@ unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedInsertProvider(
   impl->column_names = column_names;
   impl->column_types = column_types;
   impl->input_types = input_types;
+  impl->target_field_nullable =
+      TargetFieldNullability(table.GetColumns(), table.GetConstraints());
   return unique_ptr<LanceDistributedWriteProvider>(
       new LanceDistributedWriteProvider(std::move(impl)));
 }
@@ -1341,6 +1402,8 @@ PhysicalOperator &PlanLanceDistributedCreateTableAs(
   impl->column_names = names;
   impl->column_types = types;
   impl->input_types = plan.types;
+  impl->target_field_nullable =
+      TargetFieldNullability(create_info.columns, create_info.constraints);
   impl->root = root;
   impl->attached_option_keys = attached_option_keys;
   impl->attached_option_values = attached_option_values;
@@ -1769,6 +1832,12 @@ LanceDistributedWriteInitializeGlobal(ClientContext &context,
   ArrowConverter::ToArrowSchema(&result->schema_root.arrow_schema,
                                 result->transport.input_types,
                                 result->transport.input_names, properties);
+  // DuckDB LogicalType does not encode catalog nullability. Restore the
+  // coordinator-bound flags after reconstructing the worker Arrow schema so
+  // Rust receives the frozen target contract instead of synthetic nullable
+  // fields.
+  ApplyTargetFieldNullability(result->schema_root.arrow_schema,
+                              result->transport.target_field_nullable);
   return std::move(result);
 }
 
@@ -1837,6 +1906,15 @@ static void LanceDistributedWriteSink(ExecutionContext &context,
   }
   if (input.size() == 0) {
     return;
+  }
+  for (idx_t index = 0; index < global.transport.target_field_nullable.size();
+       index++) {
+    if (global.transport.target_field_nullable[index] == 0 &&
+        VectorOperations::HasNull(input.data[index], input.size())) {
+      throw ConstraintException("NOT NULL constraint failed: %s.%s",
+                                global.transport.table_name,
+                                global.transport.input_names[index]);
+    }
   }
   if (!local.writer) {
     OpenWorkerWriter(context.client, global, local);
