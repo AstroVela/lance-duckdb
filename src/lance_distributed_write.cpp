@@ -39,7 +39,7 @@ namespace duckdb {
 
 namespace {
 
-static constexpr uint32_t LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION = 2;
+static constexpr uint32_t LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION = 3;
 static constexpr const char *LANCE_DISTRIBUTED_INSERT_OPERATOR = "insert";
 static constexpr const char *LANCE_DISTRIBUTED_CTAS_OPERATOR = "ctas";
 static constexpr const char *LANCE_DISTRIBUTED_WRITE_FRAGMENT_CODEC =
@@ -62,8 +62,20 @@ struct LanceDistributedWriteTransport {
   string schema_fingerprint;
   vector<string> input_names;
   vector<LogicalType> input_types;
-  vector<uint8_t> target_field_nullable;
+  vector<uint32_t> target_schema_field_depths;
+  vector<uint8_t> target_schema_field_nullable;
   string data_storage_version;
+};
+
+struct LanceArrowNullability {
+  vector<uint32_t> field_depths;
+  vector<uint8_t> field_nullable;
+};
+
+struct LanceFrozenDirectoryTargetSnapshot {
+  uint64_t version = 0;
+  string generation_id;
+  LanceArrowNullability nullability;
 };
 
 struct LanceDistributedCommitEnvelope {
@@ -155,8 +167,8 @@ static const char *WriteOperatorName(LanceDistributedWriteKind write_kind) {
 }
 
 static vector<uint8_t>
-TargetFieldNullability(const ColumnList &columns,
-                       const vector<unique_ptr<Constraint>> &constraints) {
+TargetTopLevelNullability(const ColumnList &columns,
+                          const vector<unique_ptr<Constraint>> &constraints) {
   unordered_set<idx_t> required_columns;
   for (const auto &constraint : constraints) {
     if (constraint->type == ConstraintType::NOT_NULL) {
@@ -175,9 +187,66 @@ TargetFieldNullability(const ColumnList &columns,
   return result;
 }
 
+static idx_t ArrowSchemaChildCount(const ArrowSchema &schema) {
+  if (schema.n_children < 0 || (schema.n_children > 0 && !schema.children)) {
+    throw InternalException(
+        "Distributed Lance Arrow schema has invalid children");
+  }
+  return static_cast<idx_t>(schema.n_children);
+}
+
+static void AppendArrowSchemaNullability(const ArrowSchema &parent,
+                                         uint32_t depth,
+                                         LanceArrowNullability &result) {
+  const auto child_count = ArrowSchemaChildCount(parent);
+  for (idx_t index = 0; index < child_count; index++) {
+    auto *field = parent.children[index];
+    if (!field) {
+      throw InternalException(
+          "Distributed Lance Arrow schema has a null field");
+    }
+    result.field_depths.push_back(depth);
+    result.field_nullable.push_back(
+        (field->flags & ARROW_FLAG_NULLABLE) != 0 ? 1 : 0);
+    if (ArrowSchemaChildCount(*field) > 0) {
+      if (depth == NumericLimits<uint32_t>::Maximum()) {
+        throw InternalException(
+            "Distributed Lance Arrow schema nesting is too deep");
+      }
+      AppendArrowSchemaNullability(*field, depth + 1, result);
+    }
+  }
+}
+
+static LanceArrowNullability
+CaptureArrowSchemaNullability(const ArrowSchema &schema) {
+  LanceArrowNullability result;
+  AppendArrowSchemaNullability(schema, 0, result);
+  return result;
+}
+
+static LanceArrowNullability CaptureDatasetSchemaNullability(void *dataset,
+                                                             const string &path,
+                                                             bool redact) {
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    throw IOException("Failed to get distributed Lance target schema" +
+                      LanceVaneFormatErrorSuffix(path, redact));
+  }
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    throw IOException("Failed to export distributed Lance target schema" +
+                      LanceVaneFormatErrorSuffix(path, redact));
+  }
+  lance_free_schema(schema_handle);
+  return CaptureArrowSchemaNullability(schema_root.arrow_schema);
+}
+
 static void
-ApplyTargetFieldNullability(ArrowSchema &schema,
-                            const vector<uint8_t> &target_field_nullable) {
+ApplyTopLevelFieldNullability(ArrowSchema &schema,
+                              const vector<uint8_t> &target_field_nullable) {
   if (schema.n_children < 0 ||
       static_cast<idx_t>(schema.n_children) != target_field_nullable.size()) {
     throw InternalException(
@@ -197,17 +266,69 @@ ApplyTargetFieldNullability(ArrowSchema &schema,
   }
 }
 
+static void ApplyArrowSchemaNullability(ArrowSchema &parent, uint32_t depth,
+                                        const vector<uint32_t> &field_depths,
+                                        const vector<uint8_t> &field_nullable,
+                                        idx_t &position) {
+  const auto child_count = ArrowSchemaChildCount(parent);
+  for (idx_t index = 0; index < child_count; index++) {
+    if (position >= field_depths.size() || field_depths[position] != depth) {
+      throw SerializationException(
+          "Distributed Lance target nullability does not match its Arrow "
+          "schema shape");
+    }
+    auto *field = parent.children[index];
+    if (!field) {
+      throw InternalException(
+          "Distributed Lance Arrow schema has a null field");
+    }
+    if (field_nullable[position] != 0) {
+      field->flags |= ARROW_FLAG_NULLABLE;
+    } else {
+      field->flags &= ~ARROW_FLAG_NULLABLE;
+    }
+    position++;
+    if (ArrowSchemaChildCount(*field) > 0) {
+      if (depth == NumericLimits<uint32_t>::Maximum()) {
+        throw SerializationException(
+            "Distributed Lance target schema nesting is too deep");
+      }
+      ApplyArrowSchemaNullability(*field, depth + 1, field_depths,
+                                  field_nullable, position);
+    }
+  }
+}
+
+static void
+ApplyTargetSchemaNullability(ArrowSchema &schema,
+                             const vector<uint32_t> &field_depths,
+                             const vector<uint8_t> &field_nullable) {
+  if (field_depths.size() != field_nullable.size()) {
+    throw SerializationException(
+        "Distributed Lance target nullability has mismatched field state");
+  }
+  idx_t position = 0;
+  ApplyArrowSchemaNullability(schema, 0, field_depths, field_nullable,
+                              position);
+  if (position != field_depths.size()) {
+    throw SerializationException(
+        "Distributed Lance target nullability has trailing field state");
+  }
+}
+
 static string SchemaFingerprint(const vector<string> &names,
                                 const vector<LogicalType> &types,
-                                const vector<uint8_t> &target_field_nullable,
+                                const vector<uint32_t> &field_depths,
+                                const vector<uint8_t> &field_nullable,
                                 const string &data_storage_version) {
   MemoryStream stream(Allocator::DefaultAllocator());
   BinarySerializer serializer(stream);
   serializer.Begin();
   serializer.WriteProperty(1, "field_names", names);
   serializer.WriteProperty(2, "field_types", types);
-  serializer.WriteProperty(3, "target_field_nullable", target_field_nullable);
-  serializer.WriteProperty(4, "data_storage_version", data_storage_version);
+  serializer.WriteProperty(3, "target_schema_field_depths", field_depths);
+  serializer.WriteProperty(4, "target_schema_field_nullable", field_nullable);
+  serializer.WriteProperty(5, "data_storage_version", data_storage_version);
   serializer.End();
   MD5Context context;
   context.Add(stream.GetData(), stream.GetPosition());
@@ -222,7 +343,9 @@ static void ValidateTransport(const LanceDistributedWriteTransport &transport) {
       transport.schema_fingerprint.size() != 32 ||
       transport.input_names.empty() ||
       transport.input_names.size() != transport.input_types.size() ||
-      transport.input_names.size() != transport.target_field_nullable.size()) {
+      transport.target_schema_field_depths.empty() ||
+      transport.target_schema_field_depths.size() !=
+          transport.target_schema_field_nullable.size()) {
     throw SerializationException(
         "Distributed Lance write bind has incomplete target state");
   }
@@ -243,11 +366,30 @@ static void ValidateTransport(const LanceDistributedWriteTransport &transport) {
   for (idx_t index = 0; index < transport.input_names.size(); index++) {
     if (transport.input_names[index].empty() ||
         transport.input_types[index].id() == LogicalTypeId::INVALID ||
-        transport.target_field_nullable[index] > 1 ||
         !names.insert(transport.input_names[index]).second) {
       throw SerializationException(
           "Distributed Lance write bind has an invalid input schema");
     }
+  }
+  idx_t top_level_fields = 0;
+  for (idx_t index = 0; index < transport.target_schema_field_depths.size();
+       index++) {
+    const auto depth = transport.target_schema_field_depths[index];
+    if (transport.target_schema_field_nullable[index] > 1 ||
+        (index == 0 && depth != 0) ||
+        (index > 0 && depth > transport.target_schema_field_depths[index - 1] &&
+         depth - transport.target_schema_field_depths[index - 1] > 1)) {
+      throw SerializationException(
+          "Distributed Lance write bind has invalid target nullability");
+    }
+    if (depth == 0) {
+      top_level_fields++;
+    }
+  }
+  if (top_level_fields != transport.input_names.size()) {
+    throw SerializationException(
+        "Distributed Lance write bind target nullability has an invalid "
+        "top-level field count");
   }
 }
 
@@ -275,8 +417,10 @@ SerializeTransport(const LanceDistributedWriteTransport &transport) {
   serializer.WriteProperty(13, "input_types", transport.input_types);
   serializer.WriteProperty(14, "data_storage_version",
                            transport.data_storage_version);
-  serializer.WriteProperty(15, "target_field_nullable",
-                           transport.target_field_nullable);
+  serializer.WriteProperty(15, "target_schema_field_depths",
+                           transport.target_schema_field_depths);
+  serializer.WriteProperty(16, "target_schema_field_nullable",
+                           transport.target_schema_field_nullable);
   serializer.End();
   return string(reinterpret_cast<const char *>(stream.GetData()),
                 stream.GetPosition());
@@ -319,8 +463,12 @@ DeserializeTransport(const string &bytes) {
       deserializer.ReadProperty<vector<LogicalType>>(13, "input_types");
   result.data_storage_version =
       deserializer.ReadProperty<string>(14, "data_storage_version");
-  result.target_field_nullable =
-      deserializer.ReadProperty<vector<uint8_t>>(15, "target_field_nullable");
+  result.target_schema_field_depths =
+      deserializer.ReadProperty<vector<uint32_t>>(15,
+                                                  "target_schema_field_depths");
+  result.target_schema_field_nullable =
+      deserializer.ReadProperty<vector<uint8_t>>(
+          16, "target_schema_field_nullable");
   deserializer.End();
   ValidateTransport(result);
   return result;
@@ -469,7 +617,7 @@ static pair<uint64_t, string> CaptureTargetSnapshot(ClientContext &context,
   return {version, DatasetGenerationId(context, path, dataset.get())};
 }
 
-static pair<uint64_t, string>
+static LanceFrozenDirectoryTargetSnapshot
 CaptureFrozenDirectoryTargetSnapshot(const string &path,
                                      const vector<string> &option_keys,
                                      const vector<string> &option_values) {
@@ -507,7 +655,12 @@ CaptureFrozenDirectoryTargetSnapshot(const string &path,
   if (generation_id.empty()) {
     throw IOException("Distributed Lance target generation is empty");
   }
-  return {version, std::move(generation_id)};
+  LanceFrozenDirectoryTargetSnapshot result;
+  result.version = version;
+  result.generation_id = std::move(generation_id);
+  result.nullability =
+      CaptureDatasetSchemaNullability(dataset.get(), path, redact);
+  return result;
 }
 
 static void ValidateTargetSnapshot(ClientContext &context,
@@ -638,7 +791,7 @@ public:
   vector<string> column_names;
   vector<LogicalType> column_types;
   vector<LogicalType> input_types;
-  vector<uint8_t> target_field_nullable;
+  vector<uint8_t> target_top_level_nullable;
   string root;
   vector<string> attached_option_keys;
   vector<string> attached_option_values;
@@ -791,13 +944,17 @@ void LanceDistributedWriteProvider::Impl::InitializeInsert() {
   transport.schema_name = table->schema.name;
   transport.table_name = table->name;
   transport.dataset_uri = std::move(dataset_path);
-  transport.expected_version = snapshot.first;
-  transport.generation_id = std::move(snapshot.second);
+  transport.expected_version = snapshot.version;
+  transport.generation_id = std::move(snapshot.generation_id);
+  transport.target_schema_field_depths =
+      std::move(snapshot.nullability.field_depths);
+  transport.target_schema_field_nullable =
+      std::move(snapshot.nullability.field_nullable);
   transport.schema_fingerprint = SchemaFingerprint(
-      column_names, column_types, target_field_nullable, string());
+      column_names, column_types, transport.target_schema_field_depths,
+      transport.target_schema_field_nullable, string());
   transport.input_names = column_names;
   transport.input_types = column_types;
-  transport.target_field_nullable = target_field_nullable;
 }
 
 void LanceDistributedWriteProvider::Impl::InitializeCTAS() {
@@ -823,11 +980,22 @@ void LanceDistributedWriteProvider::Impl::InitializeCTAS() {
   transport.dataset_uri = ResolveReplayPath(*context, dataset_path);
   transport.expected_version = 1;
   transport.creation_uuid = transport.operation_id;
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  auto properties = context->GetClientProperties();
+  ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, column_types,
+                                column_names, properties);
+  ApplyTopLevelFieldNullability(schema_root.arrow_schema,
+                                target_top_level_nullable);
+  auto nullability = CaptureArrowSchemaNullability(schema_root.arrow_schema);
+  transport.target_schema_field_depths = std::move(nullability.field_depths);
+  transport.target_schema_field_nullable =
+      std::move(nullability.field_nullable);
   transport.schema_fingerprint = SchemaFingerprint(
-      column_names, column_types, target_field_nullable, data_storage_version);
+      column_names, column_types, transport.target_schema_field_depths,
+      transport.target_schema_field_nullable, data_storage_version);
   transport.input_names = column_names;
   transport.input_types = column_types;
-  transport.target_field_nullable = target_field_nullable;
   transport.data_storage_version = data_storage_version;
 }
 
@@ -911,8 +1079,9 @@ void LanceDistributedWriteProvider::Impl::PrepareCTAS(
   auto properties = context_p.GetClientProperties();
   ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, column_types,
                                 column_names, properties);
-  ApplyTargetFieldNullability(schema_root.arrow_schema,
-                              transport.target_field_nullable);
+  ApplyTargetSchemaNullability(schema_root.arrow_schema,
+                               transport.target_schema_field_depths,
+                               transport.target_schema_field_nullable);
   auto *writer = lance_open_uncommitted_writer_with_storage_options(
       open_path.c_str(), "create", key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
@@ -1273,8 +1442,6 @@ unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedInsertProvider(
   impl->column_names = column_names;
   impl->column_types = column_types;
   impl->input_types = input_types;
-  impl->target_field_nullable =
-      TargetFieldNullability(table.GetColumns(), table.GetConstraints());
   return unique_ptr<LanceDistributedWriteProvider>(
       new LanceDistributedWriteProvider(std::move(impl)));
 }
@@ -1402,8 +1569,8 @@ PhysicalOperator &PlanLanceDistributedCreateTableAs(
   impl->column_names = names;
   impl->column_types = types;
   impl->input_types = plan.types;
-  impl->target_field_nullable =
-      TargetFieldNullability(create_info.columns, create_info.constraints);
+  impl->target_top_level_nullable =
+      TargetTopLevelNullability(create_info.columns, create_info.constraints);
   impl->root = root;
   impl->attached_option_keys = attached_option_keys;
   impl->attached_option_values = attached_option_values;
@@ -1832,12 +1999,12 @@ LanceDistributedWriteInitializeGlobal(ClientContext &context,
   ArrowConverter::ToArrowSchema(&result->schema_root.arrow_schema,
                                 result->transport.input_types,
                                 result->transport.input_names, properties);
-  // DuckDB LogicalType does not encode catalog nullability. Restore the
-  // coordinator-bound flags after reconstructing the worker Arrow schema so
-  // Rust receives the frozen target contract instead of synthetic nullable
-  // fields.
-  ApplyTargetFieldNullability(result->schema_root.arrow_schema,
-                              result->transport.target_field_nullable);
+  // DuckDB LogicalType does not encode field nullability. Restore the complete
+  // coordinator-bound Arrow field tree after reconstructing the worker schema
+  // so Rust receives the frozen target contract instead of synthetic flags.
+  ApplyTargetSchemaNullability(result->schema_root.arrow_schema,
+                               result->transport.target_schema_field_depths,
+                               result->transport.target_schema_field_nullable);
   return std::move(result);
 }
 
@@ -1907,14 +2074,20 @@ static void LanceDistributedWriteSink(ExecutionContext &context,
   if (input.size() == 0) {
     return;
   }
-  for (idx_t index = 0; index < global.transport.target_field_nullable.size();
-       index++) {
-    if (global.transport.target_field_nullable[index] == 0 &&
-        VectorOperations::HasNull(input.data[index], input.size())) {
+  idx_t column_index = 0;
+  for (idx_t field_index = 0;
+       field_index < global.transport.target_schema_field_depths.size();
+       field_index++) {
+    if (global.transport.target_schema_field_depths[field_index] != 0) {
+      continue;
+    }
+    if (global.transport.target_schema_field_nullable[field_index] == 0 &&
+        VectorOperations::HasNull(input.data[column_index], input.size())) {
       throw ConstraintException("NOT NULL constraint failed: %s.%s",
                                 global.transport.table_name,
-                                global.transport.input_names[index]);
+                                global.transport.input_names[column_index]);
     }
+    column_index++;
   }
   if (!local.writer) {
     OpenWorkerWriter(context.client, global, local);

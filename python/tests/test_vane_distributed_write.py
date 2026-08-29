@@ -505,6 +505,38 @@ def _exercise_not_null_target(
     ).fetchone() == (3, 3)
 
 
+def _exercise_nested_not_null_target(
+    connection,
+    capture: DistributedWriteCapture,
+    *,
+    catalog: str,
+) -> None:
+    connection.execute(
+        f"CREATE TABLE {catalog}.main.nested_required_target "
+        "(payload STRUCT(value INTEGER))"
+    )
+    connection.execute(
+        f"ALTER TABLE {catalog}.main.nested_required_target "
+        'ALTER COLUMN "payload.value" SET NOT NULL'
+    )
+
+    source = connection.sql(
+        "SELECT struct_pack(value := i::INTEGER) AS payload "
+        "FROM range(3) AS source(i)"
+    )
+    capture.require_write(
+        "distributed Lance INSERT into a nested NOT NULL target",
+        lambda: source.insert_into(f"{catalog}.main.nested_required_target"),
+        expected_name="insert",
+        expected_rows=3,
+        minimum_task_results=1,
+    )
+    assert connection.execute(
+        f"SELECT count(*)::BIGINT, sum(payload.value)::BIGINT "
+        f"FROM {catalog}.main.nested_required_target"
+    ).fetchone() == (3, 3)
+
+
 def test_two_worker_local_shared_lance_insert_and_ctas(
     tmp_path: Path, write_capture: DistributedWriteCapture
 ) -> None:
@@ -557,6 +589,11 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
             write_capture,
             catalog="lance_write",
             target_path=required_target_path,
+        )
+        _exercise_nested_not_null_target(
+            connection,
+            write_capture,
+            catalog="lance_write",
         )
     finally:
         connection.close()
@@ -614,6 +651,11 @@ def test_two_worker_s3_lance_insert_and_ctas(
             write_capture,
             catalog="lance_s3_write",
             target_path=required_target_path,
+        )
+        _exercise_nested_not_null_target(
+            connection,
+            write_capture,
+            catalog="lance_s3_write",
         )
     finally:
         connection.close()
