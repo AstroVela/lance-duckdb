@@ -366,6 +366,50 @@ def _exercise_failed_ctas_retention_and_explicit_retry(
     assert _attempt_manifest_count(connection, target_path) == 0
 
 
+def _exercise_explicit_transaction_rejection(
+    connection,
+    capture: DistributedWriteCapture,
+    *,
+    catalog: str,
+    insert_path: str | Path,
+    ctas_path: str | Path,
+) -> None:
+    source = connection.sql(f"SELECT id, value FROM {catalog}.main.source")
+    insert_manifest_count = _manifest_count(connection, insert_path)
+    insert_row_count = connection.execute(
+        f"SELECT count(*)::BIGINT FROM {catalog}.main.insert_target"
+    ).fetchone()
+
+    previous_count = capture.dispatch_count
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        with pytest.raises(Exception, match="auto-commit mode"):
+            source.insert_into(f"{catalog}.main.insert_target")
+    finally:
+        connection.execute("ROLLBACK")
+    assert capture.dispatch_count == previous_count
+    assert _manifest_count(connection, insert_path) == insert_manifest_count
+    assert _attempt_manifest_count(connection, insert_path) == 0
+    assert (
+        connection.execute(
+            f"SELECT count(*)::BIGINT FROM {catalog}.main.insert_target"
+        ).fetchone()
+        == insert_row_count
+    )
+
+    previous_count = capture.dispatch_count
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        with pytest.raises(Exception, match="auto-commit mode"):
+            source.create(f"{catalog}.main.explicit_ctas_target")
+    finally:
+        connection.execute("ROLLBACK")
+    assert capture.dispatch_count == previous_count
+    assert _manifest_count(connection, ctas_path) == 0
+    assert _data_file_count(connection, ctas_path) == 0
+    assert _attempt_manifest_count(connection, ctas_path) == 0
+
+
 def test_two_worker_local_shared_lance_insert_and_ctas(
     tmp_path: Path, write_capture: DistributedWriteCapture
 ) -> None:
@@ -378,6 +422,7 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
     ctas_path = root / "ctas_target.lance"
     empty_ctas_path = root / "empty_ctas_target.lance"
     failed_ctas_path = root / "failed_ctas_target.lance"
+    explicit_ctas_path = root / "explicit_ctas_target.lance"
     try:
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
@@ -396,6 +441,13 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
             write_capture,
             catalog="lance_write",
             target_path=failed_ctas_path,
+        )
+        _exercise_explicit_transaction_rejection(
+            connection,
+            write_capture,
+            catalog="lance_write",
+            insert_path=insert_path,
+            ctas_path=explicit_ctas_path,
         )
     finally:
         connection.close()
@@ -418,6 +470,7 @@ def test_two_worker_s3_lance_insert_and_ctas(
         ctas_path = f"{root}/ctas_target.lance"
         empty_ctas_path = f"{root}/empty_ctas_target.lance"
         failed_ctas_path = f"{root}/failed_ctas_target.lance"
+        explicit_ctas_path = f"{root}/explicit_ctas_target.lance"
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
         connection.execute(
@@ -438,6 +491,13 @@ def test_two_worker_s3_lance_insert_and_ctas(
             write_capture,
             catalog="lance_s3_write",
             target_path=failed_ctas_path,
+        )
+        _exercise_explicit_transaction_rejection(
+            connection,
+            write_capture,
+            catalog="lance_s3_write",
+            insert_path=insert_path,
+            ctas_path=explicit_ctas_path,
         )
     finally:
         connection.close()

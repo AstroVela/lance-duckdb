@@ -52,6 +52,12 @@ Worker finalization errors rely on Lance's native uncommitted-write failure
 contract, which drops an in-progress writer and removes already completed
 fragments before returning the error; `skip_auto_cleanup` applies only to
 post-commit version cleanup.
+
+Distributed Lance writes require DuckDB auto-commit mode. The provider rejects
+explicit transactions before freezing a worker plan, preparing a CTAS target,
+or publishing an INSERT commit. Native DuckDB execution retains the existing
+Lance transaction lifecycle for `BEGIN`, `COMMIT`, and `ROLLBACK`.
+
 A failed `CREATE TABLE AS` retains its prepared target. Lance does not expose a
 generation-conditional table deletion primitive, so checking the empty
 version-one generation and then recursively deleting the dataset would race

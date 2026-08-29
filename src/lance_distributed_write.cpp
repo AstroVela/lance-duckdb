@@ -633,6 +633,14 @@ private:
 
 namespace {
 
+static void ValidateDistributedWriteAutoCommit(ClientContext &context) {
+  if (!context.transaction.IsAutoCommit()) {
+    throw NotImplementedException(
+        "Distributed Lance writes require DuckDB auto-commit mode; use native "
+        "DuckDB execution for explicit transactions");
+  }
+}
+
 static void ValidateDirectoryReplayState(
     ClientContext &context, const string &root, const string &dataset_path,
     const vector<string> &option_keys, const vector<string> &option_values,
@@ -773,6 +781,7 @@ void LanceDistributedWriteProvider::Impl::Initialize() {
   if (!context) {
     throw InternalException("Distributed Lance write has no planning context");
   }
+  ValidateDistributedWriteAutoCommit(*context);
   if (write_kind == LanceDistributedWriteKind::INSERT) {
     InitializeInsert();
   } else {
@@ -815,6 +824,7 @@ void LanceDistributedWriteProvider::Impl::Validate(
     throw InvalidInputException(
         "Distributed Lance coordinator context changed after planning");
   }
+  ValidateDistributedWriteAutoCommit(context_p);
   ValidateDirectoryReplayState(context_p, root, transport.dataset_uri,
                                attached_option_keys, attached_option_values,
                                uses_coordinator_storage_secret,
@@ -895,6 +905,7 @@ void LanceDistributedWriteProvider::Impl::PrepareCTAS(
 void LanceDistributedWriteProvider::Impl::Prepare(
     ClientContext &context_p) const {
   ValidateShape();
+  ValidateDistributedWriteAutoCommit(context_p);
   if (prepare_started) {
     throw InvalidInputException(
         "Distributed Lance write preparation started more than once");
@@ -1012,6 +1023,7 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
     ClientContext &context_p,
     const vector<DistributedWriteTaskResult> &results) const {
   ValidateShape();
+  ValidateDistributedWriteAutoCommit(context_p);
   if (finalize_started) {
     throw InvalidInputException(
         "Distributed Lance coordinator finalized more than once");
