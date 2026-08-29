@@ -42,10 +42,12 @@ keeps its prepared version-one dataset.
 Before a coordinator commit starts, abort and validation failures perform
 best-effort cleanup of the exact data files named by the rejected transactions
 and durable attempt manifests. Cleanup never deletes a file referenced by the
-current Lance manifest. After a successful commit, the same live-file check
-preserves selected data files while their cleanup manifests are removed. If
-commit execution has started and its outcome is unknown, selected manifests
-and files are retained for conservative recovery.
+current Lance manifest. After a successful commit, the coordinator releases
+selected cleanup manifests without attempting any artifact deletion. This
+preserves files referenced by the committed version even if a concurrent
+overwrite has already made that version historical. If commit execution has
+started and its outcome is unknown, selected manifests and files are retained
+for conservative recovery.
 Worker finalization errors rely on Lance's native uncommitted-write failure
 contract, which drops an in-progress writer and removes already completed
 fragments before returning the error; `skip_auto_cleanup` applies only to

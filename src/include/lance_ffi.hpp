@@ -290,6 +290,10 @@ int32_t lance_distributed_cleanup_attempt_manifests(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const char *operation_id,
     const char **retained_task_attempt_ids, size_t retained_task_attempt_count);
+int32_t lance_distributed_release_attempt_manifests(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, const char *operation_id,
+    const char **released_task_attempt_ids, size_t released_task_attempt_count);
 int32_t lance_distributed_cleanup_append_transaction(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const char *operation_id, const uint8_t *bytes,

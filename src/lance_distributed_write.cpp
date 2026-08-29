@@ -622,6 +622,9 @@ private:
       ClientContext &context,
       const vector<string> &retained_task_attempt_ids) const;
   void BestEffortCleanupAttemptManifests(ClientContext &context) const noexcept;
+  void BestEffortReleaseAttemptManifests(
+      ClientContext &context,
+      const vector<string> &released_task_attempt_ids) const noexcept;
   void InitializeInsert();
   void InitializeCTAS();
   void ValidateCTASAbsent() const;
@@ -977,6 +980,34 @@ void LanceDistributedWriteProvider::Impl::BestEffortCleanupAttemptManifests(
   }
 }
 
+void LanceDistributedWriteProvider::Impl::BestEffortReleaseAttemptManifests(
+    ClientContext &context_p,
+    const vector<string> &released_task_attempt_ids) const noexcept {
+  try {
+    string open_path;
+    vector<string> option_keys;
+    vector<string> option_values;
+    ResolveWorkerStorageOptions(context_p, transport.dataset_uri, open_path,
+                                option_keys, option_values);
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    vector<const char *> released_task_attempt_ptrs;
+    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                    value_ptrs);
+    released_task_attempt_ptrs.reserve(released_task_attempt_ids.size());
+    for (const auto &task_attempt_id : released_task_attempt_ids) {
+      released_task_attempt_ptrs.push_back(task_attempt_id.c_str());
+    }
+    (void)lance_distributed_release_attempt_manifests(
+        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+        transport.operation_id.c_str(), released_task_attempt_ptrs.data(),
+        released_task_attempt_ptrs.size());
+    (void)LanceConsumeLastError();
+  } catch (...) {
+  }
+}
+
 idx_t LanceDistributedWriteProvider::Impl::Finalize(
     ClientContext &context_p,
     const vector<DistributedWriteTaskResult> &results) const {
@@ -1079,9 +1110,12 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
   } else {
     LanceInvalidateDatasetCacheForPath(context_p, transport.dataset_uri);
   }
-  // The selected files are live in the new Lance manifest, so cleanup skips
-  // them and removes only their durable attempt ownership records.
-  BestEffortCleanupAttemptManifests(context_p);
+  // Commit transferred the selected artifacts into a durable Lance version.
+  // Release only their temporary ownership records: a concurrent overwrite
+  // may already have made the committed files historical, but time travel must
+  // continue to retain them.
+  BestEffortReleaseAttemptManifests(context_p,
+                                    decoded.manifest_task_attempt_ids);
   return decoded.row_count;
 }
 

@@ -793,6 +793,41 @@ async fn cleanup_attempt_manifests(
     Ok(())
 }
 
+async fn release_attempt_manifests(
+    dataset: &Dataset,
+    operation_id: &str,
+    released_task_attempt_ids: &HashSet<String>,
+) -> FfiResult<()> {
+    if released_task_attempt_ids.is_empty() {
+        return Err(distributed_error(
+            "distributed Lance attempt manifest release requires selected task identities",
+        ));
+    }
+    let (store, manifests) = load_attempt_manifests(dataset, operation_id).await?;
+    if manifests
+        .iter()
+        .any(|manifest| !released_task_attempt_ids.contains(&manifest.task_attempt_id))
+    {
+        return Err(distributed_error(
+            "distributed Lance attempt manifest release found an unselected task identity",
+        ));
+    }
+
+    // A known successful commit transfers every selected data artifact to a
+    // durable Lance version. Remove only the temporary ownership records: a
+    // newer concurrent overwrite may already have made those files historical,
+    // so consulting only the current manifest and deleting artifacts is unsafe.
+    for manifest in manifests {
+        delete_object_if_present(
+            store.as_ref(),
+            &manifest.path,
+            "release distributed Lance attempt cleanup manifest",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn validate_generation(
     dataset: &Dataset,
     expected_version: u64,
@@ -1186,6 +1221,65 @@ pub unsafe extern "C" fn lance_distributed_cleanup_attempt_manifests(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn lance_distributed_release_attempt_manifests(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    operation_id: *const c_char,
+    released_task_attempt_ids: *const *const c_char,
+    released_task_attempt_count: usize,
+) -> i32 {
+    let result = (|| {
+        // SAFETY: C string pointers are valid for this FFI call and are
+        // validated for null and UTF-8 by cstr_to_str before use.
+        let path = unsafe { cstr_to_str(path, "path")? }.to_string();
+        // SAFETY: C string pointers are valid for this FFI call and are
+        // validated for null and UTF-8 by cstr_to_str before use.
+        let operation_id = unsafe { cstr_to_str(operation_id, "operation_id")? }.to_string();
+        // SAFETY: the FFI caller supplies option arrays with options_len
+        // readable entries; the helper validates their null state and strings.
+        let storage_options =
+            unsafe { distributed_storage_options(option_keys, option_values, options_len)? };
+        // SAFETY: the FFI caller supplies released_task_attempt_count readable
+        // C-string pointers; the helper validates the array and every string.
+        let released_task_attempt_ids = unsafe {
+            optional_cstr_array(
+                released_task_attempt_ids,
+                released_task_attempt_count,
+                "released_task_attempt_ids",
+            )?
+        };
+        let released_task_attempt_ids: HashSet<_> = released_task_attempt_ids.into_iter().collect();
+        if released_task_attempt_ids.len() != released_task_attempt_count {
+            return Err(distributed_error(
+                "distributed Lance attempt manifest release contains duplicate task identities",
+            ));
+        }
+
+        match runtime::block_on(async {
+            let dataset = open_dataset(path.as_str(), storage_options, None).await?;
+            release_attempt_manifests(&dataset, operation_id.as_str(), &released_task_attempt_ids)
+                .await
+        }) {
+            Ok(result) => result,
+            Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+        }
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
 fn cleanup_candidate_artifacts(transaction: &Transaction) -> FfiResult<Vec<DistributedArtifact>> {
     let Operation::Append { fragments } = &transaction.operation else {
         return Err(distributed_error(
@@ -1389,6 +1483,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
+    use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
     use lance_table::format::{DataFile, Fragment};
 
     fn append_transaction(files: Vec<DataFile>) -> Transaction {
@@ -1491,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_attempt_manifest_protects_winner_and_cleans_loser() {
+    fn releasing_selected_manifest_preserves_historical_winner_and_cleans_loser() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int32,
@@ -1499,7 +1594,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let uri = format!("memory://attempt-cleanup-{}", rand::random::<u64>());
         let dataset = runtime::block_on(Dataset::write(reader, uri.as_str(), None))
             .unwrap()
@@ -1513,6 +1608,7 @@ mod tests {
         let selected_task_attempt_id = "query.0.0.0";
         let loser_task_attempt_id = "query.0.0.1";
         let live_file = dataset.manifest().fragments[0].files[0].clone();
+        let live_relative_path = format!("data/{}", live_file.path);
         let live_path = dataset.data_dir().join(live_file.path.as_str());
         let loser_file = DataFile::new("loser.lance", vec![], vec![], 1, 1, None, None);
         let loser_path = dataset.data_dir().join(loser_file.path.as_str());
@@ -1575,10 +1671,25 @@ mod tests {
             .unwrap()
             .unwrap());
 
-        runtime::block_on(cleanup_attempt_manifests(
-            &dataset,
+        let overwrite_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+        let overwrite_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
+        let overwritten = runtime::block_on(
+            InsertBuilder::new(Arc::new(dataset.clone()))
+                .with_params(&overwrite_params)
+                .execute(vec![overwrite_batch]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!live_artifact_paths(&overwritten).contains(&live_relative_path));
+
+        runtime::block_on(release_attempt_manifests(
+            &overwritten,
             operation_id,
-            &HashSet::new(),
+            &retained,
         ))
         .unwrap()
         .unwrap();
@@ -1586,6 +1697,19 @@ mod tests {
             .unwrap()
             .unwrap());
         assert!(!runtime::block_on(store.exists(&selected_manifest_path))
+            .unwrap()
+            .unwrap());
+
+        // Manifest-only release is idempotent after a partially or fully
+        // completed best-effort release.
+        runtime::block_on(release_attempt_manifests(
+            &overwritten,
+            operation_id,
+            &retained,
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(runtime::block_on(store.exists(&live_path))
             .unwrap()
             .unwrap());
     }
