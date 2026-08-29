@@ -24,6 +24,18 @@ int32_t lance_session_get_stats(void *session, LanceSessionStats *out_stats);
 int32_t lance_debug_get_counters(LanceDebugCounters *out_counters);
 void lance_debug_reset_counters();
 
+#ifdef LANCE_VANE_DISTRIBUTED
+// Bit flags returned by lance_vane_classify_path. The implementation uses the
+// same URL conversion routine as Lance's object-store layer.
+static constexpr uint8_t LANCE_VANE_PATH_IS_URI = 1U << 0;
+static constexpr uint8_t LANCE_VANE_PATH_HAS_PRIVATE_COMPONENTS = 1U << 1;
+static constexpr uint8_t LANCE_VANE_PATH_IS_PROCESS_LOCAL = 1U << 2;
+static constexpr uint8_t LANCE_VANE_PATH_INVALID = 1U << 3;
+static constexpr uint8_t LANCE_VANE_PATH_IS_LANCE_DATASET = 1U << 4;
+static constexpr uint8_t LANCE_VANE_PATH_IS_REMOTE = 1U << 5;
+uint8_t lance_vane_classify_path(const uint8_t *path, size_t path_len);
+#endif
+
 void *lance_open_dataset(const char *path);
 void *lance_open_dataset_with_session(const char *path, void *session);
 void *lance_open_dataset_with_storage_options(const char *path,
@@ -80,6 +92,11 @@ void *lance_open_dataset_in_namespace_with_session(
     const char *api_key, const char *delimiter, const char *headers_tsv,
     void *session, const char **out_table_uri);
 void lance_close_dataset(void *dataset);
+#ifdef LANCE_VANE_DISTRIBUTED
+uint64_t lance_dataset_version(void *dataset);
+const char *lance_dataset_generation_id(void *dataset);
+void *lance_dataset_checkout_version(void *dataset, uint64_t version);
+#endif
 
 void *lance_get_schema(void *dataset);
 void *lance_get_schema_for_scan(void *dataset);
@@ -166,6 +183,11 @@ typedef struct LanceFragmentStats {
 LanceFragmentStats *lance_dataset_list_fragment_stats(void *dataset,
                                                       size_t *out_len);
 void lance_free_fragment_stats_list(LanceFragmentStats *ptr, size_t len);
+
+#ifdef LANCE_VANE_DISTRIBUTED
+LanceFragmentStats *
+lance_dataset_list_distributed_fragment_stats(void *dataset, size_t *out_len);
+#endif
 
 LanceFieldStats *lance_dataset_list_field_stats(void *dataset, size_t *out_len);
 void lance_free_field_stats_list(LanceFieldStats *ptr, size_t len);
@@ -288,6 +310,9 @@ typedef struct LanceNamespaceQueryConfig {
   size_t columns_len;
   const char *filter;
   uint64_t k;
+#ifdef LANCE_VANE_DISTRIBUTED
+  int64_t version;
+#endif
   uint8_t prefilter;
 } LanceNamespaceQueryConfig;
 

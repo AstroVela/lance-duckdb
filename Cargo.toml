@@ -8,6 +8,9 @@ name = "lance_duckdb_ffi"
 crate-type = ["staticlib"]
 path = "rust/lib.rs"
 
+[features]
+vane-distributed = ["dep:lance-io", "dep:object_store", "dep:url"]
+
 [profile.release]
 lto = "thin"
 strip = true
@@ -23,6 +26,7 @@ lance = { version = "9.0.0", default-features = false, features = ["aws", "azure
 lance-arrow = "9.0.0"
 lance-core = "9.0.0"
 lance-index = "9.0.0"
+lance-io = { version = "9.0.0", default-features = false, features = ["aws"], optional = true }
 lance-linalg = "9.0.0"
 lance-namespace = "9.0.0"
 lance-namespace-impls = { version = "9.0.0", features = ["rest"] }
@@ -49,3 +53,5 @@ serde = { version = "1.0", features = ["derive"] }
 snafu = "0.8.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rand = "0.8"
+object_store = { version = "0.13.2", default-features = false, features = ["aws"], optional = true }
+url = { version = "2", optional = true }

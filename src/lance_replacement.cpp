@@ -5,6 +5,9 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_common.hpp"
+#endif
 
 namespace duckdb {
 
@@ -13,7 +16,18 @@ LanceReplacementScan(ClientContext &, ReplacementScanInput &input,
                      optional_ptr<ReplacementScanData>) {
   const auto &table_name = input.table_name;
   if (!StringUtil::EndsWith(table_name, ".lance")) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    // Private URI components follow the dataset path, so the unresolved table
+    // name no longer ends in .lance. Route these through Lance so its Vane-only
+    // replay and diagnostic guards can reject or redact them instead of
+    // letting DuckDB echo the original URI in a catalog error.
+    if (!LanceVanePathHasPrivateUriComponents(table_name) ||
+        !LanceVanePathIsLanceDataset(table_name)) {
+      return nullptr;
+    }
+#else
     return nullptr;
+#endif
   }
 
   auto table_function = make_uniq<TableFunctionRef>();

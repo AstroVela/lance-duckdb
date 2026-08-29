@@ -1,0 +1,10 @@
+schema_version = 1
+name = "lance"
+extension_config = "extension_config_vane.cmake"
+build_extensions = ["parquet", "json", "icu"]
+native_test_selection = "test/sql/dual_build_smoke.test"
+vcpkg_commit = "84bab45d415d22042bd0b9081aea57f362da3f35"
+
+[vane]
+repository = "AstroVela/vane"
+revision = "b84f025e0aeab3e46523f48ae9d233dc28d28d62"

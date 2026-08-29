@@ -1,9 +1,34 @@
 #include "lance_secrets.hpp"
 
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_common.hpp"
+#endif
+
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
 namespace duckdb {
+
+#ifdef LANCE_VANE_DISTRIBUTED
+static vector<string>
+CanonicalizeLanceSecretScopes(const vector<string> &scopes) {
+  vector<string> result;
+  result.reserve(scopes.size());
+  for (auto &scope : scopes) {
+    result.push_back(LanceVaneCanonicalizeSecretScope(scope));
+  }
+  return result;
+}
+
+static unique_ptr<BaseSecret> DeserializeLanceSecret(Deserializer &deserializer,
+                                                     BaseSecret base_secret) {
+  BaseSecret normalized_base(
+      CanonicalizeLanceSecretScopes(base_secret.GetScope()),
+      base_secret.GetType(), base_secret.GetProvider(), base_secret.GetName());
+  return KeyValueSecret::Deserialize<KeyValueSecret>(
+      deserializer, std::move(normalized_base));
+}
+#endif
 
 static bool ShouldRedactLanceStorageOption(const string &key) {
   return StringUtil::Contains(StringUtil::Lower(key), "secret") ||
@@ -13,8 +38,14 @@ static bool ShouldRedactLanceStorageOption(const string &key) {
 
 static unique_ptr<BaseSecret>
 CreateLanceSecretFromConfig(ClientContext &, CreateSecretInput &input) {
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto secret =
+      make_uniq<KeyValueSecret>(CanonicalizeLanceSecretScopes(input.scope),
+                                input.type, input.provider, input.name);
+#else
   auto secret = make_uniq<KeyValueSecret>(input.scope, input.type,
                                           input.provider, input.name);
+#endif
 
   for (auto &kv : input.options) {
     if (StringUtil::CIEquals(kv.first, "storage_options")) {
@@ -52,6 +83,21 @@ CreateLanceSecretFromConfig(ClientContext &, CreateSecretInput &input) {
   return std::move(secret);
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static unique_ptr<BaseSecret>
+CreateLanceNamespaceSecretFromConfig(ClientContext &context,
+                                     CreateSecretInput &input) {
+  auto secret = CreateLanceSecretFromConfig(context, input);
+  auto *key_value_secret = dynamic_cast<KeyValueSecret *>(secret.get());
+  if (!key_value_secret) {
+    throw InternalException(
+        "Lance namespace config provider did not create a key-value secret");
+  }
+  key_value_secret->redact_keys.insert("api_key");
+  return secret;
+}
+#endif
+
 static bool HasSecretType(SecretManager &secret_manager, const string &name) {
   for (auto &t : secret_manager.AllSecretTypes()) {
     if (StringUtil::CIEquals(t.name, name)) {
@@ -67,7 +113,11 @@ void RegisterLanceSecrets(DatabaseInstance &instance) {
   if (!HasSecretType(secret_manager, "lance")) {
     SecretType secret_type;
     secret_type.name = "lance";
+#ifdef LANCE_VANE_DISTRIBUTED
+    secret_type.deserializer = DeserializeLanceSecret;
+#else
     secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+#endif
     secret_type.default_provider = "config";
     secret_type.extension = "lance";
     secret_manager.RegisterSecretType(secret_type);
@@ -174,6 +224,31 @@ void RegisterLanceSecrets(DatabaseInstance &instance) {
   // - "env": configure via environment variables in the upstream SDK/provider.
   register_provider("credential_chain");
   register_provider("env");
+
+#ifdef LANCE_VANE_DISTRIBUTED
+  // REST namespace credentials are coordinator-local state. Register a
+  // separate secret type so Vane can resolve the current value at each
+  // context-aware namespace operation without retaining it in a table bind or
+  // serialized distributed plan.
+  if (!HasSecretType(secret_manager, "lance_namespace")) {
+    SecretType namespace_secret_type;
+    namespace_secret_type.name = "lance_namespace";
+    namespace_secret_type.deserializer = DeserializeLanceSecret;
+    namespace_secret_type.default_provider = "config";
+    namespace_secret_type.extension = "lance";
+    secret_manager.RegisterSecretType(namespace_secret_type);
+  }
+
+  CreateSecretFunction namespace_provider;
+  namespace_provider.secret_type = "lance_namespace";
+  namespace_provider.provider = "config";
+  namespace_provider.function = CreateLanceNamespaceSecretFromConfig;
+  namespace_provider.named_parameters["token"] = LogicalType::VARCHAR;
+  namespace_provider.named_parameters["bearer_token"] = LogicalType::VARCHAR;
+  namespace_provider.named_parameters["api_key"] = LogicalType::VARCHAR;
+  secret_manager.RegisterSecretFunction(std::move(namespace_provider),
+                                        OnCreateConflict::REPLACE_ON_CONFLICT);
+#endif
 }
 
 } // namespace duckdb

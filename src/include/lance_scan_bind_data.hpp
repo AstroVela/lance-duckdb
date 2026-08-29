@@ -30,6 +30,32 @@ struct LanceScanBindData : public TableFunctionData {
   optional_ptr<TableCatalogEntry> table_entry = nullptr;
   unique_ptr<LanceNamespaceTableConfig> namespace_query_config;
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  uint64_t dataset_version = 0;
+  string dataset_generation_id;
+  string distributed_scan_token;
+  bool distributed_replayable = false;
+  bool distributed_replay_path_restricted = false;
+  bool distributed_requires_coordinator_secret = false;
+  // Suppress backend error details whenever a URI, DuckDB secret, or opaque
+  // namespace response may carry credentials. This is diagnostic provenance;
+  // it is intentionally independent of worker replay eligibility.
+  bool private_uri_diagnostics = false;
+  bool distributed_namespace_session_mismatch = false;
+  bool distributed_worker = false;
+  bool distributed_splits_applied = false;
+  bool distributed_authorization_restricted = false;
+  vector<string> distributed_authorized_split_ids;
+  vector<string> distributed_authorized_split_payloads;
+  // Portable coordinator-planning metadata. Vane may translate a serialized
+  // worker plan again before assigning splits, when no process-local dataset
+  // handle is available.
+  vector<uint64_t> distributed_fragment_ids;
+  vector<int64_t> distributed_fragment_row_counts;
+  vector<uint64_t> distributed_fragment_bytes_on_disk;
+  vector<uint64_t> selected_fragment_ids;
+#endif
+
   bool sampling_pushed_down = false;
   double sample_percentage = 0.0;
   int64_t sample_seed = -1;
@@ -42,6 +68,9 @@ struct LanceScanBindData : public TableFunctionData {
 
   bool UsesNamespaceQuery() const { return namespace_query_config != nullptr; }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  unique_ptr<FunctionData> Copy() const override;
+#endif
   ~LanceScanBindData() override;
 };
 

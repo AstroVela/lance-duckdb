@@ -11,6 +11,9 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/file_system.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "duckdb/common/mutex.hpp"
+#endif
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
@@ -36,11 +39,11 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
@@ -57,7 +60,28 @@ struct LanceDirectoryNamespaceConfig {
   string root;
   vector<string> option_keys;
   vector<string> option_values;
+#ifdef LANCE_VANE_DISTRIBUTED
+  bool uses_coordinator_storage_secret = false;
+  bool distributed_replay_path_restricted = false;
+#endif
 };
+
+#ifdef LANCE_VANE_DISTRIBUTED
+class LanceVaneRestTableNamesSnapshot {
+public:
+  explicit LanceVaneRestTableNamesSnapshot(vector<string> names)
+      : names(std::move(names)) {}
+
+  vector<string> Copy() const {
+    lock_guard<mutex> guard(lock);
+    return names;
+  }
+
+private:
+  mutable mutex lock;
+  vector<string> names;
+};
+#endif
 
 struct LanceRestNamespaceConfig {
   string endpoint;
@@ -66,7 +90,53 @@ struct LanceRestNamespaceConfig {
   string bearer_token_override;
   string api_key_override;
   string headers_tsv; // Tab-separated key\tvalue pairs for custom headers
+#ifdef LANCE_VANE_DISTRIBUTED
+  bool uses_coordinator_auth_secret = false;
+  // Vane cannot safely re-list with credentials captured at ATTACH because a
+  // named secret may later be dropped or replaced. Keep only the credential-
+  // free table-name snapshot needed by DuckDB's context-free default generator.
+  shared_ptr<LanceVaneRestTableNamesSnapshot> table_names_snapshot;
+#endif
 };
+
+#ifdef LANCE_VANE_DISTRIBUTED
+// Vane replays every visible attached database before deserializing a logical
+// plan. Namespace credentials and remote identifiers are deliberately not part
+// of that connection snapshot. These reserved paths create credential-free
+// placeholder catalogs on the planning connection; scans that require REST,
+// coordinator-only secret state, or a URI containing private components are
+// rejected before plan serialization.
+static constexpr const char *LANCE_VANE_REST_SNAPSHOT_PATH =
+    "vane-internal://lance/rest-namespace-snapshot";
+static constexpr const char *LANCE_VANE_DIRECTORY_PLANNING_SNAPSHOT_PATH =
+    "vane-internal://lance/directory-planning-snapshot";
+
+static bool IsLanceVaneRestSnapshot(const AttachInfo &info) {
+  return info.path == LANCE_VANE_REST_SNAPSHOT_PATH;
+}
+
+static bool IsLanceVaneDirectoryPlanningSnapshot(const AttachInfo &info) {
+  return info.path == LANCE_VANE_DIRECTORY_PLANNING_SNAPSHOT_PATH;
+}
+
+static string
+LanceVaneDirectoryDiagnosticPath(const LanceDirectoryNamespaceConfig &ns,
+                                 const string &path) {
+  return LanceVaneDiagnosticPath(
+      path, ns.distributed_replay_path_restricted ||
+                ns.uses_coordinator_storage_secret || !ns.option_keys.empty() ||
+                LanceVanePathIsRemote(ns.root) || LanceVanePathIsRemote(path));
+}
+
+static string
+LanceVaneDirectoryFormatErrorSuffix(const LanceDirectoryNamespaceConfig &ns,
+                                    const string &path) {
+  return LanceVaneFormatErrorSuffix(
+      path, ns.distributed_replay_path_restricted ||
+                ns.uses_coordinator_storage_secret || !ns.option_keys.empty() ||
+                LanceVanePathIsRemote(ns.root) || LanceVanePathIsRemote(path));
+}
+#endif
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
   for (auto &kv : info.options) {
@@ -214,8 +284,14 @@ ListDirectoryNamespaceTables(const LanceDirectoryNamespaceConfig &ns) {
       ns.root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), ns.option_keys.size());
   if (!ptr) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    throw IOException("Failed to list tables from Lance directory namespace: " +
+                      LanceVaneDirectoryDiagnosticPath(ns, ns.root) +
+                      LanceVaneDirectoryFormatErrorSuffix(ns, ns.root));
+#else
     throw IOException("Failed to list tables from Lance directory namespace: " +
                       ns.root + LanceFormatErrorSuffix());
+#endif
   }
   string joined = ptr;
   lance_free_string(ptr);
@@ -243,8 +319,19 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
       endpoint.c_str(), namespace_id.c_str(), bearer_ptr, api_key_ptr,
       delimiter_ptr, headers_ptr);
   if (!ptr) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    auto location = endpoint + "/" + namespace_id;
+    auto private_diagnostics = !bearer_token.empty() || !api_key.empty() ||
+                               !headers_tsv.empty() ||
+                               LanceVanePathIsRemote(location);
+    throw IOException(
+        "Failed to list tables from Lance namespace: " +
+        LanceVaneDiagnosticPath(location, private_diagnostics) +
+        LanceVaneFormatErrorSuffix(location, private_diagnostics));
+#else
     throw IOException("Failed to list tables from Lance namespace: " +
                       endpoint + "/" + namespace_id + LanceFormatErrorSuffix());
+#endif
   }
   string joined = ptr;
   lance_free_string(ptr);
@@ -286,7 +373,6 @@ public:
       throw InvalidInputException(
           "Unsafe Lance dataset name for directory namespace: " + entry_name);
     }
-
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
     BuildStorageOptionPointerArrays(ns->option_keys, ns->option_values,
@@ -329,6 +415,11 @@ public:
     cfg.table_id = entry_name;
     cfg.option_keys = ns->option_keys;
     cfg.option_values = ns->option_values;
+#ifdef LANCE_VANE_DISTRIBUTED
+    cfg.uses_coordinator_storage_secret = ns->uses_coordinator_storage_secret;
+    cfg.distributed_replay_path_restricted =
+        ns->distributed_replay_path_restricted;
+#endif
     cfg.display_uri = std::move(dataset_uri);
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
@@ -399,23 +490,47 @@ public:
       Catalog &catalog, SchemaCatalogEntry &schema, string endpoint,
       string namespace_id, string bearer_token, string api_key,
       string delimiter, string bearer_token_override, string api_key_override,
-      string headers_tsv)
+      string headers_tsv
+#ifdef LANCE_VANE_DISTRIBUTED
+      ,
+      shared_ptr<LanceVaneRestTableNamesSnapshot> table_names_snapshot
+#endif
+      )
       : DefaultGenerator(catalog), schema(schema),
         endpoint(std::move(endpoint)), namespace_id(std::move(namespace_id)),
+#ifndef LANCE_VANE_DISTRIBUTED
         bearer_token(std::move(bearer_token)), api_key(std::move(api_key)),
+#endif
         delimiter(std::move(delimiter)),
         bearer_token_override(std::move(bearer_token_override)),
         api_key_override(std::move(api_key_override)),
-        headers_tsv(std::move(headers_tsv)) {}
+        headers_tsv(std::move(headers_tsv))
+#ifdef LANCE_VANE_DISTRIBUTED
+        ,
+        table_names_snapshot(std::move(table_names_snapshot))
+#endif
+  {
+#ifdef LANCE_VANE_DISTRIBUTED
+    // Resolved named-secret values are deliberately not retained. Every
+    // context-aware operation resolves the current secret state instead.
+    (void)bearer_token;
+    (void)api_key;
+#endif
+  }
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const string &entry_name) override {
+#ifdef LANCE_VANE_DISTRIBUTED
+    // Resolve only names captured by the credential-free ATTACH snapshot, and
+    // resolve current credentials while materializing one of those names.
+#else
     // Only resolve names that are real tables in this namespace. DuckDB probes
     // the active catalog for system names (e.g. duckdb_tables when SHOW TABLES
     // runs under `USE <lance_catalog>`); without this guard we'd try to open
     // those as Lance datasets and throw, aborting the statement. Returning
     // nullptr (not found) lets resolution fall through to the system catalog.
+#endif
     {
       auto known = GetDefaultEntries();
       bool found = false;
@@ -442,12 +557,19 @@ public:
     string resolved_api_key;
     ResolveLanceNamespaceAuth(context, endpoint, overrides, resolved_bearer,
                               resolved_api_key);
-    // Backward-compatible fallback to credentials resolved during ATTACH.
+#ifndef LANCE_VANE_DISTRIBUTED
+    // Preserve the official-DuckDB lane's historical fallback behavior.
     if (resolved_bearer.empty() && resolved_api_key.empty() &&
         (!bearer_token.empty() || !api_key.empty())) {
       resolved_bearer = bearer_token;
       resolved_api_key = api_key;
     }
+#endif
+#ifdef LANCE_VANE_DISTRIBUTED
+    const bool resolved_auth_private = !resolved_bearer.empty() ||
+                                       !resolved_api_key.empty() ||
+                                       !headers_tsv.empty();
+#endif
 
     // Build candidate table IDs (bare name + optional namespace-prefixed).
     vector<string> candidates = {entry_name};
@@ -477,7 +599,12 @@ public:
         continue; // Schema conversion failed, try next candidate.
       }
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced));
+                                std::move(coerced)
+#ifdef LANCE_VANE_DISTRIBUTED
+                                    ,
+                                resolved_auth_private
+#endif
+      );
     }
 
     // Slow fallback: open dataset from S3.
@@ -511,8 +638,22 @@ public:
       }
       lance_close_dataset(dataset);
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced));
+                                std::move(coerced)
+#ifdef LANCE_VANE_DISTRIBUTED
+                                    ,
+                                resolved_auth_private
+#endif
+      );
     }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+    // Do not cache a zero-column placeholder when a named secret is dropped or
+    // replaced between ATTACH and first access. Throwing leaves the default
+    // entry unmaterialized so a later lookup can resolve the current secret
+    // and recover without DETACH/ATTACH.
+    throw IOException(
+        "Failed to materialize Lance REST namespace table: details redacted");
+#else
 
     // All paths failed — return an empty entry to prevent DuckDB crash.
     CreateTableInfo info(schema, entry_name);
@@ -520,11 +661,16 @@ public:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
                               {});
+#endif
   }
 
   vector<string> GetDefaultEntries() override {
+#ifdef LANCE_VANE_DISTRIBUTED
+    auto tables = table_names_snapshot->Copy();
+#else
     auto tables = ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
                                           api_key, delimiter, headers_tsv);
+#endif
     if (namespace_id.empty()) {
       return tables;
     }
@@ -542,7 +688,12 @@ private:
   unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
                                               const string &table_id,
                                               CreateTableInfo info,
-                                              vector<string> coerced_columns) {
+                                              vector<string> coerced_columns
+#ifdef LANCE_VANE_DISTRIBUTED
+                                              ,
+                                              bool resolved_auth_private
+#endif
+  ) {
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Rest;
     cfg.endpoint = endpoint;
@@ -551,6 +702,10 @@ private:
     cfg.bearer_token_override = bearer_token_override;
     cfg.api_key_override = api_key_override;
     cfg.headers_tsv = headers_tsv;
+#ifdef LANCE_VANE_DISTRIBUTED
+    cfg.uses_coordinator_auth_secret =
+        resolved_auth_private || !headers_tsv.empty();
+#endif
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced_columns));
@@ -584,13 +739,36 @@ private:
   SchemaCatalogEntry &schema;
   string endpoint;
   string namespace_id;
+#ifndef LANCE_VANE_DISTRIBUTED
   string bearer_token;
   string api_key;
+#endif
   string delimiter;
   string bearer_token_override;
   string api_key_override;
   string headers_tsv;
+#ifdef LANCE_VANE_DISTRIBUTED
+  shared_ptr<LanceVaneRestTableNamesSnapshot> table_names_snapshot;
+#endif
 };
+
+#ifdef LANCE_VANE_DISTRIBUTED
+class LanceVanePlanningSnapshotDefaultGenerator final
+    : public DefaultGenerator {
+public:
+  explicit LanceVanePlanningSnapshotDefaultGenerator(Catalog &catalog)
+      : DefaultGenerator(catalog) {}
+
+  unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &,
+                                              const string &) override {
+    throw NotImplementedException(
+        "A Vane planning snapshot cannot access Lance namespace tables; "
+        "distributed namespace scans require replayable worker-local state");
+  }
+
+  vector<string> GetDefaultEntries() override { return {}; }
+};
+#endif
 
 static string GetDatasetDirName(const string &table_name) {
   return table_name + ".lance";
@@ -1107,11 +1285,23 @@ public:
   using DuckCatalog::PlanDelete;
   using DuckCatalog::PlanMergeInto;
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  LanceDuckCatalog(AttachedDatabase &db,
+                   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
+                   shared_ptr<LanceRestNamespaceConfig> rest_ns,
+                   string attach_path)
+      : DuckCatalog(db), directory_ns(std::move(directory_ns)),
+        rest_ns(std::move(rest_ns)), attach_path(std::move(attach_path)) {}
+
+  string GetCatalogType() override { return "lance"; }
+  string GetDBPath() override { return attach_path; }
+#else
   LanceDuckCatalog(AttachedDatabase &db,
                    shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
                    shared_ptr<LanceRestNamespaceConfig> rest_ns)
       : DuckCatalog(db), directory_ns(std::move(directory_ns)),
         rest_ns(std::move(rest_ns)) {}
+#endif
 
   using DuckCatalog::PlanUpdate;
 
@@ -1703,6 +1893,9 @@ public:
 private:
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
+#ifdef LANCE_VANE_DISTRIBUTED
+  string attach_path;
+#endif
 };
 
 PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
@@ -1721,6 +1914,13 @@ static unique_ptr<Catalog>
 LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                    AttachedDatabase &db, const string &name, AttachInfo &info,
                    AttachOptions &attach_options) {
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto vane_rest_snapshot = IsLanceVaneRestSnapshot(info);
+  auto vane_directory_planning_snapshot =
+      IsLanceVaneDirectoryPlanningSnapshot(info);
+  auto vane_planning_snapshot =
+      vane_rest_snapshot || vane_directory_planning_snapshot;
+#endif
   // Consume Lance-specific options from attach_options.options so that
   // DuckDB doesn't complain about unrecognized options when creating storage.
   attach_options.options.erase("endpoint");
@@ -1728,6 +1928,12 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   attach_options.options.erase("header");
   attach_options.options.erase("bearer_token");
   attach_options.options.erase("api_key");
+#ifdef LANCE_VANE_DISTRIBUTED
+  // TOKEN is an alias for BEARER_TOKEN. Vane serializes the remaining attach
+  // options, so consume the alias as well before a connection snapshot is
+  // constructed.
+  attach_options.options.erase("token");
+#endif
 
   auto attach_path = info.path;
   auto endpoint = GetLanceNamespaceEndpoint(info);
@@ -1739,19 +1945,47 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
 
   auto is_rest_namespace = !endpoint.empty();
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (vane_planning_snapshot && is_rest_namespace) {
+    throw InvalidInputException(
+        "A Vane namespace planning snapshot must not contain an endpoint");
+  }
+#endif
   string namespace_id;
   string bearer_token;
   string api_key;
   string bearer_token_override;
   string api_key_override;
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (vane_planning_snapshot) {
+    // A placeholder deliberately carries no directory or REST configuration.
+    // Its empty default generator below makes every table access fail closed.
+  } else if (!is_rest_namespace) {
+#else
   if (!is_rest_namespace) {
+#endif
+#ifdef LANCE_VANE_DISTRIBUTED
+    auto &file_system = FileSystem::GetFileSystem(context);
+    auto root = file_system.ExpandPath(attach_path);
+    if (root.find("://") == string::npos && !file_system.IsPathAbsolute(root)) {
+      root = file_system.JoinPath(FileSystem::GetWorkingDirectory(), root);
+    }
+#else
     auto root = FileSystem::GetFileSystem(context).ExpandPath(attach_path);
+#endif
     vector<string> option_keys;
     vector<string> option_values;
     string open_root;
+#ifdef LANCE_VANE_DISTRIBUTED
+    auto uses_coordinator_storage_secret =
+        LanceHasMatchingStorageSecret(context, root);
+    ResolveLanceStorageOptionsForDistributedRead(context, root, open_root,
+                                                 option_keys, option_values);
+#else
     ResolveLanceStorageOptions(context, root, open_root, option_keys,
                                option_values);
+#endif
 
     string list_error;
     vector<string> discovered_tables;
@@ -1766,6 +2000,10 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     directory_ns->root = std::move(open_root);
     directory_ns->option_keys = std::move(option_keys);
     directory_ns->option_values = std::move(option_values);
+#ifdef LANCE_VANE_DISTRIBUTED
+    directory_ns->uses_coordinator_storage_secret =
+        uses_coordinator_storage_secret;
+#endif
   } else {
     namespace_id = attach_path;
     if (namespace_id.empty()) {
@@ -1793,13 +2031,44 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     rest_ns->bearer_token_override = bearer_token_override;
     rest_ns->api_key_override = api_key_override;
     rest_ns->headers_tsv = headers_tsv;
+#ifdef LANCE_VANE_DISTRIBUTED
+    rest_ns->uses_coordinator_auth_secret =
+        !bearer_token.empty() || !api_key.empty() || !headers_tsv.empty();
+    rest_ns->table_names_snapshot =
+        make_shared_ptr<LanceVaneRestTableNamesSnapshot>(
+            std::move(discovered_tables));
+#endif
   }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  // AttachedDatabase captured the caller-visible access mode before invoking
+  // this callback. The ephemeral DuckCatalog backing store itself must always
+  // be writable: DuckDB rejects read-only in-memory storage, which is otherwise
+  // selected automatically for remote namespace paths such as s3://.
+  attach_options.access_mode = AccessMode::READ_WRITE;
+  info.path = ":memory:";
+  auto replay_path = attach_path;
+  if (directory_ns) {
+    auto portable_attach_path = LanceVaneReplayPath(context, attach_path);
+    auto portable_root = LanceVaneReplayPath(context, directory_ns->root);
+    directory_ns->distributed_replay_path_restricted =
+        portable_attach_path.empty() || portable_root.empty();
+    replay_path = directory_ns->uses_coordinator_storage_secret ||
+                          directory_ns->distributed_replay_path_restricted
+                      ? LANCE_VANE_DIRECTORY_PLANNING_SNAPSHOT_PATH
+                      : std::move(portable_root);
+  } else if (rest_ns) {
+    replay_path = LANCE_VANE_REST_SNAPSHOT_PATH;
+  }
+  auto catalog = make_uniq<LanceDuckCatalog>(db, directory_ns, rest_ns,
+                                             std::move(replay_path));
+#else
   // Back the attached catalog by an in-memory DuckCatalog that lazily
   // materializes per-table entries mapping to internal scan / namespace scan,
   // scan, and supports CREATE TABLE for directory namespaces.
   info.path = ":memory:";
   auto catalog = make_uniq<LanceDuckCatalog>(db, directory_ns, rest_ns);
+#endif
   catalog->Initialize(false);
 
   auto system_transaction =
@@ -1811,14 +2080,25 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto &duck_schema = schema.Cast<DuckSchemaEntry>();
   auto &catalog_set = duck_schema.GetCatalogSet(CatalogType::TABLE_ENTRY);
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (vane_planning_snapshot) {
+    generator = make_uniq<LanceVanePlanningSnapshotDefaultGenerator>(*catalog);
+  } else if (!is_rest_namespace) {
+#else
   if (!is_rest_namespace) {
+#endif
     generator = make_uniq<LanceDirectoryDefaultGenerator>(*catalog, schema,
                                                           directory_ns);
   } else {
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
         *catalog, schema, endpoint, namespace_id, std::move(bearer_token),
         std::move(api_key), delimiter, bearer_token_override, api_key_override,
-        headers_tsv);
+        headers_tsv
+#ifdef LANCE_VANE_DISTRIBUTED
+        ,
+        rest_ns->table_names_snapshot
+#endif
+    );
   }
   auto *generator_ptr = generator.get();
   catalog_set.SetDefaultGenerator(std::move(generator));

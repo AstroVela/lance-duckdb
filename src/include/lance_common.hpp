@@ -15,8 +15,17 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
                         DataChunk &chunk, SelectionVector &sel);
 
 void *LanceOpenDataset(ClientContext &context, const string &path);
+#ifdef LANCE_VANE_DISTRIBUTED
+void *LanceOpenDatasetForDistributedScan(ClientContext &context,
+                                         const string &path);
+#endif
 
 string LanceNormalizeS3Scheme(const string &path);
+#ifdef LANCE_VANE_DISTRIBUTED
+// Canonicalize a syntactically valid URI scheme for secret matching. URI
+// schemes are ASCII case-insensitive; Lance also treats s3a/s3n as s3 aliases.
+string LanceVaneCanonicalizeSecretScope(const string &scope);
+#endif
 void LanceFillStorageOptionsFromSecrets(ClientContext &context,
                                         const string &path,
                                         vector<string> &out_keys,
@@ -25,6 +34,38 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
                                 string &out_open_path,
                                 vector<string> &out_option_keys,
                                 vector<string> &out_option_values);
+#ifdef LANCE_VANE_DISTRIBUTED
+void ResolveLanceStorageOptionsForDistributedRead(
+    ClientContext &context, const string &path, string &out_open_path,
+    vector<string> &out_option_keys, vector<string> &out_option_values);
+bool LanceHasMatchingStorageSecret(ClientContext &context, const string &path);
+// Return whether a URI carries components that must never appear in Vane plan
+// snapshots or diagnostics. Plain filesystem paths are not parsed as URIs.
+bool LanceVanePathHasPrivateUriComponents(const string &path);
+// Return whether Lance resolves the path through a remote object-store or
+// service URI. Remote backend diagnostics are always treated as opaque.
+bool LanceVanePathIsRemote(const string &path);
+// Include remote-backend and resolved storage-option provenance in the
+// diagnostic taint. This must be evaluated before the first backend call
+// because an error response may repeat ambient/request credentials, vended
+// URLs, or private endpoint values.
+bool LanceVanePathRequiresRedaction(ClientContext &context, const string &path);
+// Return whether Lance's normalized URL/path semantics identify the input as
+// a dataset path. Replacement scans use this instead of reparsing URI text in
+// C++ so credential-bearing normalized forms cannot fall through to DuckDB.
+bool LanceVanePathIsLanceDataset(const string &path);
+// Redact a URI with private components, or a path whose provenance requires
+// redaction, before exposing it through errors or EXPLAIN output.
+string LanceVaneDiagnosticPath(const string &path,
+                               bool force_redaction = false);
+// Consume the current Lance FFI error while suppressing its details whenever
+// they could contain a private URI.
+string LanceVaneFormatErrorSuffix(const string &path,
+                                  bool force_redaction = false);
+// Return a canonical worker-replay path, or an empty string when the path is
+// process-local or could expose URI credentials through a serialized plan.
+string LanceVaneReplayPath(ClientContext &context, const string &path);
+#endif
 void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
                                      const vector<string> &option_values,
                                      vector<const char *> &out_key_ptrs,
@@ -85,6 +126,19 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
 
 struct LanceNamespaceTableConfig;
 class LanceTableEntry;
+
+#ifdef LANCE_VANE_DISTRIBUTED
+// Return whether diagnostics for this table must suppress the supplied path
+// and the current Lance FFI error. Namespace resolution can normalize a
+// private ATTACH URI into a path that no longer carries the original marker,
+// so this check also consults the catalog-entry provenance bits.
+bool LanceVaneTablePathRequiresRedaction(const LanceTableEntry &table,
+                                         const string &path);
+string LanceVaneTableDiagnosticPath(const LanceTableEntry &table,
+                                    const string &path);
+string LanceVaneTableFormatErrorSuffix(const LanceTableEntry &table,
+                                       const string &path);
+#endif
 
 void FillLanceNamespaceQueryConfig(
     ClientContext &context, const LanceNamespaceTableConfig &cfg, uint64_t k,
