@@ -542,8 +542,17 @@ pub unsafe extern "C" fn lance_distributed_commit_append_transactions(
     transaction_bytes: *const *const u8,
     transaction_lengths: *const usize,
     transaction_count: usize,
+    out_commit_started: *mut u8,
 ) -> i32 {
     let result = (|| {
+        if out_commit_started.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "out_commit_started is null",
+            ));
+        }
+        // SAFETY: the caller provides writable storage for the commit phase marker.
+        unsafe { ptr::write_unaligned(out_commit_started, 0) };
         if transaction_count == 0 {
             return Err(distributed_error(
                 "distributed Lance batch commit requires transactions",
@@ -609,6 +618,10 @@ pub unsafe extern "C" fn lance_distributed_commit_append_transactions(
         let builder = CommitBuilder::new(Arc::new(dataset))
             .with_max_retries(0)
             .with_skip_auto_cleanup(true);
+        // No catalog mutation is attempted before this point. Once the marker
+        // is set, every error is conservatively treated as an unknown outcome.
+        // SAFETY: out_commit_started was validated above.
+        unsafe { ptr::write_unaligned(out_commit_started, 1) };
         let result = match runtime::block_on(builder.execute_batch(transactions)) {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
@@ -641,6 +654,46 @@ pub unsafe extern "C" fn lance_distributed_commit_append_transactions(
             -1
         }
     }
+}
+
+fn cleanup_candidate_artifacts(transaction: &Transaction) -> FfiResult<Vec<DistributedArtifact>> {
+    let Operation::Append { fragments } = &transaction.operation else {
+        return Err(distributed_error(
+            "distributed Lance cleanup requires an append transaction",
+        ));
+    };
+    if fragments.is_empty()
+        || fragments
+            .iter()
+            .any(|fragment| fragment.deletion_file.is_some() || !fragment.overlays.is_empty())
+    {
+        return Err(distributed_error(
+            "distributed Lance cleanup requires pure append fragments",
+        ));
+    }
+
+    let mut artifact_paths = HashSet::new();
+    let mut artifacts = Vec::new();
+    for file in fragments.iter().flat_map(|fragment| fragment.files.iter()) {
+        if file.base_id.is_some() || validate_relative_data_path(file.path.as_str()).is_err() {
+            continue;
+        }
+        let relative = format!("data/{}", file.path);
+        if !artifact_paths.insert(relative.clone()) {
+            continue;
+        }
+        let Ok(path) = CString::new(relative) else {
+            continue;
+        };
+        let size_bytes = file.file_size_bytes.get().map_or(0, |size| size.get());
+        artifacts.push(DistributedArtifact { path, size_bytes });
+    }
+    if artifacts.is_empty() {
+        return Err(distributed_error(
+            "distributed Lance append transaction has no safe cleanup artifacts",
+        ));
+    }
+    Ok(artifacts)
 }
 
 fn cleanup_append_artifacts(
@@ -688,6 +741,44 @@ fn cleanup_append_artifacts(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn lance_distributed_cleanup_append_transaction_handle(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    transaction: *mut c_void,
+) -> i32 {
+    let result = (|| {
+        if transaction.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "transaction is null",
+            ));
+        }
+        // SAFETY: this FFI consumes one live Transaction handle on every return path.
+        let transaction = unsafe { Box::from_raw(transaction as *mut Transaction) };
+        // SAFETY: C string pointers are validated by cstr_to_str before use.
+        let path = unsafe { cstr_to_str(path, "path")? }.to_string();
+        // SAFETY: option arrays are validated before constructing Rust slices.
+        let storage_options =
+            unsafe { distributed_storage_options(option_keys, option_values, options_len)? };
+        let artifacts = cleanup_candidate_artifacts(&transaction)?;
+        cleanup_append_artifacts(path.as_str(), storage_options, &artifacts)
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -791,5 +882,67 @@ pub unsafe extern "C" fn lance_distributed_cleanup_append_transaction(
             set_last_error(err.code, err.message);
             -1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_table::format::{DataFile, Fragment};
+
+    fn append_transaction(files: Vec<DataFile>) -> Transaction {
+        let mut fragment = Fragment::new(0);
+        fragment.files = files;
+        Transaction::new(
+            7,
+            Operation::Append {
+                fragments: vec![fragment],
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn commit_marker_remains_clear_for_pre_commit_failure() {
+        let mut commit_started = 1;
+        // SAFETY: the zero transaction count makes every array and string
+        // pointer unreachable after the writable marker is initialized.
+        let result = unsafe {
+            lance_distributed_commit_append_transactions(
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                &mut commit_started,
+            )
+        };
+
+        assert_eq!(result, -1);
+        assert_eq!(commit_started, 0);
+    }
+
+    #[test]
+    fn cleanup_candidates_survive_strict_encoding_validation_failure() {
+        let transaction = append_transaction(vec![
+            DataFile::new("safe.lance", vec![], vec![], 2, 2, None, None),
+            DataFile::new("safe.lance", vec![], vec![], 2, 2, None, None),
+            DataFile::new("../escape.lance", vec![], vec![], 2, 2, None, None),
+            DataFile::new("routed.lance", vec![], vec![], 2, 2, None, Some(1)),
+        ]);
+
+        assert!(
+            inspect_append_transaction(&transaction, 7, "operation", None, None, None).is_err()
+        );
+
+        let artifacts = cleanup_candidate_artifacts(&transaction).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].path.to_str().unwrap(), "data/safe.lance");
     }
 }

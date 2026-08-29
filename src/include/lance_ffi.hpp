@@ -279,11 +279,14 @@ int32_t lance_distributed_commit_append_transactions(
     size_t options_len, void *session, uint64_t expected_version,
     const char *expected_generation, const char *operation_id,
     const uint8_t **transaction_bytes, const size_t *transaction_lengths,
-    size_t transaction_count);
+    size_t transaction_count, uint8_t *out_commit_started);
 int32_t lance_distributed_cleanup_append_transaction(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const char *operation_id, const uint8_t *bytes,
     size_t bytes_len);
+int32_t lance_distributed_cleanup_append_transaction_handle(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, void *transaction);
 int32_t lance_distributed_abort_uncommitted_writer(
     void *writer, const char *path, const char **option_keys,
     const char **option_values, size_t options_len, uint64_t expected_version,

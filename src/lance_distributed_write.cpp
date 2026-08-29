@@ -990,24 +990,32 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
     throw;
   }
 
+  uint8_t commit_started = 0;
   const auto commit_result = lance_distributed_commit_append_transactions(
       open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       LanceGetSessionHandle(context_p), transport.expected_version,
       prepared_generation.c_str(), transport.operation_id.c_str(),
       transaction_ptrs.data(), transaction_lengths.data(),
-      transaction_ptrs.size());
+      transaction_ptrs.size(), &commit_started);
   if (commit_result != 0) {
+    const auto error_suffix = LanceVaneFormatErrorSuffix(
+        transport.dataset_uri,
+        LanceVanePathRequiresRedaction(context_p, transport.dataset_uri));
+    if (commit_started == 0) {
+      BestEffortCleanupTransactions(context_p, decoded);
+    }
     if (table) {
       LanceInvalidateDatasetCacheForTable(context_p, *table);
     } else {
       LanceInvalidateDatasetCacheForPath(context_p, transport.dataset_uri);
     }
-    throw IOException(
-        "Distributed Lance coordinator commit outcome is unknown" +
-        LanceVaneFormatErrorSuffix(
-            transport.dataset_uri,
-            LanceVanePathRequiresRedaction(context_p, transport.dataset_uri)));
+    const auto *message =
+        commit_started == 0
+            ? "Distributed Lance coordinator commit failed before commit "
+              "execution"
+            : "Distributed Lance coordinator commit outcome is unknown";
+    throw IOException(string(message) + error_suffix);
   }
   if (table) {
     LanceInvalidateDatasetCacheForTable(context_p, *table);
@@ -1496,6 +1504,63 @@ static void BestEffortCleanupTransactions(
   }
 }
 
+static void BestEffortCleanupTransactionHandle(
+    const string &open_path, const vector<string> &option_keys,
+    const vector<string> &option_values, void *transaction) noexcept {
+  auto *transaction_to_cleanup = transaction;
+  if (!transaction_to_cleanup) {
+    return;
+  }
+  try {
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                    value_ptrs);
+    (void)lance_distributed_cleanup_append_transaction_handle(
+        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+        transaction_to_cleanup);
+    // The cleanup FFI consumes the transaction on every return path.
+    transaction_to_cleanup = nullptr;
+    (void)LanceConsumeLastError();
+  } catch (...) {
+  }
+  if (transaction_to_cleanup) {
+    lance_free_transaction(transaction_to_cleanup);
+  }
+}
+
+class LanceUncommittedTransactionGuard {
+public:
+  LanceUncommittedTransactionGuard(void *transaction_p,
+                                   const string &open_path_p,
+                                   const vector<string> &option_keys_p,
+                                   const vector<string> &option_values_p)
+      : transaction(transaction_p), open_path(open_path_p),
+        option_keys(option_keys_p), option_values(option_values_p) {}
+
+  LanceUncommittedTransactionGuard(const LanceUncommittedTransactionGuard &) =
+      delete;
+  LanceUncommittedTransactionGuard &
+  operator=(const LanceUncommittedTransactionGuard &) = delete;
+
+  ~LanceUncommittedTransactionGuard() {
+    BestEffortCleanupTransactionHandle(open_path, option_keys, option_values,
+                                       transaction);
+  }
+
+  void MarkRegistered() noexcept {
+    lance_free_transaction(transaction);
+    transaction = nullptr;
+  }
+
+private:
+  void *transaction;
+  const string &open_path;
+  const vector<string> &option_keys;
+  const vector<string> &option_values;
+};
+
 class LanceDistributedWriteGlobalState final
     : public DistributedWriteGlobalState {
 public:
@@ -1719,12 +1784,13 @@ LanceDistributedWriteCombine(ExecutionContext &context,
             LanceVanePathRequiresRedaction(context.client,
                                            global.transport.dataset_uri)));
   }
+  LanceUncommittedTransactionGuard transaction_guard(
+      transaction, global.open_path, global.option_keys, global.option_values);
 
   auto *encoded = lance_distributed_encode_append_transaction(
       transaction, global.transport.expected_version,
       global.transport.operation_id.c_str(), task.query_id.c_str(),
       task.task_attempt_id.c_str(), local.row_count);
-  lance_free_transaction(transaction);
   if (!encoded) {
     throw IOException("Failed to encode distributed Lance worker transaction" +
                       LanceVaneFormatErrorSuffix(
@@ -1767,12 +1833,17 @@ LanceDistributedWriteCombine(ExecutionContext &context,
         "Distributed Lance worker transaction has no data artifacts");
   }
 
-  lock_guard<mutex> guard(global.lock);
-  global.row_count = CheckedAdd(global.row_count, worker_transaction.row_count,
-                                "task row count");
-  global.byte_count = CheckedAdd(
-      global.byte_count, worker_transaction.byte_count, "task byte count");
-  global.transactions.push_back(std::move(worker_transaction));
+  {
+    lock_guard<mutex> guard(global.lock);
+    const auto row_count = CheckedAdd(
+        global.row_count, worker_transaction.row_count, "task row count");
+    const auto byte_count = CheckedAdd(
+        global.byte_count, worker_transaction.byte_count, "task byte count");
+    global.transactions.push_back(std::move(worker_transaction));
+    global.row_count = row_count;
+    global.byte_count = byte_count;
+  }
+  transaction_guard.MarkRegistered();
 }
 
 static vector<DistributedWriteFragment>
