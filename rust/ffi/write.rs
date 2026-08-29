@@ -699,6 +699,8 @@ pub(super) fn distributed_optional_cstr(
     if value.is_null() {
         return Ok(None);
     }
+    // SAFETY: the enclosing FFI call guarantees that a non-null value points
+    // to a valid NUL-terminated C string for the duration of this call.
     let value = unsafe { cstr_to_str(value, name)? };
     if value.is_empty() {
         return Ok(None);
@@ -721,11 +723,15 @@ pub(super) unsafe fn distributed_storage_options(
     let keys = if options_len == 0 {
         &[][..]
     } else {
+        // SAFETY: non-zero arrays were checked non-null above, and the FFI
+        // caller guarantees option_keys contains options_len readable entries.
         unsafe { slice_from_ptr(option_keys, options_len, "option_keys")? }
     };
     let values = if options_len == 0 {
         &[][..]
     } else {
+        // SAFETY: non-zero arrays were checked non-null above, and the FFI
+        // caller guarantees option_values contains options_len readable entries.
         unsafe { slice_from_ptr(option_values, options_len, "option_values")? }
     };
     let mut result = HashMap::new();
@@ -736,9 +742,13 @@ pub(super) unsafe fn distributed_storage_options(
                 format!("option key/value is null at index {index}"),
             ));
         }
+        // SAFETY: key was checked non-null above, and the FFI caller guarantees
+        // each option key is a valid NUL-terminated C string.
         let key = unsafe { CStr::from_ptr(key) }.to_str().map_err(|err| {
             FfiError::new(ErrorCode::Utf8, format!("option_keys[{index}] utf8: {err}"))
         })?;
+        // SAFETY: value was checked non-null above, and the FFI caller guarantees
+        // each option value is a valid NUL-terminated C string.
         let value = unsafe { CStr::from_ptr(value) }.to_str().map_err(|err| {
             FfiError::new(
                 ErrorCode::Utf8,
@@ -769,9 +779,17 @@ fn open_distributed_uncommitted_writer_inner(
     session: *mut c_void,
     schema: *const c_void,
 ) -> FfiResult<WriterHandle> {
+    // SAFETY: the enclosing FFI call guarantees that path points to a valid
+    // NUL-terminated C string for the duration of this call.
     let path_value = unsafe { cstr_to_str(path, "path")? }.to_string();
+    // SAFETY: the enclosing FFI call guarantees that operation_id points to a
+    // valid NUL-terminated C string for the duration of this call.
     let operation_id = unsafe { cstr_to_str(operation_id, "operation_id")? }.to_string();
+    // SAFETY: the enclosing FFI call guarantees that query_id points to a
+    // valid NUL-terminated C string for the duration of this call.
     let query_id = unsafe { cstr_to_str(query_id, "query_id")? }.to_string();
+    // SAFETY: the enclosing FFI call guarantees that task_attempt_id points to
+    // a valid NUL-terminated C string for the duration of this call.
     let task_attempt_id = unsafe { cstr_to_str(task_attempt_id, "task_attempt_id")? }.to_string();
     if expected_version == 0
         || operation_id.is_empty()
@@ -794,8 +812,12 @@ fn open_distributed_uncommitted_writer_inner(
         ));
     }
 
+    // SAFETY: the enclosing FFI call guarantees that the option arrays contain
+    // options_len readable C-string pointers; the helper validates null state.
     let storage_options =
         unsafe { distributed_storage_options(option_keys, option_values, options_len)? };
+    // SAFETY: session is either null or a live session handle returned by this
+    // module, as required by the enclosing FFI call.
     let session_handle = unsafe { optional_session_handle(session)? };
     let dataset = match runtime::block_on(async {
         let mut builder = DatasetBuilder::from_uri(path_value.as_str());

@@ -585,6 +585,8 @@ fn dataset_list_distributed_fragment_stats_inner(
     if out_len.is_null() {
         return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
     }
+    // SAFETY: the FFI caller supplies a live dataset handle returned by this
+    // module; dataset_handle rejects a null pointer before dereferencing it.
     let handle = unsafe { super::util::dataset_handle(dataset)? };
 
     let mut out: Vec<LanceFragmentStats> = Vec::with_capacity(handle.dataset.fragments().len());
@@ -620,6 +622,8 @@ fn dataset_list_distributed_fragment_stats_inner(
     let data = boxed.as_mut_ptr();
     std::mem::forget(boxed);
 
+    // SAFETY: out_len was checked non-null above and the FFI caller provides
+    // writable storage for one usize value.
     unsafe {
         std::ptr::write_unaligned(out_len, len);
     }

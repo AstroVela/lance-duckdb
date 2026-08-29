@@ -138,6 +138,8 @@ pub unsafe extern "C" fn lance_vane_classify_path(path: *const u8, path_len: usi
     if path.is_null() {
         return VANE_PATH_INVALID | VANE_PATH_HAS_PRIVATE_COMPONENTS;
     }
+    // SAFETY: the FFI caller guarantees that a non-null path points to at
+    // least path_len readable bytes for the duration of this call.
     let bytes = unsafe { std::slice::from_raw_parts(path, path_len) };
     let Ok(path) = std::str::from_utf8(bytes) else {
         return VANE_PATH_INVALID | VANE_PATH_HAS_PRIVATE_COMPONENTS;
