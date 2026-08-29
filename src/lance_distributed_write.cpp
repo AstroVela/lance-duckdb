@@ -1837,6 +1837,10 @@ LanceDistributedWriteCombine(ExecutionContext &context,
   void *transaction = nullptr;
   const auto finish_result =
       lance_writer_finish_uncommitted(local.writer, &transaction);
+  // Lance's execute_uncommitted_stream failure path drops the in-progress
+  // writer and deletes every completed fragment before returning an error.
+  // WriteParams::skip_auto_cleanup affects only post-commit version cleanup,
+  // not this write-failure cleanup, so the wrapper handle can now be closed.
   lance_close_writer(local.writer);
   local.writer = nullptr;
   if (finish_result != 0 || !transaction) {

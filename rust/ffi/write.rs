@@ -1794,3 +1794,93 @@ pub unsafe extern "C" fn lance_free_transaction(transaction: *mut c_void) {
         let _ = Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction);
     }
 }
+
+#[cfg(all(test, feature = "vane-distributed"))]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+    use lance::dataset::progress::WriteFragmentProgress;
+    use lance_table::format::Fragment;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct FailCompletedFragment;
+
+    #[async_trait::async_trait]
+    impl WriteFragmentProgress for FailCompletedFragment {
+        async fn begin(&self, _fragment: &Fragment) -> lance::Result<()> {
+            Ok(())
+        }
+
+        async fn complete(&self, _fragment: &Fragment) -> lance::Result<()> {
+            Err(lance::Error::invalid_input(
+                "injected completed-fragment failure",
+            ))
+        }
+    }
+
+    fn data_objects(dataset: &Dataset) -> Vec<String> {
+        let store = runtime::block_on(dataset.object_store(None))
+            .unwrap()
+            .unwrap();
+        let mut objects = runtime::block_on(async {
+            store
+                .list(Some(dataset.data_dir()))
+                .map_ok(|object| object.location.to_string())
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .unwrap()
+        .unwrap();
+        objects.sort();
+        objects
+    }
+
+    #[test]
+    fn failed_uncommitted_write_cleans_completed_fragments() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let uri = format!("memory://failed-write-cleanup-{}", rand::random::<u64>());
+        let dataset = runtime::block_on(Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            uri.as_str(),
+            None,
+        ))
+        .unwrap()
+        .unwrap();
+        let objects_before = data_objects(&dataset);
+
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            progress: Arc::new(FailCompletedFragment),
+            // This skips post-commit version cleanup only. Lance must still
+            // remove uncommitted data artifacts when the write itself fails.
+            skip_auto_cleanup: true,
+            ..Default::default()
+        };
+        let source = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let error = runtime::block_on(
+            InsertBuilder::new(Arc::new(dataset.clone()))
+                .with_params(&params)
+                .execute_uncommitted_stream(source),
+        )
+        .unwrap()
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected completed-fragment failure"));
+        assert_eq!(data_objects(&dataset), objects_before);
+    }
+}
