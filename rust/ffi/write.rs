@@ -539,8 +539,9 @@ fn frozen_target_vector_dimension(input_type: &DataType, target_type: &DataType)
 }
 
 #[cfg(feature = "vane-distributed")]
-fn frozen_target_field_type_compatible(input: &Field, target: &Field) -> bool {
+fn frozen_target_field_compatible(input: &Field, target: &Field) -> bool {
     input.name() == target.name()
+        && input.is_nullable() == target.is_nullable()
         && frozen_target_type_compatible(input.data_type(), target.data_type())
 }
 
@@ -565,24 +566,24 @@ fn frozen_target_type_compatible(input: &DataType, target: &DataType) -> bool {
         (
             DataType::List(input_field) | DataType::LargeList(input_field),
             DataType::List(target_field) | DataType::LargeList(target_field),
-        ) => frozen_target_field_type_compatible(input_field, target_field),
+        ) => frozen_target_field_compatible(input_field, target_field),
         (
             DataType::FixedSizeList(input_field, input_dimension),
             DataType::FixedSizeList(target_field, target_dimension),
         ) => {
             input_dimension == target_dimension
-                && frozen_target_field_type_compatible(input_field, target_field)
+                && frozen_target_field_compatible(input_field, target_field)
         }
         (DataType::Struct(input_fields), DataType::Struct(target_fields)) => {
             input_fields.len() == target_fields.len()
                 && input_fields
                     .iter()
                     .zip(target_fields)
-                    .all(|(input, target)| frozen_target_field_type_compatible(input, target))
+                    .all(|(input, target)| frozen_target_field_compatible(input, target))
         }
         (DataType::Map(input_field, input_sorted), DataType::Map(target_field, target_sorted)) => {
             input_sorted == target_sorted
-                && frozen_target_field_type_compatible(input_field, target_field)
+                && frozen_target_field_compatible(input_field, target_field)
         }
         _ => false,
     }
@@ -606,6 +607,25 @@ fn configure_frozen_target_schema(
             return Err(FfiError::new(
                 ErrorCode::DistributedWrite,
                 "distributed Lance worker input field names do not match the frozen target",
+            ));
+        }
+        if target.is_nullable() != input.is_nullable() {
+            return Err(FfiError::new(
+                ErrorCode::DistributedWrite,
+                format!(
+                    "distributed Lance worker input field '{}' is {}, but the frozen target field is {}",
+                    input.name(),
+                    if input.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    },
+                    if target.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    }
+                ),
             ));
         }
         if !frozen_target_type_compatible(input.data_type(), target.data_type()) {
@@ -1960,7 +1980,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_target_schema_rejects_casts_and_configures_vectors() {
+    fn frozen_target_schema_rejects_changes_and_configures_vectors() {
         let int_input = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int32,
@@ -1984,6 +2004,33 @@ mod tests {
         let error = configure_frozen_target_schema(&float_input, &half_target, &mut candidates)
             .unwrap_err();
         assert!(error.message.contains("frozen target has type Float16"));
+
+        let nullable_input = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]));
+        let required_target = Schema::new(vec![Field::new("value", DataType::Int32, false)]);
+        let error =
+            configure_frozen_target_schema(&nullable_input, &required_target, &mut candidates)
+                .unwrap_err();
+        assert!(error.message.contains(
+            "input field 'value' is nullable, but the frozen target field is non-nullable"
+        ));
+
+        let nested_input = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Struct(vec![Arc::new(Field::new("child", DataType::Int32, true))].into()),
+            true,
+        )]));
+        let nested_target = Schema::new(vec![Field::new(
+            "value",
+            DataType::Struct(vec![Arc::new(Field::new("child", DataType::Int32, false))].into()),
+            true,
+        )]);
+        let error = configure_frozen_target_schema(&nested_input, &nested_target, &mut candidates)
+            .unwrap_err();
+        assert!(error.message.contains("frozen target has type Struct"));
 
         let string_input = Arc::new(Schema::new(vec![Field::new(
             "value",
