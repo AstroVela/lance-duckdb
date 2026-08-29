@@ -410,6 +410,54 @@ def _exercise_explicit_transaction_rejection(
     assert _attempt_manifest_count(connection, ctas_path) == 0
 
 
+def _exercise_stale_target_type_rejection(
+    connection,
+    capture: DistributedWriteCapture,
+    *,
+    root: Path,
+    target_path: Path,
+) -> None:
+    connection.execute("CREATE TABLE lance_write.main.stale_target (id INTEGER)")
+    assert connection.execute(
+        "SELECT data_type FROM duckdb_columns() "
+        "WHERE database_name = 'lance_write' AND schema_name = 'main' "
+        "AND table_name = 'stale_target' AND column_name = 'id'"
+    ).fetchone() == ("INTEGER",)
+
+    evolution_connection = _connect()
+    try:
+        evolution_connection.execute(
+            f"ATTACH {_sql_literal(root)} AS lance_evolve (TYPE LANCE)"
+        )
+        evolution_connection.execute(
+            "ALTER TABLE lance_evolve.main.stale_target " "ALTER COLUMN id TYPE BIGINT"
+        )
+        assert evolution_connection.execute(
+            "SELECT data_type FROM duckdb_columns() "
+            "WHERE database_name = 'lance_evolve' AND schema_name = 'main' "
+            "AND table_name = 'stale_target' AND column_name = 'id'"
+        ).fetchone() == ("BIGINT",)
+
+        manifest_count = _manifest_count(evolution_connection, target_path)
+        data_file_count = _data_file_count(evolution_connection, target_path)
+        previous_count = capture.dispatch_count
+        source = connection.sql("SELECT i::INTEGER AS id FROM range(3) AS source(i)")
+        with pytest.raises(
+            Exception,
+            match="definition changed|input field 'id' has type Int32",
+        ):
+            source.insert_into("lance_write.main.stale_target")
+        assert capture.dispatch_count == previous_count + 1
+        assert _manifest_count(evolution_connection, target_path) == manifest_count
+        assert _data_file_count(evolution_connection, target_path) == data_file_count
+        assert _attempt_manifest_count(evolution_connection, target_path) == 0
+        assert evolution_connection.execute(
+            "SELECT count(*)::BIGINT FROM lance_evolve.main.stale_target"
+        ).fetchone() == (0,)
+    finally:
+        evolution_connection.close()
+
+
 def test_two_worker_local_shared_lance_insert_and_ctas(
     tmp_path: Path, write_capture: DistributedWriteCapture
 ) -> None:
@@ -423,6 +471,7 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
     empty_ctas_path = root / "empty_ctas_target.lance"
     failed_ctas_path = root / "failed_ctas_target.lance"
     explicit_ctas_path = root / "explicit_ctas_target.lance"
+    stale_type_path = root / "stale_target.lance"
     try:
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
@@ -448,6 +497,12 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
             catalog="lance_write",
             insert_path=insert_path,
             ctas_path=explicit_ctas_path,
+        )
+        _exercise_stale_target_type_rejection(
+            connection,
+            write_capture,
+            root=root,
+            target_path=stale_type_path,
         )
     finally:
         connection.close()

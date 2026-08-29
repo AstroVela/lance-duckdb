@@ -499,6 +499,10 @@ fn convert_record_batch(
         }
         for (column, field) in cols.iter_mut().zip(output_schema.fields()) {
             if column.data_type() != field.data_type() {
+                // The frozen-target validator admits only representation-level
+                // Arrow normalization and the explicit vector conversion. It
+                // rejects semantic casts (for example Int32 to Utf8) before a
+                // worker accepts any batch.
                 *column = arrow::compute::cast(column.as_ref(), field.data_type())
                     .map_err(|err| err.to_string())?;
             }
@@ -513,6 +517,128 @@ fn select_writer_output_schema(state: &WriterState, inferred_schema: SchemaRef) 
         return target_schema.clone();
     }
     inferred_schema
+}
+
+#[cfg(feature = "vane-distributed")]
+fn frozen_target_vector_dimension(input_type: &DataType, target_type: &DataType) -> Option<usize> {
+    let input_child = match input_type {
+        DataType::List(child) | DataType::LargeList(child)
+            if matches!(child.data_type(), DataType::Float32 | DataType::Float64) =>
+        {
+            child
+        }
+        _ => return None,
+    };
+    let DataType::FixedSizeList(target_child, dimension) = target_type else {
+        return None;
+    };
+    if *dimension <= 0 || input_child.as_ref() != target_child.as_ref() {
+        return None;
+    }
+    usize::try_from(*dimension).ok()
+}
+
+#[cfg(feature = "vane-distributed")]
+fn frozen_target_field_type_compatible(input: &Field, target: &Field) -> bool {
+    input.name() == target.name()
+        && frozen_target_type_compatible(input.data_type(), target.data_type())
+}
+
+#[cfg(feature = "vane-distributed")]
+fn frozen_target_type_compatible(input: &DataType, target: &DataType) -> bool {
+    if input == target || frozen_target_vector_dimension(input, target).is_some() {
+        return true;
+    }
+    match (input, target) {
+        // DuckDB can export the same VARCHAR or BLOB logical type with 32-bit,
+        // 64-bit, or view offsets according to client properties. Lance stores
+        // the canonical non-view representation, so these are encoding-only
+        // differences rather than schema evolution.
+        (
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+        )
+        | (
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+        ) => true,
+        (
+            DataType::List(input_field) | DataType::LargeList(input_field),
+            DataType::List(target_field) | DataType::LargeList(target_field),
+        ) => frozen_target_field_type_compatible(input_field, target_field),
+        (
+            DataType::FixedSizeList(input_field, input_dimension),
+            DataType::FixedSizeList(target_field, target_dimension),
+        ) => {
+            input_dimension == target_dimension
+                && frozen_target_field_type_compatible(input_field, target_field)
+        }
+        (DataType::Struct(input_fields), DataType::Struct(target_fields)) => {
+            input_fields.len() == target_fields.len()
+                && input_fields
+                    .iter()
+                    .zip(target_fields)
+                    .all(|(input, target)| frozen_target_field_type_compatible(input, target))
+        }
+        (DataType::Map(input_field, input_sorted), DataType::Map(target_field, target_sorted)) => {
+            input_sorted == target_sorted
+                && frozen_target_field_type_compatible(input_field, target_field)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+fn configure_frozen_target_schema(
+    input_schema: &SchemaRef,
+    target_schema: &Schema,
+    vector_candidates: &mut Vec<VectorConversion>,
+) -> FfiResult<()> {
+    if target_schema.fields().len() != input_schema.fields().len() {
+        return Err(FfiError::new(
+            ErrorCode::DistributedWrite,
+            "distributed Lance worker input field count does not match the frozen target",
+        ));
+    }
+
+    for (target, input) in target_schema.fields().iter().zip(input_schema.fields()) {
+        if target.name() != input.name() {
+            return Err(FfiError::new(
+                ErrorCode::DistributedWrite,
+                "distributed Lance worker input field names do not match the frozen target",
+            ));
+        }
+        if !frozen_target_type_compatible(input.data_type(), target.data_type()) {
+            return Err(FfiError::new(
+                ErrorCode::DistributedWrite,
+                format!(
+                    "distributed Lance worker input field '{}' has type {:?}, but the frozen target has type {:?}",
+                    input.name(),
+                    input.data_type(),
+                    target.data_type()
+                ),
+            ));
+        }
+    }
+
+    // Variable float lists are normally candidates for fixed-size vector
+    // inference. An existing frozen target is authoritative: retain and seed
+    // only the candidates whose target is a fixed-size vector. Exact List or
+    // LargeList targets must remain variable instead of being converted and
+    // cast back to their original type.
+    let mut configured_candidates = Vec::new();
+    for mut candidate in std::mem::take(vector_candidates) {
+        let input = input_schema.field(candidate.col_idx);
+        let target = target_schema.field(candidate.col_idx);
+        if let Some(dimension) =
+            frozen_target_vector_dimension(input.data_type(), target.data_type())
+        {
+            candidate.dim = dimension;
+            configured_candidates.push(candidate);
+        }
+    }
+    *vector_candidates = configured_candidates;
+    Ok(())
 }
 
 fn spawn_writer_thread(
@@ -895,18 +1021,6 @@ fn open_distributed_uncommitted_writer_inner(
         schema,
     )?;
     let target_schema: Schema = dataset.schema().into();
-    if target_schema.fields().len() != handle.input_schema.fields().len()
-        || target_schema
-            .fields()
-            .iter()
-            .zip(handle.input_schema.fields())
-            .any(|(target, input)| target.name() != input.name())
-    {
-        return Err(FfiError::new(
-            ErrorCode::DistributedWrite,
-            "distributed Lance worker input fields do not match the frozen target",
-        ));
-    }
     let mut transaction_properties = HashMap::new();
     transaction_properties.insert("vane.operation_id".to_string(), operation_id);
     transaction_properties.insert("vane.query_id".to_string(), query_id);
@@ -916,6 +1030,11 @@ fn open_distributed_uncommitted_writer_inner(
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        configure_frozen_target_schema(
+            &handle.input_schema,
+            &target_schema,
+            &mut state.vector_candidates,
+        )?;
         state.dataset = Some(Arc::new(dataset));
         state.frozen_target_schema = Some(Arc::new(target_schema));
         state.params.transaction_properties = Some(Arc::new(transaction_properties));
@@ -1838,6 +1957,65 @@ mod tests {
         .unwrap();
         objects.sort();
         objects
+    }
+
+    #[test]
+    fn frozen_target_schema_rejects_casts_and_configures_vectors() {
+        let int_input = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]));
+        let string_target = Schema::new(vec![Field::new("value", DataType::Utf8, true)]);
+        let mut candidates = Vec::new();
+        let error = configure_frozen_target_schema(&int_input, &string_target, &mut candidates)
+            .unwrap_err();
+        assert!(error.message.contains("input field 'value' has type Int32"));
+
+        // Float16 is intentionally widened only for reads. The SQL write path
+        // rejects coerced columns, and the distributed worker must not narrow
+        // Float32 input back to Float16 implicitly.
+        let float_input = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float32,
+            true,
+        )]));
+        let half_target = Schema::new(vec![Field::new("value", DataType::Float16, true)]);
+        let error = configure_frozen_target_schema(&float_input, &half_target, &mut candidates)
+            .unwrap_err();
+        assert!(error.message.contains("frozen target has type Float16"));
+
+        let string_input = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        configure_frozen_target_schema(&string_input, &string_target, &mut candidates).unwrap();
+
+        let vector_child = Arc::new(Field::new("item", DataType::Float32, true));
+        let vector_input = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::List(vector_child.clone()),
+            true,
+        )]));
+        let vector_target = Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(vector_child, 3),
+            true,
+        )]);
+        let mut candidates = vec![VectorConversion {
+            col_idx: 0,
+            dim: 0,
+            list_kind: VectorListKind::List,
+            element_type: VectorElementType::Float32,
+        }];
+        configure_frozen_target_schema(&vector_input, &vector_target, &mut candidates).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].dim, 3);
+
+        let variable_target = vector_input.as_ref().clone();
+        configure_frozen_target_schema(&vector_input, &variable_target, &mut candidates).unwrap();
+        assert!(candidates.is_empty());
     }
 
     #[test]

@@ -48,6 +48,7 @@ preserves files referenced by the committed version even if a concurrent
 overwrite has already made that version historical. If commit execution has
 started and its outcome is unknown, selected manifests and files are retained
 for conservative recovery.
+
 Worker finalization errors rely on Lance's native uncommitted-write failure
 contract, which drops an in-progress writer and removes already completed
 fragments before returning the error; `skip_auto_cleanup` applies only to
@@ -57,6 +58,16 @@ Distributed Lance writes require DuckDB auto-commit mode. The provider rejects
 explicit transactions before freezing a worker plan, preparing a CTAS target,
 or publishing an INSERT commit. Native DuckDB execution retains the existing
 Lance transaction lifecycle for `BEGIN`, `COMMIT`, and `ROLLBACK`.
+
+Every worker validates the bound Arrow field names and types against the frozen
+target before accepting a batch. Arbitrary Arrow casts are not part of the
+distributed append contract, so a stale catalog schema cannot silently convert
+data after concurrent schema evolution. Explicit representation normalization
+is retained for DuckDB's Utf8/LargeUtf8, Binary/LargeBinary, and nested list
+offset variants. The existing variable-list to fixed-size-list vector
+conversion is seeded from the target dimension. Float16 continues to be widened
+for reads only; the SQL write guard rejects that coerced schema instead of
+narrowing values implicitly.
 
 A failed `CREATE TABLE AS` retains its prepared target. Lance does not expose a
 generation-conditional table deletion primitive, so checking the empty
@@ -104,7 +115,10 @@ the statically linked wheel into a fresh environment and verifies local shared
 storage plus MinIO-backed S3. The contract tests cover distributed `INSERT`,
 distributed `CREATE TABLE AS`, empty input, worker-result metadata, exact row
 counts, single-version coordinator commits, failed-CTAS prepared-target
-retention and explicit cleanup before retry, attempt-manifest removal, and
-native single-node write fallback. Rust tests also exercise winner retention,
-successful loser cleanup, and post-commit live-file protection. The ordinary
-DuckDB build and test lane remain independent of the Vane ABI.
+retention and explicit cleanup before retry, attempt-manifest removal, explicit
+transaction rejection, and native single-node write fallback. Rust tests also
+exercise frozen target type validation, vector compatibility, winner retention,
+successful loser cleanup, and post-commit live-file protection. The local
+pipeline also evolves a target type through a second catalog connection and
+verifies that a stale bound writer cannot publish rows. The ordinary DuckDB
+build and test lane remain independent of the Vane ABI.
