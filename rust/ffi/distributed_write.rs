@@ -21,7 +21,7 @@ use super::util::{
     cstr_to_str, optional_session_handle, slice_from_ptr, with_explicit_aws_credentials, FfiError,
     FfiResult,
 };
-use super::write::distributed_storage_options;
+use super::write::{distributed_storage_options, finish_distributed_writer_uncommitted};
 
 const OPERATION_PROPERTY: &str = "vane.operation_id";
 const QUERY_PROPERTY: &str = "vane.query_id";
@@ -643,6 +643,113 @@ pub unsafe extern "C" fn lance_distributed_commit_append_transactions(
     }
 }
 
+fn cleanup_append_artifacts(
+    path: &str,
+    storage_options: HashMap<String, String>,
+    artifacts: &[DistributedArtifact],
+) -> FfiResult<()> {
+    let dataset = match runtime::block_on(open_dataset(path, storage_options, None)) {
+        Ok(Ok(dataset)) => dataset,
+        Ok(Err(err)) => return Err(err),
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+    let live_paths: HashSet<String> = dataset
+        .manifest()
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.files.iter())
+        .map(|file| format!("data/{}", file.path))
+        .collect();
+    let store = match runtime::block_on(dataset.object_store(None)) {
+        Ok(Ok(store)) => store,
+        Ok(Err(err)) => {
+            return Err(distributed_error(format!(
+                "resolve distributed Lance cleanup store: {err}"
+            )))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+    let data_dir = dataset.data_dir();
+    for artifact in artifacts {
+        let relative = artifact.path.to_string_lossy();
+        if live_paths.contains(relative.as_ref()) {
+            continue;
+        }
+        let Some(file_name) = relative.strip_prefix("data/") else {
+            continue;
+        };
+        let file_path = data_dir.clone().join(file_name);
+        let _ = runtime::block_on(store.delete(&file_path));
+        if let Some(stem) = std::path::Path::new(file_name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+        {
+            let _ = runtime::block_on(store.remove_dir_all(data_dir.clone().join(stem)));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn lance_distributed_abort_uncommitted_writer(
+    writer: *mut c_void,
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    expected_version: u64,
+    operation_id: *const c_char,
+    query_id: *const c_char,
+    task_attempt_id: *const c_char,
+) -> i32 {
+    let result = (|| {
+        // SAFETY: C string pointers are validated by cstr_to_str before use.
+        let path = unsafe { cstr_to_str(path, "path")? }.to_string();
+        // SAFETY: C string pointers are validated by cstr_to_str before use.
+        let operation_id = unsafe { cstr_to_str(operation_id, "operation_id")? }.to_string();
+        // SAFETY: C string pointers are validated by cstr_to_str before use.
+        let query_id = unsafe { cstr_to_str(query_id, "query_id")? }.to_string();
+        // SAFETY: C string pointers are validated by cstr_to_str before use.
+        let task_attempt_id =
+            unsafe { cstr_to_str(task_attempt_id, "task_attempt_id")? }.to_string();
+        // SAFETY: option arrays are validated before constructing Rust slices.
+        let storage_options =
+            unsafe { distributed_storage_options(option_keys, option_values, options_len)? };
+
+        let mut transaction = ptr::null_mut();
+        finish_distributed_writer_uncommitted(writer, &mut transaction)?;
+        if transaction.is_null() {
+            return Err(distributed_error(
+                "aborted distributed Lance writer returned no transaction",
+            ));
+        }
+        // SAFETY: successful writer finalization transfers one Transaction to this call.
+        let transaction = unsafe { Box::from_raw(transaction as *mut Transaction) };
+        let (artifacts, _, _) = inspect_append_transaction(
+            &transaction,
+            expected_version,
+            operation_id.as_str(),
+            Some(query_id.as_str()),
+            Some(task_attempt_id.as_str()),
+            None,
+        )?;
+        cleanup_append_artifacts(path.as_str(), storage_options, &artifacts)
+    })();
+    // SAFETY: this FFI consumes the writer handle on every return path.
+    unsafe { super::write::lance_close_writer(writer) };
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_distributed_cleanup_append_transaction(
@@ -673,46 +780,7 @@ pub unsafe extern "C" fn lance_distributed_cleanup_append_transaction(
             None,
             None,
         )?;
-        let dataset = match runtime::block_on(open_dataset(path.as_str(), storage_options, None)) {
-            Ok(Ok(dataset)) => dataset,
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-        };
-        let live_paths: HashSet<String> = dataset
-            .manifest()
-            .fragments
-            .iter()
-            .flat_map(|fragment| fragment.files.iter())
-            .map(|file| format!("data/{}", file.path))
-            .collect();
-        let store = match runtime::block_on(dataset.object_store(None)) {
-            Ok(Ok(store)) => store,
-            Ok(Err(err)) => {
-                return Err(distributed_error(format!(
-                    "resolve distributed Lance cleanup store: {err}"
-                )))
-            }
-            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-        };
-        let data_dir = dataset.data_dir();
-        for artifact in artifacts {
-            let relative = artifact.path.to_string_lossy();
-            if live_paths.contains(relative.as_ref()) {
-                continue;
-            }
-            let Some(file_name) = relative.strip_prefix("data/") else {
-                continue;
-            };
-            let file_path = data_dir.clone().join(file_name);
-            let _ = runtime::block_on(store.delete(&file_path));
-            if let Some(stem) = std::path::Path::new(file_name)
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-            {
-                let _ = runtime::block_on(store.remove_dir_all(data_dir.clone().join(stem)));
-            }
-        }
-        Ok(())
+        cleanup_append_artifacts(path.as_str(), storage_options, &artifacts)
     })();
     match result {
         Ok(()) => {

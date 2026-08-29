@@ -1522,14 +1522,42 @@ class LanceDistributedWriteLocalState final
     : public DistributedWriteLocalState {
 public:
   ~LanceDistributedWriteLocalState() override {
-    if (writer) {
-      lance_close_writer(writer);
-      writer = nullptr;
+    auto *writer_to_abort = writer;
+    writer = nullptr;
+    if (!writer_to_abort) {
+      return;
+    }
+    try {
+      vector<const char *> key_ptrs;
+      vector<const char *> value_ptrs;
+      BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                      value_ptrs);
+      (void)lance_distributed_abort_uncommitted_writer(
+          writer_to_abort, open_path.c_str(),
+          key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+          expected_version, operation_id.c_str(), query_id.c_str(),
+          task_attempt_id.c_str());
+      // The abort FFI consumes the writer even when finalization or cleanup
+      // fails, so it must not be closed a second time.
+      writer_to_abort = nullptr;
+      (void)LanceConsumeLastError();
+    } catch (...) {
+    }
+    if (writer_to_abort) {
+      lance_close_writer(writer_to_abort);
     }
   }
 
   void *writer = nullptr;
   idx_t row_count = 0;
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  uint64_t expected_version = 0;
+  string operation_id;
+  string query_id;
+  string task_attempt_id;
 };
 
 static void ValidateWorkerTask(const LanceDistributedWriteGlobalState &global,
@@ -1577,7 +1605,15 @@ LanceDistributedWriteInitializeLocal(
     DistributedWriteGlobalState &global_state) {
   auto &global = global_state.Cast<LanceDistributedWriteGlobalState>();
   ValidateWorkerTask(global, task);
-  return make_uniq<LanceDistributedWriteLocalState>();
+  auto result = make_uniq<LanceDistributedWriteLocalState>();
+  result->open_path = global.open_path;
+  result->option_keys = global.option_keys;
+  result->option_values = global.option_values;
+  result->expected_version = global.transport.expected_version;
+  result->operation_id = global.transport.operation_id;
+  result->query_id = task.query_id;
+  result->task_attempt_id = task.task_attempt_id;
+  return std::move(result);
 }
 
 static void OpenWorkerWriter(ClientContext &context,

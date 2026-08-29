@@ -284,6 +284,11 @@ int32_t lance_distributed_cleanup_append_transaction(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const char *operation_id, const uint8_t *bytes,
     size_t bytes_len);
+int32_t lance_distributed_abort_uncommitted_writer(
+    void *writer, const char *path, const char **option_keys,
+    const char **option_values, size_t options_len, uint64_t expected_version,
+    const char *operation_id, const char *query_id,
+    const char *task_attempt_id);
 #endif
 
 int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(

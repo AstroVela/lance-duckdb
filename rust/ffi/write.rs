@@ -1635,6 +1635,14 @@ fn writer_finish_uncommitted_inner(
     Ok(())
 }
 
+#[cfg(feature = "vane-distributed")]
+pub(super) fn finish_distributed_writer_uncommitted(
+    writer: *mut c_void,
+    out_transaction: *mut *mut c_void,
+) -> FfiResult<()> {
+    writer_finish_uncommitted_inner(writer, out_transaction)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_writer(writer: *mut c_void) {
     if writer.is_null() {

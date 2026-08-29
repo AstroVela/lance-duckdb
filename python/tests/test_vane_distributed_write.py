@@ -50,8 +50,30 @@ def _write_source(connection, path: str | Path) -> None:
     )
 
 
+def _write_failure_source(connection, path: str | Path) -> None:
+    # Keep the rows in one fragment that spans many DuckDB chunks so the
+    # downstream writer receives data before the injected expression error.
+    connection.execute(
+        "COPY (SELECT i::BIGINT AS id, "
+        "('value-' || i::VARCHAR)::VARCHAR AS value "
+        "FROM range(32768) AS source(i)) "
+        f"TO {_sql_literal(path)} "
+        "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 65536, "
+        "MAX_ROWS_PER_GROUP 1024)"
+    )
+
+
 def _manifest_count(connection, path: str | Path) -> int:
     pattern = f"{str(path).rstrip('/')}/_versions/*.manifest"
+    return int(
+        connection.execute(
+            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
+        ).fetchone()[0]
+    )
+
+
+def _data_file_count(connection, path: str | Path) -> int:
+    pattern = f"{str(path).rstrip('/')}/data/*.lance"
     return int(
         connection.execute(
             f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
@@ -97,20 +119,6 @@ def _execution_node_ids(ray) -> frozenset[str]:
             return node_ids
         time.sleep(0.25)
     raise AssertionError(f"expected {WORKER_COUNT} live Ray execution nodes")
-
-
-class FailSelectedLanceWorker:
-    """Fail one source partition after other tasks can produce write output."""
-
-    def __call__(self, table):
-        import pyarrow.compute as pc
-
-        if table.num_rows and bool(
-            pc.any(pc.greater_equal(table.column("id"), 60)).as_py()
-        ):
-            time.sleep(0.5)
-            raise RuntimeError("intentional distributed Lance worker failure")
-        return table
 
 
 @pytest.fixture(scope="session")
@@ -312,18 +320,9 @@ def _exercise_failed_ctas_retention_and_explicit_retry(
     target_path: str | Path,
 ) -> None:
     failing_source = connection.sql(
-        f"SELECT id, value FROM {catalog}.main.source"
-    ).map_batches(
-        FailSelectedLanceWorker,
-        schema={
-            "id": vane.sqltype("BIGINT"),
-            "value": vane.sqltype("VARCHAR"),
-        },
-        batch_size=10,
-        cpus=1.0,
-        execution_backend="ray_actor",
-        actor_number=WORKER_COUNT,
-        target_max_batch_bytes=4096,
+        f"SELECT id, CASE WHEN id < 16384 THEN value "
+        "ELSE error('intentional distributed Lance worker failure') END AS value "
+        f"FROM {catalog}.main.failure_source"
     )
     previous_count = capture.dispatch_count
     with pytest.raises(Exception):
@@ -333,6 +332,7 @@ def _exercise_failed_ctas_retention_and_explicit_retry(
     assert connection.execute(
         f"SELECT count(*)::BIGINT FROM {catalog}.main.failed_ctas_target"
     ).fetchone() == (0,)
+    assert _data_file_count(connection, target_path) == 0
 
     source = connection.sql(f"SELECT id, value FROM {catalog}.main.source")
     with pytest.raises(Exception):
@@ -358,12 +358,14 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
     root = tmp_path / "distributed-write"
     root.mkdir()
     source_path = root / "source.lance"
+    failure_source_path = root / "failure_source.lance"
     insert_path = root / "insert_target.lance"
     ctas_path = root / "ctas_target.lance"
     empty_ctas_path = root / "empty_ctas_target.lance"
     failed_ctas_path = root / "failed_ctas_target.lance"
     try:
         _write_source(connection, source_path)
+        _write_failure_source(connection, failure_source_path)
         connection.execute(f"ATTACH {_sql_literal(root)} AS lance_write (TYPE LANCE)")
         _exercise_insert_and_ctas(
             connection,
@@ -396,11 +398,13 @@ def test_two_worker_s3_lance_insert_and_ctas(
         config = _configure_s3(connection)
         root = f"s3://{config['LANCE_S3_BUCKET']}/distributed-write/" f"{uuid.uuid4()}"
         source_path = f"{root}/source.lance"
+        failure_source_path = f"{root}/failure_source.lance"
         insert_path = f"{root}/insert_target.lance"
         ctas_path = f"{root}/ctas_target.lance"
         empty_ctas_path = f"{root}/empty_ctas_target.lance"
         failed_ctas_path = f"{root}/failed_ctas_target.lance"
         _write_source(connection, source_path)
+        _write_failure_source(connection, failure_source_path)
         connection.execute(
             f"ATTACH {_sql_literal(root)} AS lance_s3_write "
             "(TYPE LANCE, READ_ONLY false)"
