@@ -274,11 +274,6 @@ int32_t lance_distributed_commit_empty_create(const char *path,
                                               size_t options_len, void *session,
                                               const char *operation_id,
                                               void *transaction);
-int32_t lance_distributed_abort_empty_create(const char *path,
-                                             const char **option_keys,
-                                             const char **option_values,
-                                             size_t options_len, void *session,
-                                             const char *operation_id);
 int32_t lance_distributed_commit_append_transactions(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, void *session, uint64_t expected_version,

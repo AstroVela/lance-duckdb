@@ -304,12 +304,12 @@ def _exercise_insert_and_ctas(
     assert _manifest_count(connection, source_path) == 1
 
 
-def _exercise_failed_ctas_cleanup(
+def _exercise_failed_ctas_retention_and_explicit_retry(
     connection,
     capture: DistributedWriteCapture,
     *,
     catalog: str,
-    target_path: Path,
+    target_path: str | Path,
 ) -> None:
     failing_source = connection.sql(
         f"SELECT id, value FROM {catalog}.main.source"
@@ -329,11 +329,20 @@ def _exercise_failed_ctas_cleanup(
     with pytest.raises(Exception):
         failing_source.create(f"{catalog}.main.failed_ctas_target")
     assert capture.dispatch_count == previous_count + 1
-    assert not target_path.exists()
+    assert _manifest_count(connection, target_path) == 1
+    assert connection.execute(
+        f"SELECT count(*)::BIGINT FROM {catalog}.main.failed_ctas_target"
+    ).fetchone() == (0,)
 
     source = connection.sql(f"SELECT id, value FROM {catalog}.main.source")
+    with pytest.raises(Exception):
+        source.create(f"{catalog}.main.failed_ctas_target")
+
+    connection.execute(f"DROP TABLE {catalog}.main.failed_ctas_target")
+    assert _manifest_count(connection, target_path) == 0
+    source = connection.sql(f"SELECT id, value FROM {catalog}.main.source")
     capture.require_write(
-        "retried distributed Lance CTAS",
+        "distributed Lance CTAS retried after explicit cleanup",
         lambda: source.create(f"{catalog}.main.failed_ctas_target"),
         expected_name="ctas",
         expected_rows=80,
@@ -365,7 +374,7 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
             ctas_path=ctas_path,
             empty_ctas_path=empty_ctas_path,
         )
-        _exercise_failed_ctas_cleanup(
+        _exercise_failed_ctas_retention_and_explicit_retry(
             connection,
             write_capture,
             catalog="lance_write",
@@ -390,6 +399,7 @@ def test_two_worker_s3_lance_insert_and_ctas(
         insert_path = f"{root}/insert_target.lance"
         ctas_path = f"{root}/ctas_target.lance"
         empty_ctas_path = f"{root}/empty_ctas_target.lance"
+        failed_ctas_path = f"{root}/failed_ctas_target.lance"
         _write_source(connection, source_path)
         connection.execute(
             f"ATTACH {_sql_literal(root)} AS lance_s3_write "
@@ -403,6 +413,12 @@ def test_two_worker_s3_lance_insert_and_ctas(
             insert_path=insert_path,
             ctas_path=ctas_path,
             empty_ctas_path=empty_ctas_path,
+        )
+        _exercise_failed_ctas_retention_and_explicit_retry(
+            connection,
+            write_capture,
+            catalog="lance_s3_write",
+            target_path=failed_ctas_path,
         )
     finally:
         connection.close()

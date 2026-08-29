@@ -30,10 +30,13 @@ keeps its prepared version-one dataset.
 
 Before a coordinator commit starts, abort and validation failures perform
 best-effort cleanup of the exact data files named by the rejected transactions.
-A failed `CREATE TABLE AS` also removes its empty prepared target only when it
-still matches the operation UUID, version one, and an empty fragment list. A
-coordinator commit error is reported as an unknown outcome and is never retried
-automatically by the extension.
+A failed `CREATE TABLE AS` retains its prepared target. Lance does not expose a
+generation-conditional table deletion primitive, so checking the empty
+version-one generation and then recursively deleting the dataset would race
+with another client committing a live version. Explicitly drop or otherwise
+clean the retained target before retrying CTAS. A coordinator commit error is
+reported as an unknown outcome and is never retried automatically by the
+extension.
 
 ## Storage and credential boundary
 
@@ -71,6 +74,7 @@ The Vane workflow has a dedicated two-worker distributed-write job. It installs
 the statically linked wheel into a fresh environment and verifies local shared
 storage plus MinIO-backed S3. The contract tests cover distributed `INSERT`,
 distributed `CREATE TABLE AS`, empty input, worker-result metadata, exact row
-counts, single-version coordinator commits, failed-CTAS prepared-target cleanup
-and retry, and native single-node write fallback. The ordinary DuckDB build and
-test lane remain independent of the Vane ABI.
+counts, single-version coordinator commits, failed-CTAS prepared-target
+retention and explicit cleanup before retry, and native single-node write
+fallback. The ordinary DuckDB build and test lane remain independent of the
+Vane ABI.

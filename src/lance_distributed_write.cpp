@@ -617,7 +617,6 @@ private:
   void BestEffortCleanupTransactions(
       ClientContext &context,
       const LanceDecodedDistributedCommit &decoded) const noexcept;
-  void BestEffortAbortPreparedCTAS(ClientContext &context) const noexcept;
   void InitializeInsert();
   void InitializeCTAS();
   void ValidateCTASAbsent() const;
@@ -931,31 +930,6 @@ void LanceDistributedWriteProvider::Impl::BestEffortCleanupTransactions(
   }
 }
 
-void LanceDistributedWriteProvider::Impl::BestEffortAbortPreparedCTAS(
-    ClientContext &context_p) const noexcept {
-  if (write_kind != LanceDistributedWriteKind::CTAS || !prepare_started) {
-    return;
-  }
-  try {
-    string open_path;
-    vector<string> option_keys;
-    vector<string> option_values;
-    ResolveWorkerStorageOptions(context_p, transport.dataset_uri, open_path,
-                                option_keys, option_values);
-    vector<const char *> key_ptrs;
-    vector<const char *> value_ptrs;
-    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                    value_ptrs);
-    (void)lance_distributed_abort_empty_create(
-        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        LanceGetSessionHandle(context_p), transport.operation_id.c_str());
-    (void)LanceConsumeLastError();
-    LanceInvalidateDatasetCacheForPath(context_p, transport.dataset_uri);
-  } catch (...) {
-  }
-}
-
 idx_t LanceDistributedWriteProvider::Impl::Finalize(
     ClientContext &context_p,
     const vector<DistributedWriteTaskResult> &results) const {
@@ -989,7 +963,6 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
     }
   } catch (...) {
     BestEffortCleanupTransactions(context_p, decoded);
-    BestEffortAbortPreparedCTAS(context_p);
     throw;
   }
 
@@ -1014,7 +987,6 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
     }
   } catch (...) {
     BestEffortCleanupTransactions(context_p, decoded);
-    BestEffortAbortPreparedCTAS(context_p);
     throw;
   }
 
@@ -1062,11 +1034,14 @@ void LanceDistributedWriteProvider::Impl::Abort(
     }
   } catch (...) {
     BestEffortCleanupTransactions(context_p, decoded);
-    BestEffortAbortPreparedCTAS(context_p);
     throw;
   }
   BestEffortCleanupTransactions(context_p, decoded);
-  BestEffortAbortPreparedCTAS(context_p);
+  // A prepared CTAS target is deliberately retained. Lance has no
+  // generation-conditional table deletion primitive, so a check followed by
+  // recursive deletion could race with another client committing a live
+  // version. The caller must explicitly drop the retained empty target before
+  // retrying CTAS.
 }
 
 LanceDistributedWriteProvider::LanceDistributedWriteProvider(
