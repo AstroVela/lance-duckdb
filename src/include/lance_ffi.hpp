@@ -242,6 +242,55 @@ int32_t lance_commit_transaction_with_storage_options(
     size_t options_len, void *session, void *transaction);
 void lance_free_transaction(void *transaction);
 
+#ifdef LANCE_VANE_DISTRIBUTED
+void *lance_open_distributed_uncommitted_writer_with_storage_options(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, uint64_t expected_version,
+    const char *expected_generation, const char *expected_creation_uuid,
+    const char *operation_id, const char *query_id, const char *task_attempt_id,
+    uint64_t max_rows_per_file, uint64_t max_rows_per_group,
+    uint64_t max_bytes_per_file, void *session, const void *schema);
+
+void *lance_distributed_encode_append_transaction(
+    void *transaction, uint64_t expected_version, const char *operation_id,
+    const char *query_id, const char *task_attempt_id, uint64_t row_count);
+void *lance_distributed_decode_append_transaction(
+    const uint8_t *bytes, size_t bytes_len, uint64_t expected_version,
+    const char *operation_id, const char *query_id, const char *task_attempt_id,
+    uint64_t row_count);
+const uint8_t *lance_distributed_transaction_bytes(void *transaction,
+                                                   size_t *out_len);
+size_t lance_distributed_transaction_artifact_count(void *transaction);
+const char *lance_distributed_transaction_artifact_path(void *transaction,
+                                                        size_t index);
+uint64_t lance_distributed_transaction_artifact_size(void *transaction,
+                                                     size_t index);
+uint64_t lance_distributed_transaction_byte_count(void *transaction);
+void lance_free_distributed_transaction(void *transaction);
+
+int32_t lance_distributed_commit_empty_create(const char *path,
+                                              const char **option_keys,
+                                              const char **option_values,
+                                              size_t options_len, void *session,
+                                              const char *operation_id,
+                                              void *transaction);
+int32_t lance_distributed_abort_empty_create(const char *path,
+                                             const char **option_keys,
+                                             const char **option_values,
+                                             size_t options_len, void *session,
+                                             const char *operation_id);
+int32_t lance_distributed_commit_append_transactions(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, void *session, uint64_t expected_version,
+    const char *expected_generation, const char *operation_id,
+    const uint8_t **transaction_bytes, const size_t *transaction_lengths,
+    size_t transaction_count);
+int32_t lance_distributed_cleanup_append_transaction(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, const char *operation_id, const uint8_t *bytes,
+    size_t bytes_len);
+#endif
+
 int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const uint8_t *predicate_ir, size_t predicate_ir_len,

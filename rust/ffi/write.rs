@@ -13,6 +13,8 @@ use arrow_array::{
     RecordBatch, RecordBatchReader, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+#[cfg(feature = "vane-distributed")]
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 
@@ -20,6 +22,8 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::record_commit;
+#[cfg(feature = "vane-distributed")]
+use super::util::with_explicit_aws_credentials;
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
 #[repr(C)]
@@ -105,6 +109,10 @@ struct VectorConversion {
 struct WriterState {
     kind: WriterKind,
     path: String,
+    #[cfg(feature = "vane-distributed")]
+    dataset: Option<Arc<Dataset>>,
+    #[cfg(feature = "vane-distributed")]
+    frozen_target_schema: Option<SchemaRef>,
     params: WriteParams,
 
     vector_candidates: Vec<VectorConversion>,
@@ -468,6 +476,7 @@ fn convert_record_batch(
     output_schema: &SchemaRef,
     conversions: &[VectorConversion],
 ) -> Result<RecordBatch, String> {
+    #[cfg(not(feature = "vane-distributed"))]
     if conversions.is_empty() {
         return RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
             .map_err(|e| e.to_string());
@@ -483,12 +492,33 @@ fn convert_record_batch(
             convert_list_array_to_fixed_size(arr, conv.list_kind, conv.element_type, conv.dim)?;
         cols[conv.col_idx] = Arc::new(fixed);
     }
+    #[cfg(feature = "vane-distributed")]
+    {
+        if cols.len() != output_schema.fields().len() {
+            return Err("writer output schema has a different field count".to_string());
+        }
+        for (column, field) in cols.iter_mut().zip(output_schema.fields()) {
+            if column.data_type() != field.data_type() {
+                *column = arrow::compute::cast(column.as_ref(), field.data_type())
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+    }
     RecordBatch::try_new(output_schema.clone(), cols).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "vane-distributed")]
+fn select_writer_output_schema(state: &WriterState, inferred_schema: SchemaRef) -> SchemaRef {
+    if let Some(target_schema) = &state.frozen_target_schema {
+        return target_schema.clone();
+    }
+    inferred_schema
 }
 
 fn spawn_writer_thread(
     kind: WriterKind,
     path: String,
+    #[cfg(feature = "vane-distributed")] dataset: Option<Arc<Dataset>>,
     params: WriteParams,
     schema: SchemaRef,
     receiver: Receiver<RecordBatch>,
@@ -506,8 +536,27 @@ fn spawn_writer_thread(
             }
             WriterKind::Uncommitted => {
                 let source: Box<dyn RecordBatchReader + Send> = Box::new(reader);
+                #[cfg(not(feature = "vane-distributed"))]
                 let builder = InsertBuilder::new(path.as_str()).with_params(&params);
+                #[cfg(not(feature = "vane-distributed"))]
                 let fut = builder.execute_uncommitted_stream(source);
+                #[cfg(feature = "vane-distributed")]
+                let fut = async move {
+                    match dataset {
+                        Some(dataset) => {
+                            InsertBuilder::new(dataset)
+                                .with_params(&params)
+                                .execute_uncommitted_stream(source)
+                                .await
+                        }
+                        None => {
+                            InsertBuilder::new(path.as_str())
+                                .with_params(&params)
+                                .execute_uncommitted_stream(source)
+                                .await
+                        }
+                    }
+                };
                 match runtime::block_on(fut) {
                     Ok(Ok(txn)) => Ok(WriterResult::Uncommitted(Box::new(txn))),
                     Ok(Err(err)) => Err(err.to_string()),
@@ -592,6 +641,265 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
             ptr::null_mut()
         }
     }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_distributed_uncommitted_writer_with_storage_options(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    expected_version: u64,
+    expected_generation: *const c_char,
+    expected_creation_uuid: *const c_char,
+    operation_id: *const c_char,
+    query_id: *const c_char,
+    task_attempt_id: *const c_char,
+    max_rows_per_file: u64,
+    max_rows_per_group: u64,
+    max_bytes_per_file: u64,
+    session: *mut c_void,
+    schema: *const c_void,
+) -> *mut c_void {
+    match open_distributed_uncommitted_writer_inner(
+        path,
+        option_keys,
+        option_values,
+        options_len,
+        expected_version,
+        expected_generation,
+        expected_creation_uuid,
+        operation_id,
+        query_id,
+        task_attempt_id,
+        max_rows_per_file,
+        max_rows_per_group,
+        max_bytes_per_file,
+        session,
+        schema,
+    ) {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+pub(super) fn distributed_optional_cstr(
+    value: *const c_char,
+    name: &'static str,
+) -> FfiResult<Option<String>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = unsafe { cstr_to_str(value, name)? };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value.to_string()))
+}
+
+#[cfg(feature = "vane-distributed")]
+pub(super) unsafe fn distributed_storage_options(
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+) -> FfiResult<HashMap<String, String>> {
+    if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "option_keys/option_values is null with non-zero length",
+        ));
+    }
+    let keys = if options_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice_from_ptr(option_keys, options_len, "option_keys")? }
+    };
+    let values = if options_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice_from_ptr(option_values, options_len, "option_values")? }
+    };
+    let mut result = HashMap::new();
+    for (index, (&key, &value)) in keys.iter().zip(values.iter()).enumerate() {
+        if key.is_null() || value.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("option key/value is null at index {index}"),
+            ));
+        }
+        let key = unsafe { CStr::from_ptr(key) }.to_str().map_err(|err| {
+            FfiError::new(ErrorCode::Utf8, format!("option_keys[{index}] utf8: {err}"))
+        })?;
+        let value = unsafe { CStr::from_ptr(value) }.to_str().map_err(|err| {
+            FfiError::new(
+                ErrorCode::Utf8,
+                format!("option_values[{index}] utf8: {err}"),
+            )
+        })?;
+        result.insert(key.to_string(), value.to_string());
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "vane-distributed")]
+#[allow(clippy::too_many_arguments)]
+fn open_distributed_uncommitted_writer_inner(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    expected_version: u64,
+    expected_generation: *const c_char,
+    expected_creation_uuid: *const c_char,
+    operation_id: *const c_char,
+    query_id: *const c_char,
+    task_attempt_id: *const c_char,
+    max_rows_per_file: u64,
+    max_rows_per_group: u64,
+    max_bytes_per_file: u64,
+    session: *mut c_void,
+    schema: *const c_void,
+) -> FfiResult<WriterHandle> {
+    let path_value = unsafe { cstr_to_str(path, "path")? }.to_string();
+    let operation_id = unsafe { cstr_to_str(operation_id, "operation_id")? }.to_string();
+    let query_id = unsafe { cstr_to_str(query_id, "query_id")? }.to_string();
+    let task_attempt_id = unsafe { cstr_to_str(task_attempt_id, "task_attempt_id")? }.to_string();
+    if expected_version == 0
+        || operation_id.is_empty()
+        || query_id.is_empty()
+        || task_attempt_id.is_empty()
+    {
+        return Err(FfiError::new(
+            ErrorCode::DistributedWrite,
+            "distributed Lance writer has incomplete frozen identity",
+        ));
+    }
+    let expected_generation =
+        distributed_optional_cstr(expected_generation, "expected_generation")?;
+    let expected_creation_uuid =
+        distributed_optional_cstr(expected_creation_uuid, "expected_creation_uuid")?;
+    if expected_generation.is_some() == expected_creation_uuid.is_some() {
+        return Err(FfiError::new(
+            ErrorCode::DistributedWrite,
+            "distributed Lance writer requires exactly one generation identity",
+        ));
+    }
+
+    let storage_options =
+        unsafe { distributed_storage_options(option_keys, option_values, options_len)? };
+    let session_handle = unsafe { optional_session_handle(session)? };
+    let dataset = match runtime::block_on(async {
+        let mut builder = DatasetBuilder::from_uri(path_value.as_str());
+        builder = with_explicit_aws_credentials(builder, &storage_options);
+        builder = builder.with_storage_options(storage_options);
+        if let Some(session) = session_handle.clone() {
+            builder = builder.with_session(session);
+        }
+        builder.load().await
+    }) {
+        Ok(Ok(dataset)) => dataset,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DistributedWrite,
+                format!("open frozen distributed Lance target: {err}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+    if dataset.version_id() != expected_version {
+        return Err(FfiError::new(
+            ErrorCode::DistributedWrite,
+            format!(
+                "distributed Lance target version changed: expected {expected_version}, got {}",
+                dataset.version_id()
+            ),
+        ));
+    }
+    if let Some(expected_generation) = expected_generation {
+        let identity = match runtime::block_on(super::dataset::dataset_snapshot_identity(&dataset))
+        {
+            Ok(Ok(identity)) => format!("snapshot|{identity}"),
+            Ok(Err(err)) => return Err(err),
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+        };
+        if identity != expected_generation {
+            return Err(FfiError::new(
+                ErrorCode::DistributedWrite,
+                "distributed Lance target generation changed",
+            ));
+        }
+    }
+    if let Some(expected_creation_uuid) = expected_creation_uuid {
+        let expected_suffix = format!("-{expected_creation_uuid}.txn");
+        if !dataset
+            .manifest()
+            .transaction_file
+            .as_deref()
+            .is_some_and(|path| path.ends_with(expected_suffix.as_str()))
+        {
+            return Err(FfiError::new(
+                ErrorCode::DistributedWrite,
+                "prepared distributed Lance CTAS generation does not match its operation",
+            ));
+        }
+    }
+
+    let append_mode = std::ffi::CString::new("append").map_err(|err| {
+        FfiError::new(
+            ErrorCode::DistributedWrite,
+            format!("construct append mode: {err}"),
+        )
+    })?;
+    let handle = open_uncommitted_writer_inner(
+        path,
+        append_mode.as_ptr(),
+        option_keys,
+        option_values,
+        options_len,
+        max_rows_per_file,
+        max_rows_per_group,
+        max_bytes_per_file,
+        ptr::null(),
+        session,
+        schema,
+    )?;
+    let target_schema: Schema = dataset.schema().into();
+    if target_schema.fields().len() != handle.input_schema.fields().len()
+        || target_schema
+            .fields()
+            .iter()
+            .zip(handle.input_schema.fields())
+            .any(|(target, input)| target.name() != input.name())
+    {
+        return Err(FfiError::new(
+            ErrorCode::DistributedWrite,
+            "distributed Lance worker input fields do not match the frozen target",
+        ));
+    }
+    let mut transaction_properties = HashMap::new();
+    transaction_properties.insert("vane.operation_id".to_string(), operation_id);
+    transaction_properties.insert("vane.query_id".to_string(), query_id);
+    transaction_properties.insert("vane.task_attempt_id".to_string(), task_attempt_id);
+    {
+        let mut state = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.dataset = Some(Arc::new(dataset));
+        state.frozen_target_schema = Some(Arc::new(target_schema));
+        state.params.transaction_properties = Some(Arc::new(transaction_properties));
+        state.params.skip_auto_cleanup = true;
+    }
+    Ok(handle)
 }
 
 fn parse_data_storage_version_arg(
@@ -760,6 +1068,10 @@ fn open_uncommitted_writer_inner(
         state: Mutex::new(WriterState {
             kind: WriterKind::Uncommitted,
             path,
+            #[cfg(feature = "vane-distributed")]
+            dataset: None,
+            #[cfg(feature = "vane-distributed")]
+            frozen_target_schema: None,
             params,
             vector_candidates,
             buffered_batches: Vec::new(),
@@ -912,6 +1224,10 @@ fn open_writer_inner(
         state: Mutex::new(WriterState {
             kind: WriterKind::Committed,
             path,
+            #[cfg(feature = "vane-distributed")]
+            dataset: None,
+            #[cfg(feature = "vane-distributed")]
+            frozen_target_schema: None,
             params,
             vector_candidates,
             buffered_batches: Vec::new(),
@@ -1027,10 +1343,14 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
 
                 let output_schema = build_output_schema(&handle.input_schema, &conversions)
                     .map_err(|e| FfiError::new(ErrorCode::DatasetWriteBatch, e))?;
+                #[cfg(feature = "vane-distributed")]
+                let output_schema = select_writer_output_schema(&guard, output_schema);
                 let (sender, receiver) = sync_channel::<RecordBatch>(2);
                 let join = spawn_writer_thread(
                     guard.kind,
                     guard.path.clone(),
+                    #[cfg(feature = "vane-distributed")]
+                    guard.dataset.clone(),
                     guard.params.clone(),
                     output_schema.clone(),
                     receiver,
@@ -1122,10 +1442,14 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
                 .collect();
             let output_schema = build_output_schema(&handle.input_schema, &conversions)
                 .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinish, e))?;
+            #[cfg(feature = "vane-distributed")]
+            let output_schema = select_writer_output_schema(&guard, output_schema);
             let (sender, receiver) = sync_channel::<RecordBatch>(2);
             let join = spawn_writer_thread(
                 guard.kind,
                 guard.path.clone(),
+                #[cfg(feature = "vane-distributed")]
+                guard.dataset.clone(),
                 guard.params.clone(),
                 output_schema.clone(),
                 receiver,
@@ -1227,10 +1551,14 @@ fn writer_finish_uncommitted_inner(
                 .collect();
             let output_schema = build_output_schema(&handle.input_schema, &conversions)
                 .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinishUncommitted, e))?;
+            #[cfg(feature = "vane-distributed")]
+            let output_schema = select_writer_output_schema(&guard, output_schema);
             let (sender, receiver) = sync_channel::<RecordBatch>(2);
             let join = spawn_writer_thread(
                 guard.kind,
                 guard.path.clone(),
+                #[cfg(feature = "vane-distributed")]
+                guard.dataset.clone(),
                 guard.params.clone(),
                 output_schema.clone(),
                 receiver,

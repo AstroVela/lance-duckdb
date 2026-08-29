@@ -43,6 +43,9 @@
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_distributed_write.hpp"
+#endif
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
@@ -1769,6 +1772,14 @@ public:
     if (!directory_ns || directory_ns->root.empty()) {
       throw InternalException("Lance directory namespace root is empty");
     }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+    return PlanLanceDistributedCreateTableAs(
+        context, planner, op, plan, directory_ns->root,
+        directory_ns->option_keys, directory_ns->option_values,
+        directory_ns->uses_coordinator_storage_secret,
+        directory_ns->distributed_replay_path_restricted, data_storage_version);
+#endif
 
     auto dataset_path = JoinNamespacePath(directory_ns->root,
                                           GetDatasetDirName(create_info.table));

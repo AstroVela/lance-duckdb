@@ -260,7 +260,7 @@ fn dataset_version_inner(dataset: *mut c_void) -> FfiResult<u64> {
 }
 
 #[cfg(feature = "vane-distributed")]
-async fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiResult<String> {
+pub(super) async fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiResult<String> {
     let manifest = dataset.manifest();
     let location = dataset.manifest_location();
     let mut size = location.size;

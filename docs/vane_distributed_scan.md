@@ -119,13 +119,14 @@ each fragment split. The official DuckDB build retains these pushdowns.
 
 ## Boundary
 
-This integration covers read-only table scans, including filters, projections,
+The scan integration covers read-only table scans, including filters, projections,
 point-lookups, aggregates, sampling, global limits, empty datasets, and
 directory namespace tables. It deliberately excludes vector search, full-text
 search, hybrid search, and all index planning. REST namespace query scans are
 also excluded until that control plane can provide a stable replayable physical
-snapshot. Distributed writes and distributed replay of `TYPE LANCE` secret
-catalog entries are separate features and are not part of this contract.
+snapshot. Distributed writes have a separate
+[write contract](./vane_distributed_write.md). Distributed replay of
+`TYPE LANCE` secret catalog entries is not part of either contract.
 
 The official DuckDB build keeps its existing scan optimizers and behavior when
 `LANCE_VANE_DISTRIBUTED` is disabled.
