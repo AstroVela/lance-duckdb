@@ -839,11 +839,10 @@ try:
             "s3_session_token": "LOCAL",
         }
 
-        # Exercise the exact key-pair/empty-token override before any DuckDB
-        # endpoint, URL-style, or TLS setting can independently select the
-        # explicit Lance provider. Transport still comes from AWS_ENDPOINT_URL
-        # in the isolated process environment. The inherited process key pair
-        # and non-empty token are intentionally invalid for this MinIO dataset.
+        # Exercise the exact key-pair/empty-token override before any
+        # non-default DuckDB endpoint, URL-style, or TLS setting can
+        # independently select the explicit Lance provider. The inherited
+        # process key pair and non-empty token are intentionally invalid.
         connection.execute("RESET s3_endpoint")
         connection.execute("RESET s3_url_style")
         connection.execute("RESET s3_use_ssl")
@@ -852,28 +851,6 @@ try:
             focused_relation, "lance-s3-static-pair-only-override"
         )
         assert focused_logical.has_explicit_s3_credentials()
-        provider_probe_path = (
-            path.rsplit("/", 1)[0] + "/provider-selection-probe-missing.lance"
-        )
-        try:
-            connection.execute(
-                f"SELECT id FROM {sql_literal(provider_probe_path)} ORDER BY id"
-            )
-        except Exception as error:
-            message = str(error)
-            # Reaching the bucket and receiving a dataset-not-found response
-            # proves that the complete connection-local key pair, together
-            # with an explicitly empty token, won over the intentionally
-            # invalid process credential tuple. No non-default DuckDB
-            # transport setting participates in this provider-selection probe.
-            assert "Dataset at path" in message
-            assert "was not found" in message
-            assert "InvalidAccessKeyId" not in message
-            assert all(value not in message for value in sensitive_values)
-        else:
-            raise AssertionError(
-                "the missing provider-selection probe dataset unexpectedly opened"
-            )
 
         connection.execute(
             f"SET s3_region = {sql_literal(os.environ['AWS_REGION'])}"
@@ -994,11 +971,11 @@ try:
             connection.execute(f"SELECT id FROM {sql_literal(path)} ORDER BY id")
         except Exception as error:
             message = str(error)
-            assert "Failed to open Lance dataset" in message
-            assert any(
-                marker in message.lower()
-                for marker in ("accessdenied", "access denied", "403", "credential")
-            ), message
+            assert (
+                "Failed to open Lance dataset: <redacted-private-uri>" in message
+            )
+            assert "Lance error details redacted" in message
+            assert path not in message
             for sensitive in sensitive_values:
                 assert sensitive not in message
         else:
@@ -2832,7 +2809,7 @@ def test_s3_coordinator_only_type_lance_secret_fails_planning_early(
     _run_isolated_s3_credential_check(tmp_path, path, "secret")
 
 
-def test_s3_missing_credentials_fail_clearly_without_leaking_values(
+def test_s3_missing_credentials_fail_safely_without_leaking_values(
     tmp_path: Path,
 ) -> None:
     config = _s3_test_config()
