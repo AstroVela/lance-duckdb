@@ -84,6 +84,7 @@ struct LanceDistributedCommitEnvelope {
 
 struct LanceDecodedDistributedCommit {
   vector<string> transactions;
+  vector<string> manifest_task_attempt_ids;
   idx_t row_count = 0;
   idx_t byte_count = 0;
 };
@@ -617,6 +618,10 @@ private:
   void BestEffortCleanupTransactions(
       ClientContext &context,
       const LanceDecodedDistributedCommit &decoded) const noexcept;
+  void CleanupAttemptManifests(
+      ClientContext &context,
+      const vector<string> &retained_task_attempt_ids) const;
+  void BestEffortCleanupAttemptManifests(ClientContext &context) const noexcept;
   void InitializeInsert();
   void InitializeCTAS();
   void ValidateCTASAbsent() const;
@@ -930,6 +935,48 @@ void LanceDistributedWriteProvider::Impl::BestEffortCleanupTransactions(
   }
 }
 
+void LanceDistributedWriteProvider::Impl::CleanupAttemptManifests(
+    ClientContext &context_p,
+    const vector<string> &retained_task_attempt_ids) const {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveWorkerStorageOptions(context_p, transport.dataset_uri, open_path,
+                              option_keys, option_values);
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  vector<const char *> retained_task_attempt_ptrs;
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
+  retained_task_attempt_ptrs.reserve(retained_task_attempt_ids.size());
+  for (const auto &task_attempt_id : retained_task_attempt_ids) {
+    retained_task_attempt_ptrs.push_back(task_attempt_id.c_str());
+  }
+  const auto result = lance_distributed_cleanup_attempt_manifests(
+      open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+      transport.operation_id.c_str(),
+      retained_task_attempt_ptrs.empty() ? nullptr
+                                         : retained_task_attempt_ptrs.data(),
+      retained_task_attempt_ptrs.size());
+  if (result != 0) {
+    throw IOException(
+        "Failed to reconcile distributed Lance attempt cleanup manifests" +
+        LanceVaneFormatErrorSuffix(
+            transport.dataset_uri,
+            LanceVanePathRequiresRedaction(context_p, transport.dataset_uri)));
+  }
+}
+
+void LanceDistributedWriteProvider::Impl::BestEffortCleanupAttemptManifests(
+    ClientContext &context_p) const noexcept {
+  try {
+    CleanupAttemptManifests(context_p, {});
+  } catch (...) {
+    (void)LanceConsumeLastError();
+  }
+}
+
 idx_t LanceDistributedWriteProvider::Impl::Finalize(
     ClientContext &context_p,
     const vector<DistributedWriteTaskResult> &results) const {
@@ -955,14 +1002,22 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
         throw InvalidInputException(
             "Distributed Lance write returned rows without transactions");
       }
+      CleanupAttemptManifests(context_p, {});
       return 0;
     }
     if (decoded.row_count == 0) {
       throw InvalidInputException(
           "Distributed Lance write returned transactions without rows");
     }
+    // Vane's attempt-finalization barrier quiesces every peer before exposing
+    // one selected attempt per logical task to coordinator finalization.
+    // Reconcile every durable worker manifest now: selected attempts retain
+    // cleanup ownership through the commit, while successful retry/speculation
+    // losers are deleted before catalog mutation.
+    CleanupAttemptManifests(context_p, decoded.manifest_task_attempt_ids);
   } catch (...) {
     BestEffortCleanupTransactions(context_p, decoded);
+    BestEffortCleanupAttemptManifests(context_p);
     throw;
   }
 
@@ -987,6 +1042,7 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
     }
   } catch (...) {
     BestEffortCleanupTransactions(context_p, decoded);
+    BestEffortCleanupAttemptManifests(context_p);
     throw;
   }
 
@@ -1004,6 +1060,7 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
         LanceVanePathRequiresRedaction(context_p, transport.dataset_uri));
     if (commit_started == 0) {
       BestEffortCleanupTransactions(context_p, decoded);
+      BestEffortCleanupAttemptManifests(context_p);
     }
     if (table) {
       LanceInvalidateDatasetCacheForTable(context_p, *table);
@@ -1022,6 +1079,9 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
   } else {
     LanceInvalidateDatasetCacheForPath(context_p, transport.dataset_uri);
   }
+  // The selected files are live in the new Lance manifest, so cleanup skips
+  // them and removes only their durable attempt ownership records.
+  BestEffortCleanupAttemptManifests(context_p);
   return decoded.row_count;
 }
 
@@ -1042,9 +1102,11 @@ void LanceDistributedWriteProvider::Impl::Abort(
     }
   } catch (...) {
     BestEffortCleanupTransactions(context_p, decoded);
+    BestEffortCleanupAttemptManifests(context_p);
     throw;
   }
   BestEffortCleanupTransactions(context_p, decoded);
+  BestEffortCleanupAttemptManifests(context_p);
   // A prepared CTAS target is deliberately retained. Lance has no
   // generation-conditional table deletion primitive, so a check followed by
   // recursive deletion could race with another client committing a live
@@ -1461,6 +1523,7 @@ DecodeCommitResults(const DistributedExtensionWriteInfo &info,
         CheckedAdd(decoded.row_count, envelope.row_count, "selected row count");
     decoded.byte_count = CheckedAdd(decoded.byte_count, envelope.byte_count,
                                     "selected byte count");
+    decoded.manifest_task_attempt_ids.push_back(result.task_attempt_id);
   }
   if (!duplicate_logical_task_id.empty()) {
     throw InvalidInputException(
@@ -1847,7 +1910,7 @@ LanceDistributedWriteCombine(ExecutionContext &context,
 }
 
 static vector<DistributedWriteFragment>
-LanceDistributedWriteFinalize(ClientContext &,
+LanceDistributedWriteFinalize(ClientContext &context,
                               const DistributedExtensionWriteInfo &,
                               const DistributedWriteTaskContext &task,
                               DistributedWriteGlobalState &global_state) {
@@ -1906,6 +1969,38 @@ LanceDistributedWriteFinalize(ClientContext &,
   }
   vector<DistributedWriteFragment> fragments;
   fragments.push_back(std::move(fragment));
+
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  vector<const uint8_t *> transaction_ptrs;
+  vector<size_t> transaction_lengths;
+  BuildStorageOptionPointerArrays(global.option_keys, global.option_values,
+                                  key_ptrs, value_ptrs);
+  transaction_ptrs.reserve(global.transactions.size());
+  transaction_lengths.reserve(global.transactions.size());
+  for (const auto &transaction : global.transactions) {
+    transaction_ptrs.push_back(
+        reinterpret_cast<const uint8_t *>(transaction.payload.data()));
+    transaction_lengths.push_back(transaction.payload.size());
+  }
+  const auto publish_result = lance_distributed_publish_attempt_manifest(
+      global.open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(),
+      global.option_keys.size(), global.transport.expected_version,
+      global.transport.operation_id.c_str(), task.query_id.c_str(),
+      task.task_attempt_id.c_str(), transaction_ptrs.data(),
+      transaction_lengths.data(), transaction_ptrs.size());
+  if (publish_result != 0) {
+    throw IOException(
+        "Failed to publish distributed Lance attempt cleanup manifest" +
+        LanceVaneFormatErrorSuffix(global.transport.dataset_uri,
+                                   LanceVanePathRequiresRedaction(
+                                       context, global.transport.dataset_uri)));
+  }
+
+  // Ownership has moved from worker memory to a durable attempt manifest.
+  // The coordinator removes retry/speculation losers after Vane selects the
+  // winning attempts, and retains selected ownership until commit succeeds.
   global.transactions.clear();
   return fragments;
 }

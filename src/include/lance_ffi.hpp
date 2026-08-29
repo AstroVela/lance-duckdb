@@ -280,6 +280,16 @@ int32_t lance_distributed_commit_append_transactions(
     const char *expected_generation, const char *operation_id,
     const uint8_t **transaction_bytes, const size_t *transaction_lengths,
     size_t transaction_count, uint8_t *out_commit_started);
+int32_t lance_distributed_publish_attempt_manifest(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, uint64_t expected_version, const char *operation_id,
+    const char *query_id, const char *task_attempt_id,
+    const uint8_t **transaction_bytes, const size_t *transaction_lengths,
+    size_t transaction_count);
+int32_t lance_distributed_cleanup_attempt_manifests(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, const char *operation_id,
+    const char **retained_task_attempt_ids, size_t retained_task_attempt_count);
 int32_t lance_distributed_cleanup_append_transaction(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const char *operation_id, const uint8_t *bytes,

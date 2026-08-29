@@ -21,6 +21,17 @@ identities. Its declared rows, bytes, and data-file artifacts are validated on
 the coordinator. Task retries may produce new attempt results, but Vane selects
 only one successful attempt for each logical task.
 
+Before a successful worker returns its result, it atomically publishes an
+operation-scoped cleanup manifest beside the dataset. This transfers ownership
+of the uncommitted files out of worker memory. After Vane selects task results,
+its attempt-finalization barrier has already quiesced every peer attempt. The
+coordinator validates that every selected non-empty attempt has a manifest and
+deletes the files and manifests of successful retry or speculation losers.
+Selected manifests remain in place until the coordinator knows the commit
+outcome. Manifest paths use Lance transaction UUIDs, and manifest contents are
+validated against the frozen version and operation, query, and attempt
+identities before any cleanup occurs.
+
 After every selected result has been validated, the coordinator uses Lance's
 batch transaction commit API to publish all append transactions as one new
 dataset version. Lance commit retries are disabled at this boundary: a target
@@ -29,14 +40,20 @@ writes do not create an append version. An empty `CREATE TABLE AS` therefore
 keeps its prepared version-one dataset.
 
 Before a coordinator commit starts, abort and validation failures perform
-best-effort cleanup of the exact data files named by the rejected transactions.
+best-effort cleanup of the exact data files named by the rejected transactions
+and durable attempt manifests. Cleanup never deletes a file referenced by the
+current Lance manifest. After a successful commit, the same live-file check
+preserves selected data files while their cleanup manifests are removed. If
+commit execution has started and its outcome is unknown, selected manifests
+and files are retained for conservative recovery.
 A failed `CREATE TABLE AS` retains its prepared target. Lance does not expose a
 generation-conditional table deletion primitive, so checking the empty
 version-one generation and then recursively deleting the dataset would race
 with another client committing a live version. Explicitly drop or otherwise
 clean the retained target before retrying CTAS. A coordinator commit error is
-reported as an unknown outcome and is never retried automatically by the
-extension.
+reported as an unknown outcome only after commit execution starts and is never
+retried automatically by the extension. A known pre-commit failure cleans all
+attempt artifacts and manifests.
 
 ## Storage and credential boundary
 
@@ -75,6 +92,7 @@ the statically linked wheel into a fresh environment and verifies local shared
 storage plus MinIO-backed S3. The contract tests cover distributed `INSERT`,
 distributed `CREATE TABLE AS`, empty input, worker-result metadata, exact row
 counts, single-version coordinator commits, failed-CTAS prepared-target
-retention and explicit cleanup before retry, and native single-node write
-fallback. The ordinary DuckDB build and test lane remain independent of the
-Vane ABI.
+retention and explicit cleanup before retry, attempt-manifest removal, and
+native single-node write fallback. Rust tests also exercise winner retention,
+successful loser cleanup, and post-commit live-file protection. The ordinary
+DuckDB build and test lane remain independent of the Vane ABI.

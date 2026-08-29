@@ -81,6 +81,15 @@ def _data_file_count(connection, path: str | Path) -> int:
     )
 
 
+def _attempt_manifest_count(connection, path: str | Path) -> int:
+    pattern = f"{str(path).rstrip('/')}/_vane_distributed_write_attempts/*/*.manifest"
+    return int(
+        connection.execute(
+            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
+        ).fetchone()[0]
+    )
+
+
 def _configure_s3(connection) -> dict[str, str]:
     names = (
         "AWS_ACCESS_KEY_ID",
@@ -269,6 +278,7 @@ def _exercise_insert_and_ctas(
         minimum_task_results=2,
     )
     assert _manifest_count(connection, insert_path) == 2
+    assert _attempt_manifest_count(connection, insert_path) == 0
     assert connection.execute(
         f"SELECT count(*)::BIGINT, sum(id)::BIGINT "
         f"FROM {catalog}.main.insert_target"
@@ -282,6 +292,7 @@ def _exercise_insert_and_ctas(
         minimum_task_results=2,
     )
     assert _manifest_count(connection, ctas_path) == 2
+    assert _attempt_manifest_count(connection, ctas_path) == 0
     assert connection.execute(
         f"SELECT count(*)::BIGINT, sum(id)::BIGINT " f"FROM {catalog}.main.ctas_target"
     ).fetchone() == (80, 3160)
@@ -297,6 +308,7 @@ def _exercise_insert_and_ctas(
         minimum_task_results=1,
     )
     assert _manifest_count(connection, insert_path) == 2
+    assert _attempt_manifest_count(connection, insert_path) == 0
 
     capture.require_write(
         "empty distributed Lance CTAS",
@@ -306,6 +318,7 @@ def _exercise_insert_and_ctas(
         minimum_task_results=1,
     )
     assert _manifest_count(connection, empty_ctas_path) == 1
+    assert _attempt_manifest_count(connection, empty_ctas_path) == 0
     assert connection.execute(
         f"SELECT count(*)::BIGINT FROM {catalog}.main.empty_ctas_target"
     ).fetchone() == (0,)
@@ -333,6 +346,7 @@ def _exercise_failed_ctas_retention_and_explicit_retry(
         f"SELECT count(*)::BIGINT FROM {catalog}.main.failed_ctas_target"
     ).fetchone() == (0,)
     assert _data_file_count(connection, target_path) == 0
+    assert _attempt_manifest_count(connection, target_path) == 0
 
     source = connection.sql(f"SELECT id, value FROM {catalog}.main.source")
     with pytest.raises(Exception):
@@ -349,6 +363,7 @@ def _exercise_failed_ctas_retention_and_explicit_retry(
         minimum_task_results=2,
     )
     assert _manifest_count(connection, target_path) == 2
+    assert _attempt_manifest_count(connection, target_path) == 0
 
 
 def test_two_worker_local_shared_lance_insert_and_ctas(
