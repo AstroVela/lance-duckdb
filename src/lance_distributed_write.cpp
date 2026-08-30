@@ -5,6 +5,7 @@
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
+#include "lance_scan_bind_data.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
@@ -27,6 +28,7 @@
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
+
 #include "duckdb/planner/operator/logical_create_table.hpp"
 
 #include <algorithm>
@@ -39,15 +41,26 @@ namespace duckdb {
 
 namespace {
 
-static constexpr uint32_t LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION = 3;
+static constexpr uint32_t LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION = 4;
 static constexpr const char *LANCE_DISTRIBUTED_INSERT_OPERATOR = "insert";
 static constexpr const char *LANCE_DISTRIBUTED_CTAS_OPERATOR = "ctas";
-static constexpr const char *LANCE_DISTRIBUTED_WRITE_FRAGMENT_CODEC =
+static constexpr const char *LANCE_DISTRIBUTED_DELETE_OPERATOR = "delete";
+static constexpr const char *LANCE_DISTRIBUTED_UPDATE_OPERATOR = "update";
+static constexpr const char *LANCE_DISTRIBUTED_APPEND_FRAGMENT_CODEC =
     "lance.append-transaction";
+static constexpr const char *LANCE_DISTRIBUTED_MUTATION_FRAGMENT_CODEC =
+    "lance.mutation-transaction";
 static constexpr const char *LANCE_DISTRIBUTED_DATA_ARTIFACT_CODEC =
     "lance.data-file";
+static constexpr const char *LANCE_DISTRIBUTED_MUTATION_ARTIFACT_CODEC =
+    "lance.mutation-file";
 
-enum class LanceDistributedWriteKind : uint8_t { INSERT = 1, CTAS = 2 };
+enum class LanceDistributedWriteKind : uint8_t {
+  INSERT = 1,
+  CTAS = 2,
+  DELETE = 3,
+  UPDATE = 4
+};
 
 struct LanceDistributedWriteTransport {
   LanceDistributedWriteKind write_kind = LanceDistributedWriteKind::INSERT;
@@ -60,11 +73,17 @@ struct LanceDistributedWriteTransport {
   string generation_id;
   string creation_uuid;
   string schema_fingerprint;
+  vector<string> target_names;
+  vector<LogicalType> target_types;
   vector<string> input_names;
   vector<LogicalType> input_types;
   vector<uint32_t> target_schema_field_depths;
   vector<uint8_t> target_schema_field_nullable;
   string data_storage_version;
+  vector<uint64_t> source_fragment_ids;
+  idx_t row_id_index = DConstants::INVALID_INDEX;
+  vector<string> set_columns;
+  vector<string> set_expr_irs;
 };
 
 struct LanceArrowNullability {
@@ -160,10 +179,31 @@ static const char *WriteOperatorName(LanceDistributedWriteKind write_kind) {
     return LANCE_DISTRIBUTED_INSERT_OPERATOR;
   case LanceDistributedWriteKind::CTAS:
     return LANCE_DISTRIBUTED_CTAS_OPERATOR;
+  case LanceDistributedWriteKind::DELETE:
+    return LANCE_DISTRIBUTED_DELETE_OPERATOR;
+  case LanceDistributedWriteKind::UPDATE:
+    return LANCE_DISTRIBUTED_UPDATE_OPERATOR;
   default:
     throw SerializationException(
         "Distributed Lance write bind has an invalid write kind");
   }
+}
+
+static bool IsMutationWrite(LanceDistributedWriteKind write_kind) {
+  return write_kind == LanceDistributedWriteKind::DELETE ||
+         write_kind == LanceDistributedWriteKind::UPDATE;
+}
+
+static const char *
+WriteFragmentCodecName(LanceDistributedWriteKind write_kind) {
+  return IsMutationWrite(write_kind) ? LANCE_DISTRIBUTED_MUTATION_FRAGMENT_CODEC
+                                     : LANCE_DISTRIBUTED_APPEND_FRAGMENT_CODEC;
+}
+
+static const char *
+WriteArtifactCodecName(LanceDistributedWriteKind write_kind) {
+  return IsMutationWrite(write_kind) ? LANCE_DISTRIBUTED_MUTATION_ARTIFACT_CODEC
+                                     : LANCE_DISTRIBUTED_DATA_ARTIFACT_CODEC;
 }
 
 static vector<uint8_t>
@@ -341,6 +381,8 @@ static void ValidateTransport(const LanceDistributedWriteTransport &transport) {
       transport.table_name.empty() || transport.dataset_uri.empty() ||
       transport.expected_version == 0 ||
       transport.schema_fingerprint.size() != 32 ||
+      transport.target_names.empty() ||
+      transport.target_names.size() != transport.target_types.size() ||
       transport.input_names.empty() ||
       transport.input_names.size() != transport.input_types.size() ||
       transport.target_schema_field_depths.empty() ||
@@ -351,16 +393,46 @@ static void ValidateTransport(const LanceDistributedWriteTransport &transport) {
   }
   (void)WriteOperatorName(transport.write_kind);
   if (transport.write_kind == LanceDistributedWriteKind::INSERT) {
-    if (transport.generation_id.empty() || !transport.creation_uuid.empty()) {
+    if (transport.generation_id.empty() || !transport.creation_uuid.empty() ||
+        !transport.source_fragment_ids.empty() ||
+        transport.row_id_index != DConstants::INVALID_INDEX ||
+        !transport.set_columns.empty() || !transport.set_expr_irs.empty()) {
       throw SerializationException(
           "Distributed Lance INSERT bind has invalid generation state");
     }
-  } else if (!transport.generation_id.empty() ||
-             transport.creation_uuid != transport.operation_id ||
-             transport.expected_version != 1 ||
-             transport.data_storage_version.empty()) {
-    throw SerializationException(
-        "Distributed Lance CTAS bind has invalid prepared-generation state");
+  } else if (transport.write_kind == LanceDistributedWriteKind::CTAS) {
+    if (!transport.generation_id.empty() ||
+        transport.creation_uuid != transport.operation_id ||
+        transport.expected_version != 1 ||
+        transport.data_storage_version.empty() ||
+        !transport.source_fragment_ids.empty() ||
+        transport.row_id_index != DConstants::INVALID_INDEX ||
+        !transport.set_columns.empty() || !transport.set_expr_irs.empty()) {
+      throw SerializationException(
+          "Distributed Lance CTAS bind has invalid prepared-generation state");
+    }
+  } else {
+    if (!IsMutationWrite(transport.write_kind) ||
+        transport.generation_id.empty() || !transport.creation_uuid.empty() ||
+        !transport.data_storage_version.empty() ||
+        transport.row_id_index >= transport.input_types.size() ||
+        (transport.input_types[transport.row_id_index].id() !=
+             LogicalTypeId::BIGINT &&
+         transport.input_types[transport.row_id_index].id() !=
+             LogicalTypeId::UBIGINT)) {
+      throw SerializationException(
+          "Distributed Lance mutation bind has invalid frozen state");
+    }
+    if (transport.write_kind == LanceDistributedWriteKind::DELETE) {
+      if (!transport.set_columns.empty() || !transport.set_expr_irs.empty()) {
+        throw SerializationException(
+            "Distributed Lance DELETE bind contains UPDATE expressions");
+      }
+    } else if (transport.set_columns.empty() ||
+               transport.set_columns.size() != transport.set_expr_irs.size()) {
+      throw SerializationException(
+          "Distributed Lance UPDATE bind has invalid SET expressions");
+    }
   }
   unordered_set<string> names;
   for (idx_t index = 0; index < transport.input_names.size(); index++) {
@@ -369,6 +441,29 @@ static void ValidateTransport(const LanceDistributedWriteTransport &transport) {
         !names.insert(transport.input_names[index]).second) {
       throw SerializationException(
           "Distributed Lance write bind has an invalid input schema");
+    }
+  }
+  names.clear();
+  for (idx_t index = 0; index < transport.target_names.size(); index++) {
+    if (transport.target_names[index].empty() ||
+        transport.target_types[index].id() == LogicalTypeId::INVALID ||
+        !names.insert(transport.target_names[index]).second) {
+      throw SerializationException(
+          "Distributed Lance write bind has an invalid target schema");
+    }
+  }
+  unordered_set<uint64_t> source_fragments;
+  for (auto fragment_id : transport.source_fragment_ids) {
+    if (!source_fragments.insert(fragment_id).second) {
+      throw SerializationException(
+          "Distributed Lance mutation bind has duplicate source fragments");
+    }
+  }
+  names.clear();
+  for (const auto &set_column : transport.set_columns) {
+    if (set_column.empty() || !names.insert(set_column).second) {
+      throw SerializationException(
+          "Distributed Lance UPDATE bind has duplicate SET columns");
     }
   }
   idx_t top_level_fields = 0;
@@ -386,7 +481,7 @@ static void ValidateTransport(const LanceDistributedWriteTransport &transport) {
       top_level_fields++;
     }
   }
-  if (top_level_fields != transport.input_names.size()) {
+  if (top_level_fields != transport.target_names.size()) {
     throw SerializationException(
         "Distributed Lance write bind target nullability has an invalid "
         "top-level field count");
@@ -421,6 +516,13 @@ SerializeTransport(const LanceDistributedWriteTransport &transport) {
                            transport.target_schema_field_depths);
   serializer.WriteProperty(16, "target_schema_field_nullable",
                            transport.target_schema_field_nullable);
+  serializer.WriteProperty(17, "target_names", transport.target_names);
+  serializer.WriteProperty(18, "target_types", transport.target_types);
+  serializer.WriteProperty(19, "source_fragment_ids",
+                           transport.source_fragment_ids);
+  serializer.WriteProperty(20, "row_id_index", transport.row_id_index);
+  serializer.WriteProperty(21, "set_columns", transport.set_columns);
+  serializer.WriteProperty(22, "set_expr_irs", transport.set_expr_irs);
   serializer.End();
   return string(reinterpret_cast<const char *>(stream.GetData()),
                 stream.GetPosition());
@@ -469,6 +571,17 @@ DeserializeTransport(const string &bytes) {
   result.target_schema_field_nullable =
       deserializer.ReadProperty<vector<uint8_t>>(
           16, "target_schema_field_nullable");
+  result.target_names =
+      deserializer.ReadProperty<vector<string>>(17, "target_names");
+  result.target_types =
+      deserializer.ReadProperty<vector<LogicalType>>(18, "target_types");
+  result.source_fragment_ids =
+      deserializer.ReadProperty<vector<uint64_t>>(19, "source_fragment_ids");
+  result.row_id_index = deserializer.ReadProperty<idx_t>(20, "row_id_index");
+  result.set_columns =
+      deserializer.ReadProperty<vector<string>>(21, "set_columns");
+  result.set_expr_irs =
+      deserializer.ReadProperty<vector<string>>(22, "set_expr_irs");
   deserializer.End();
   ValidateTransport(result);
   return result;
@@ -557,7 +670,6 @@ DeserializeCommitEnvelope(const string &bytes) {
       result.serialized_transport.empty() || result.transactions.empty() ||
       result.transactions.size() != result.transaction_row_counts.size() ||
       result.transactions.size() != result.transaction_byte_counts.size() ||
-      result.artifact_paths.empty() ||
       result.artifact_paths.size() != result.artifact_sizes.size() ||
       result.row_count == 0) {
     throw SerializationException(
@@ -766,7 +878,8 @@ ValidateResolvedInfo(const DistributedExtensionWriteInfo &info,
           WriteOperatorName(transport.write_kind) ||
       info.capability.capability.protocol_version !=
           LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION ||
-      info.fragment_codec.name != LANCE_DISTRIBUTED_WRITE_FRAGMENT_CODEC ||
+      info.fragment_codec.name !=
+          WriteFragmentCodecName(transport.write_kind) ||
       info.fragment_codec.version != LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION) {
     throw InvalidInputException(
         "Distributed Lance write contract does not match its registration");
@@ -791,6 +904,13 @@ public:
   vector<string> column_names;
   vector<LogicalType> column_types;
   vector<LogicalType> input_types;
+  uint64_t mutation_version = 0;
+  string mutation_generation_id;
+  vector<uint64_t> mutation_source_fragment_ids;
+  idx_t mutation_row_id_index = DConstants::INVALID_INDEX;
+  vector<string> mutation_set_columns;
+  vector<string> mutation_set_expr_irs;
+  bool mutation_uses_take_splits = false;
   vector<uint8_t> target_top_level_nullable;
   string root;
   vector<string> attached_option_keys;
@@ -835,6 +955,7 @@ private:
       const vector<string> &released_task_attempt_ids) const noexcept;
   void InitializeInsert();
   void InitializeCTAS();
+  void InitializeMutation();
   void ValidateCTASAbsent() const;
   void PrepareCTAS(ClientContext &context) const;
 };
@@ -953,8 +1074,100 @@ void LanceDistributedWriteProvider::Impl::InitializeInsert() {
   transport.schema_fingerprint = SchemaFingerprint(
       column_names, column_types, transport.target_schema_field_depths,
       transport.target_schema_field_nullable, string());
+  transport.target_names = column_names;
+  transport.target_types = column_types;
   transport.input_names = column_names;
   transport.input_types = column_types;
+}
+
+void LanceDistributedWriteProvider::Impl::InitializeMutation() {
+  if (!table || !IsMutationWrite(write_kind)) {
+    throw InternalException(
+        "Distributed Lance mutation has no target table entry");
+  }
+  if (!table->IsNamespaceBacked()) {
+    throw NotImplementedException(
+        "Distributed Lance mutations require a directory-namespace table");
+  }
+  const auto &config = table->NamespaceConfig();
+  if (config.IsRest()) {
+    throw NotImplementedException(
+        "Distributed Lance mutations do not support REST namespace tables "
+        "until the namespace exposes replayable physical write state");
+  }
+  if (mutation_uses_take_splits) {
+    throw NotImplementedException(
+        "Distributed Lance mutations require fragment-owned scan splits; "
+        "index-qualified take splits are not supported");
+  }
+  if (mutation_version == 0 || mutation_generation_id.empty() ||
+      mutation_row_id_index >= input_types.size()) {
+    throw InvalidInputException(
+        "Distributed Lance mutation has an incomplete frozen scan");
+  }
+
+  root = config.root;
+  attached_option_keys = config.option_keys;
+  attached_option_values = config.option_values;
+  uses_coordinator_storage_secret = config.uses_coordinator_storage_secret;
+  distributed_replay_path_restricted =
+      config.distributed_replay_path_restricted;
+  auto dataset_path = LanceDirectoryNamespaceDatasetUri(config);
+  if (uses_coordinator_storage_secret || distributed_replay_path_restricted ||
+      LanceVanePathHasPrivateUriComponents(root) ||
+      LanceVanePathHasPrivateUriComponents(dataset_path)) {
+    throw NotImplementedException(
+        "Distributed Lance mutations require replayable session credentials "
+        "and a dataset URI without private components");
+  }
+  dataset_path = ResolveReplayPath(*context, dataset_path);
+  auto snapshot = CaptureFrozenDirectoryTargetSnapshot(
+      dataset_path, attached_option_keys, attached_option_values);
+  if (snapshot.version != mutation_version ||
+      snapshot.generation_id != mutation_generation_id) {
+    throw TransactionException(
+        "Lance mutation target changed after its scan was bound");
+  }
+
+  column_names.clear();
+  column_types.clear();
+  for (const auto &column : table->GetColumns().Physical()) {
+    column_names.push_back(column.Name());
+    column_types.push_back(column.Type());
+  }
+  if (column_names.empty()) {
+    throw InvalidInputException(
+        "Distributed Lance mutation target schema is empty");
+  }
+
+  transport.write_kind = write_kind;
+  transport.operation_id = UUID::ToString(UUID::GenerateRandomUUID());
+  transport.catalog_name = table->catalog.GetName();
+  transport.schema_name = table->schema.name;
+  transport.table_name = table->name;
+  transport.dataset_uri = std::move(dataset_path);
+  transport.expected_version = mutation_version;
+  transport.generation_id = mutation_generation_id;
+  transport.target_schema_field_depths =
+      std::move(snapshot.nullability.field_depths);
+  transport.target_schema_field_nullable =
+      std::move(snapshot.nullability.field_nullable);
+  transport.schema_fingerprint = SchemaFingerprint(
+      column_names, column_types, transport.target_schema_field_depths,
+      transport.target_schema_field_nullable, string());
+  transport.target_names = column_names;
+  transport.target_types = column_types;
+  transport.input_types = input_types;
+  transport.input_names.reserve(input_types.size());
+  for (idx_t index = 0; index < input_types.size(); index++) {
+    transport.input_names.push_back("input_" + to_string(index));
+  }
+  transport.source_fragment_ids = mutation_source_fragment_ids;
+  std::sort(transport.source_fragment_ids.begin(),
+            transport.source_fragment_ids.end());
+  transport.row_id_index = mutation_row_id_index;
+  transport.set_columns = mutation_set_columns;
+  transport.set_expr_irs = mutation_set_expr_irs;
 }
 
 void LanceDistributedWriteProvider::Impl::InitializeCTAS() {
@@ -994,6 +1207,8 @@ void LanceDistributedWriteProvider::Impl::InitializeCTAS() {
   transport.schema_fingerprint = SchemaFingerprint(
       column_names, column_types, transport.target_schema_field_depths,
       transport.target_schema_field_nullable, data_storage_version);
+  transport.target_names = column_names;
+  transport.target_types = column_types;
   transport.input_names = column_names;
   transport.input_types = column_types;
   transport.data_storage_version = data_storage_version;
@@ -1009,8 +1224,10 @@ void LanceDistributedWriteProvider::Impl::Initialize() {
   ValidateDistributedWriteAutoCommit(*context);
   if (write_kind == LanceDistributedWriteKind::INSERT) {
     InitializeInsert();
-  } else {
+  } else if (write_kind == LanceDistributedWriteKind::CTAS) {
     InitializeCTAS();
+  } else {
+    InitializeMutation();
   }
   ValidateTransport(transport);
   plan.extension_name = "lance";
@@ -1165,12 +1382,21 @@ void LanceDistributedWriteProvider::Impl::BestEffortCleanupTransactions(
     BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                     value_ptrs);
     for (const auto &transaction : decoded.transactions) {
-      (void)lance_distributed_cleanup_append_transaction(
-          open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-          transport.operation_id.c_str(),
-          reinterpret_cast<const uint8_t *>(transaction.data()),
-          transaction.size());
+      if (IsMutationWrite(write_kind)) {
+        (void)lance_distributed_cleanup_mutation_transaction(
+            open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(),
+            option_keys.size(), transport.operation_id.c_str(),
+            reinterpret_cast<const uint8_t *>(transaction.data()),
+            transaction.size());
+      } else {
+        (void)lance_distributed_cleanup_append_transaction(
+            open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(),
+            option_keys.size(), transport.operation_id.c_str(),
+            reinterpret_cast<const uint8_t *>(transaction.data()),
+            transaction.size());
+      }
       (void)LanceConsumeLastError();
     }
   } catch (...) {
@@ -1194,13 +1420,24 @@ void LanceDistributedWriteProvider::Impl::CleanupAttemptManifests(
   for (const auto &task_attempt_id : retained_task_attempt_ids) {
     retained_task_attempt_ptrs.push_back(task_attempt_id.c_str());
   }
-  const auto result = lance_distributed_cleanup_attempt_manifests(
-      open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      transport.operation_id.c_str(),
-      retained_task_attempt_ptrs.empty() ? nullptr
-                                         : retained_task_attempt_ptrs.data(),
-      retained_task_attempt_ptrs.size());
+  const auto result =
+      IsMutationWrite(write_kind)
+          ? lance_distributed_cleanup_mutation_attempt_manifests(
+                open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+                value_ptrs.empty() ? nullptr : value_ptrs.data(),
+                option_keys.size(), transport.operation_id.c_str(),
+                retained_task_attempt_ptrs.empty()
+                    ? nullptr
+                    : retained_task_attempt_ptrs.data(),
+                retained_task_attempt_ptrs.size())
+          : lance_distributed_cleanup_attempt_manifests(
+                open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+                value_ptrs.empty() ? nullptr : value_ptrs.data(),
+                option_keys.size(), transport.operation_id.c_str(),
+                retained_task_attempt_ptrs.empty()
+                    ? nullptr
+                    : retained_task_attempt_ptrs.data(),
+                retained_task_attempt_ptrs.size());
   if (result != 0) {
     throw IOException(
         "Failed to reconcile distributed Lance attempt cleanup manifests" +
@@ -1237,11 +1474,19 @@ void LanceDistributedWriteProvider::Impl::BestEffortReleaseAttemptManifests(
     for (const auto &task_attempt_id : released_task_attempt_ids) {
       released_task_attempt_ptrs.push_back(task_attempt_id.c_str());
     }
-    (void)lance_distributed_release_attempt_manifests(
-        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        transport.operation_id.c_str(), released_task_attempt_ptrs.data(),
-        released_task_attempt_ptrs.size());
+    if (IsMutationWrite(write_kind)) {
+      (void)lance_distributed_release_mutation_attempt_manifests(
+          open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+          transport.operation_id.c_str(), released_task_attempt_ptrs.data(),
+          released_task_attempt_ptrs.size());
+    } else {
+      (void)lance_distributed_release_attempt_manifests(
+          open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+          transport.operation_id.c_str(), released_task_attempt_ptrs.data(),
+          released_task_attempt_ptrs.size());
+    }
     (void)LanceConsumeLastError();
   } catch (...) {
   }
@@ -1318,13 +1563,29 @@ idx_t LanceDistributedWriteProvider::Impl::Finalize(
   }
 
   uint8_t commit_started = 0;
-  const auto commit_result = lance_distributed_commit_append_transactions(
-      open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      LanceGetSessionHandle(context_p), transport.expected_version,
-      prepared_generation.c_str(), transport.operation_id.c_str(),
-      transaction_ptrs.data(), transaction_lengths.data(),
-      transaction_ptrs.size(), &commit_started);
+  const auto commit_result =
+      IsMutationWrite(write_kind)
+          ? lance_distributed_commit_mutation_transactions(
+                open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+                value_ptrs.empty() ? nullptr : value_ptrs.data(),
+                option_keys.size(), LanceGetSessionHandle(context_p),
+                static_cast<uint8_t>(write_kind), transport.expected_version,
+                prepared_generation.c_str(), transport.operation_id.c_str(),
+                transport.schema_fingerprint.c_str(),
+                transport.source_fragment_ids.empty()
+                    ? nullptr
+                    : transport.source_fragment_ids.data(),
+                transport.source_fragment_ids.size(), transaction_ptrs.data(),
+                transaction_lengths.data(), transaction_ptrs.size(),
+                &commit_started)
+          : lance_distributed_commit_append_transactions(
+                open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+                value_ptrs.empty() ? nullptr : value_ptrs.data(),
+                option_keys.size(), LanceGetSessionHandle(context_p),
+                transport.expected_version, prepared_generation.c_str(),
+                transport.operation_id.c_str(), transaction_ptrs.data(),
+                transaction_lengths.data(), transaction_ptrs.size(),
+                &commit_started);
   if (commit_result != 0) {
     const auto error_suffix = LanceVaneFormatErrorSuffix(
         transport.dataset_uri,
@@ -1442,6 +1703,43 @@ unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedInsertProvider(
   impl->column_names = column_names;
   impl->column_types = column_types;
   impl->input_types = input_types;
+  return unique_ptr<LanceDistributedWriteProvider>(
+      new LanceDistributedWriteProvider(std::move(impl)));
+}
+
+unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedDeleteProvider(
+    ClientContext &context, LanceTableEntry &table,
+    const LanceScanBindData &scan_bind, const vector<LogicalType> &input_types,
+    idx_t row_id_index) {
+  auto impl = make_uniq<LanceDistributedWriteProvider::Impl>(context);
+  impl->table = table;
+  impl->write_kind = LanceDistributedWriteKind::DELETE;
+  impl->input_types = input_types;
+  impl->mutation_version = scan_bind.dataset_version;
+  impl->mutation_generation_id = scan_bind.dataset_generation_id;
+  impl->mutation_source_fragment_ids = scan_bind.distributed_fragment_ids;
+  impl->mutation_row_id_index = row_id_index;
+  impl->mutation_uses_take_splits = !scan_bind.take_row_ids.empty();
+  return unique_ptr<LanceDistributedWriteProvider>(
+      new LanceDistributedWriteProvider(std::move(impl)));
+}
+
+unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedUpdateProvider(
+    ClientContext &context, LanceTableEntry &table,
+    const LanceScanBindData &scan_bind, const vector<LogicalType> &input_types,
+    idx_t row_id_index, const vector<string> &set_columns,
+    const vector<string> &set_expr_irs) {
+  auto impl = make_uniq<LanceDistributedWriteProvider::Impl>(context);
+  impl->table = table;
+  impl->write_kind = LanceDistributedWriteKind::UPDATE;
+  impl->input_types = input_types;
+  impl->mutation_version = scan_bind.dataset_version;
+  impl->mutation_generation_id = scan_bind.dataset_generation_id;
+  impl->mutation_source_fragment_ids = scan_bind.distributed_fragment_ids;
+  impl->mutation_row_id_index = row_id_index;
+  impl->mutation_set_columns = set_columns;
+  impl->mutation_set_expr_irs = set_expr_irs;
+  impl->mutation_uses_take_splits = !scan_bind.take_row_ids.empty();
   return unique_ptr<LanceDistributedWriteProvider>(
       new LanceDistributedWriteProvider(std::move(impl)));
 }
@@ -1621,6 +1919,14 @@ struct LanceEncodedTransactionDeleter {
   }
 };
 
+struct LanceEncodedMutationTransactionDeleter {
+  void operator()(void *transaction) const {
+    if (transaction) {
+      lance_free_distributed_mutation_transaction(transaction);
+    }
+  }
+};
+
 static void
 DecodeCommitResults(const DistributedExtensionWriteInfo &info,
                     const LanceDistributedWriteTransport &transport,
@@ -1733,42 +2039,88 @@ DecodeCommitResults(const DistributedExtensionWriteInfo &info,
           CheckedAdd(envelope_bytes, NumericCast<idx_t>(transaction_bytes),
                      "envelope byte count");
 
-      auto *transaction = lance_distributed_decode_append_transaction(
-          reinterpret_cast<const uint8_t *>(payload.data()), payload.size(),
-          transport.expected_version, transport.operation_id.c_str(),
-          result.query_id.c_str(), result.task_attempt_id.c_str(),
-          transaction_rows);
-      if (!transaction) {
-        throw InvalidInputException(
-            "Failed to validate distributed Lance append transaction" +
-            LanceVaneFormatErrorSuffix(
-                transport.dataset_uri,
-                LanceVanePathIsRemote(transport.dataset_uri)));
-      }
-      unique_ptr<void, LanceEncodedTransactionDeleter> transaction_owner(
-          transaction);
-      if (lance_distributed_transaction_byte_count(transaction) !=
-          transaction_bytes) {
-        throw InvalidInputException(
-            "Distributed Lance append transaction byte count does not match "
-            "its envelope");
-      }
-      const auto artifact_count =
-          lance_distributed_transaction_artifact_count(transaction);
-      for (idx_t artifact_index = 0; artifact_index < artifact_count;
-           artifact_index++) {
-        const auto *path = lance_distributed_transaction_artifact_path(
-            transaction, artifact_index);
-        if (!path || string(path).empty() ||
-            !artifact_paths.insert(path).second) {
+      if (IsMutationWrite(transport.write_kind)) {
+        auto *transaction = lance_distributed_decode_mutation_transaction(
+            reinterpret_cast<const uint8_t *>(payload.data()), payload.size(),
+            static_cast<uint8_t>(transport.write_kind),
+            transport.expected_version, transport.operation_id.c_str(),
+            result.query_id.c_str(), result.task_attempt_id.c_str(),
+            transport.schema_fingerprint.c_str(),
+            transport.source_fragment_ids.empty()
+                ? nullptr
+                : transport.source_fragment_ids.data(),
+            transport.source_fragment_ids.size(), transaction_rows);
+        if (!transaction) {
           throw InvalidInputException(
-              "Distributed Lance selected an empty or duplicate data-file "
-              "artifact");
+              "Failed to validate distributed Lance mutation transaction" +
+              LanceVaneFormatErrorSuffix(
+                  transport.dataset_uri,
+                  LanceVanePathIsRemote(transport.dataset_uri)));
         }
-        decoded_artifact_paths.emplace_back(path);
-        decoded_artifact_sizes.push_back(
-            lance_distributed_transaction_artifact_size(transaction,
-                                                        artifact_index));
+        unique_ptr<void, LanceEncodedMutationTransactionDeleter>
+            transaction_owner(transaction);
+        if (lance_distributed_mutation_transaction_byte_count(transaction) !=
+            transaction_bytes) {
+          throw InvalidInputException(
+              "Distributed Lance mutation transaction byte count does not "
+              "match its envelope");
+        }
+        const auto artifact_count =
+            lance_distributed_mutation_transaction_artifact_count(transaction);
+        for (idx_t artifact_index = 0; artifact_index < artifact_count;
+             artifact_index++) {
+          const auto *path =
+              lance_distributed_mutation_transaction_artifact_path(
+                  transaction, artifact_index);
+          if (!path || string(path).empty() ||
+              !artifact_paths.insert(path).second) {
+            throw InvalidInputException(
+                "Distributed Lance selected an empty or duplicate mutation "
+                "artifact");
+          }
+          decoded_artifact_paths.emplace_back(path);
+          decoded_artifact_sizes.push_back(
+              lance_distributed_mutation_transaction_artifact_size(
+                  transaction, artifact_index));
+        }
+      } else {
+        auto *transaction = lance_distributed_decode_append_transaction(
+            reinterpret_cast<const uint8_t *>(payload.data()), payload.size(),
+            transport.expected_version, transport.operation_id.c_str(),
+            result.query_id.c_str(), result.task_attempt_id.c_str(),
+            transaction_rows);
+        if (!transaction) {
+          throw InvalidInputException(
+              "Failed to validate distributed Lance append transaction" +
+              LanceVaneFormatErrorSuffix(
+                  transport.dataset_uri,
+                  LanceVanePathIsRemote(transport.dataset_uri)));
+        }
+        unique_ptr<void, LanceEncodedTransactionDeleter> transaction_owner(
+            transaction);
+        if (lance_distributed_transaction_byte_count(transaction) !=
+            transaction_bytes) {
+          throw InvalidInputException(
+              "Distributed Lance append transaction byte count does not "
+              "match its envelope");
+        }
+        const auto artifact_count =
+            lance_distributed_transaction_artifact_count(transaction);
+        for (idx_t artifact_index = 0; artifact_index < artifact_count;
+             artifact_index++) {
+          const auto *path = lance_distributed_transaction_artifact_path(
+              transaction, artifact_index);
+          if (!path || string(path).empty() ||
+              !artifact_paths.insert(path).second) {
+            throw InvalidInputException(
+                "Distributed Lance selected an empty or duplicate data-file "
+                "artifact");
+          }
+          decoded_artifact_paths.emplace_back(path);
+          decoded_artifact_sizes.push_back(
+              lance_distributed_transaction_artifact_size(transaction,
+                                                          artifact_index));
+        }
       }
       decoded.transactions.push_back(payload);
     }
@@ -1787,7 +2139,7 @@ DecodeCommitResults(const DistributedExtensionWriteInfo &info,
           artifact.uri != envelope.artifact_paths[artifact_index] ||
           artifact.codec !=
               DistributedPayloadCodec{
-                  LANCE_DISTRIBUTED_DATA_ARTIFACT_CODEC,
+                  WriteArtifactCodecName(transport.write_kind),
                   LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION} ||
           !artifact.payload.empty()) {
         throw InvalidInputException(
@@ -1821,6 +2173,41 @@ struct LanceWorkerTransaction {
   idx_t byte_count = 0;
 };
 
+static LanceWorkerTransaction ReadEncodedMutationTransaction(void *encoded,
+                                                             idx_t row_count) {
+  size_t payload_size = 0;
+  const auto *payload =
+      lance_distributed_mutation_transaction_bytes(encoded, &payload_size);
+  if (!payload || payload_size == 0) {
+    throw IOException(
+        "Distributed Lance mutation transaction payload is empty" +
+        LanceFormatErrorSuffix());
+  }
+  LanceWorkerTransaction transaction;
+  transaction.payload.assign(reinterpret_cast<const char *>(payload),
+                             payload_size);
+  transaction.row_count = row_count;
+  transaction.byte_count = NumericCast<idx_t>(
+      lance_distributed_mutation_transaction_byte_count(encoded));
+  const auto artifact_count =
+      lance_distributed_mutation_transaction_artifact_count(encoded);
+  transaction.artifact_paths.reserve(artifact_count);
+  transaction.artifact_sizes.reserve(artifact_count);
+  for (idx_t index = 0; index < artifact_count; index++) {
+    const auto *artifact_path =
+        lance_distributed_mutation_transaction_artifact_path(encoded, index);
+    if (!artifact_path || string(artifact_path).empty()) {
+      throw IOException(
+          "Distributed Lance mutation transaction has an empty artifact "
+          "path");
+    }
+    transaction.artifact_paths.emplace_back(artifact_path);
+    transaction.artifact_sizes.push_back(
+        lance_distributed_mutation_transaction_artifact_size(encoded, index));
+  }
+  return transaction;
+}
+
 static void BestEffortCleanupTransactions(
     const LanceDistributedWriteTransport &transport, const string &open_path,
     const vector<string> &option_keys, const vector<string> &option_values,
@@ -1831,17 +2218,86 @@ static void BestEffortCleanupTransactions(
     BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                     value_ptrs);
     for (const auto &transaction : transactions) {
-      (void)lance_distributed_cleanup_append_transaction(
-          open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-          transport.operation_id.c_str(),
-          reinterpret_cast<const uint8_t *>(transaction.payload.data()),
-          transaction.payload.size());
+      if (IsMutationWrite(transport.write_kind)) {
+        (void)lance_distributed_cleanup_mutation_transaction(
+            open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(),
+            option_keys.size(), transport.operation_id.c_str(),
+            reinterpret_cast<const uint8_t *>(transaction.payload.data()),
+            transaction.payload.size());
+      } else {
+        (void)lance_distributed_cleanup_append_transaction(
+            open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(),
+            option_keys.size(), transport.operation_id.c_str(),
+            reinterpret_cast<const uint8_t *>(transaction.payload.data()),
+            transaction.payload.size());
+      }
       (void)LanceConsumeLastError();
     }
   } catch (...) {
   }
 }
+
+static void BestEffortCleanupMutationTransactionHandle(
+    const LanceDistributedWriteTransport &transport, const string &open_path,
+    const vector<string> &option_keys, const vector<string> &option_values,
+    void *transaction) noexcept {
+  if (!transaction) {
+    return;
+  }
+  try {
+    size_t payload_size = 0;
+    const auto *payload = lance_distributed_mutation_transaction_bytes(
+        transaction, &payload_size);
+    if (payload && payload_size > 0) {
+      vector<const char *> key_ptrs;
+      vector<const char *> value_ptrs;
+      BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                      value_ptrs);
+      (void)lance_distributed_cleanup_mutation_transaction(
+          open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+          transport.operation_id.c_str(), payload, payload_size);
+      (void)LanceConsumeLastError();
+    }
+  } catch (...) {
+  }
+  lance_free_distributed_mutation_transaction(transaction);
+}
+
+class LanceUncommittedMutationTransactionGuard {
+public:
+  LanceUncommittedMutationTransactionGuard(
+      void *transaction_p, const LanceDistributedWriteTransport &transport_p,
+      const string &open_path_p, const vector<string> &option_keys_p,
+      const vector<string> &option_values_p)
+      : transaction(transaction_p), transport(transport_p),
+        open_path(open_path_p), option_keys(option_keys_p),
+        option_values(option_values_p) {}
+
+  LanceUncommittedMutationTransactionGuard(
+      const LanceUncommittedMutationTransactionGuard &) = delete;
+  LanceUncommittedMutationTransactionGuard &
+  operator=(const LanceUncommittedMutationTransactionGuard &) = delete;
+
+  ~LanceUncommittedMutationTransactionGuard() {
+    BestEffortCleanupMutationTransactionHandle(
+        transport, open_path, option_keys, option_values, transaction);
+  }
+
+  void MarkRegistered() noexcept {
+    lance_free_distributed_mutation_transaction(transaction);
+    transaction = nullptr;
+  }
+
+private:
+  void *transaction;
+  const LanceDistributedWriteTransport &transport;
+  const string &open_path;
+  const vector<string> &option_keys;
+  const vector<string> &option_values;
+};
 
 static void BestEffortCleanupTransactionHandle(
     const string &open_path, const vector<string> &option_keys,
@@ -1922,6 +2378,18 @@ public:
   bool finalized = false;
 };
 
+static void RegisterWorkerTransaction(LanceDistributedWriteGlobalState &global,
+                                      LanceWorkerTransaction transaction) {
+  lock_guard<mutex> guard(global.lock);
+  const auto row_count =
+      CheckedAdd(global.row_count, transaction.row_count, "task row count");
+  const auto byte_count =
+      CheckedAdd(global.byte_count, transaction.byte_count, "task byte count");
+  global.transactions.push_back(std::move(transaction));
+  global.row_count = row_count;
+  global.byte_count = byte_count;
+}
+
 class LanceDistributedWriteLocalState final
     : public DistributedWriteLocalState {
 public:
@@ -1955,6 +2423,7 @@ public:
 
   void *writer = nullptr;
   idx_t row_count = 0;
+  vector<uint64_t> mutation_row_ids;
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;
@@ -1995,16 +2464,20 @@ LanceDistributedWriteInitializeGlobal(ClientContext &context,
   result->task_attempt_id = task.task_attempt_id;
   memset(&result->schema_root.arrow_schema, 0,
          sizeof(result->schema_root.arrow_schema));
-  auto properties = context.GetClientProperties();
-  ArrowConverter::ToArrowSchema(&result->schema_root.arrow_schema,
-                                result->transport.input_types,
-                                result->transport.input_names, properties);
-  // DuckDB LogicalType does not encode field nullability. Restore the complete
-  // coordinator-bound Arrow field tree after reconstructing the worker schema
-  // so Rust receives the frozen target contract instead of synthetic flags.
-  ApplyTargetSchemaNullability(result->schema_root.arrow_schema,
-                               result->transport.target_schema_field_depths,
-                               result->transport.target_schema_field_nullable);
+  if (!IsMutationWrite(result->transport.write_kind)) {
+    auto properties = context.GetClientProperties();
+    ArrowConverter::ToArrowSchema(&result->schema_root.arrow_schema,
+                                  result->transport.input_types,
+                                  result->transport.input_names, properties);
+    // DuckDB LogicalType does not encode field nullability. Restore the
+    // complete coordinator-bound Arrow field tree after reconstructing the
+    // worker schema so Rust receives the frozen target contract instead of
+    // synthetic flags.
+    ApplyTargetSchemaNullability(
+        result->schema_root.arrow_schema,
+        result->transport.target_schema_field_depths,
+        result->transport.target_schema_field_nullable);
+  }
   return std::move(result);
 }
 
@@ -2074,6 +2547,48 @@ static void LanceDistributedWriteSink(ExecutionContext &context,
   if (input.size() == 0) {
     return;
   }
+  if (IsMutationWrite(global.transport.write_kind)) {
+    const auto row_id_index = global.transport.row_id_index;
+    if (row_id_index >= input.ColumnCount()) {
+      throw InvalidInputException(
+          "Distributed Lance mutation row-id input is missing");
+    }
+    auto &row_id_vector = input.data[row_id_index];
+    UnifiedVectorFormat format;
+    row_id_vector.ToUnifiedFormat(input.size(), format);
+    const auto row_id_type = row_id_vector.GetType().id();
+    if (row_id_type != LogicalTypeId::BIGINT &&
+        row_id_type != LogicalTypeId::UBIGINT) {
+      throw InvalidInputException(
+          "Distributed Lance mutation row-id input must be BIGINT");
+    }
+    const auto old_size = local.mutation_row_ids.size();
+    local.mutation_row_ids.reserve(old_size + input.size());
+    if (row_id_type == LogicalTypeId::UBIGINT) {
+      const auto *values = UnifiedVectorFormat::GetData<uint64_t>(format);
+      for (idx_t row = 0; row < input.size(); row++) {
+        const auto index = format.sel->get_index(row);
+        if (!format.validity.RowIsValid(index)) {
+          throw InvalidInputException(
+              "Distributed Lance mutation received a NULL row id");
+        }
+        local.mutation_row_ids.push_back(values[index]);
+      }
+    } else {
+      const auto *values = UnifiedVectorFormat::GetData<int64_t>(format);
+      for (idx_t row = 0; row < input.size(); row++) {
+        const auto index = format.sel->get_index(row);
+        if (!format.validity.RowIsValid(index) || values[index] < 0) {
+          throw InvalidInputException(
+              "Distributed Lance mutation received an invalid row id");
+        }
+        local.mutation_row_ids.push_back(NumericCast<uint64_t>(values[index]));
+      }
+    }
+    local.row_count =
+        CheckedAdd(local.row_count, input.size(), "worker mutation row count");
+    return;
+  }
   // Top-level DuckDB vectors can be checked directly here. The Rust writer
   // validates nested Arrow values against the restored frozen schema after
   // conversion and before buffering a worker batch.
@@ -2126,6 +2641,70 @@ LanceDistributedWriteCombine(ExecutionContext &context,
   auto &global = global_state.Cast<LanceDistributedWriteGlobalState>();
   auto &local = local_state.Cast<LanceDistributedWriteLocalState>();
   ValidateWorkerTask(global, task);
+  if (IsMutationWrite(global.transport.write_kind)) {
+    if (local.mutation_row_ids.empty()) {
+      if (local.row_count != 0) {
+        throw InternalException(
+            "Distributed Lance mutation lost row ids for non-empty input");
+      }
+      return;
+    }
+    if (local.mutation_row_ids.size() != local.row_count) {
+      throw InternalException(
+          "Distributed Lance mutation row-id count is inconsistent");
+    }
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    vector<const char *> set_column_ptrs;
+    vector<const uint8_t *> set_expr_ptrs;
+    vector<size_t> set_expr_lengths;
+    BuildStorageOptionPointerArrays(global.option_keys, global.option_values,
+                                    key_ptrs, value_ptrs);
+    for (idx_t index = 0; index < global.transport.set_columns.size();
+         index++) {
+      set_column_ptrs.push_back(global.transport.set_columns[index].c_str());
+      set_expr_ptrs.push_back(reinterpret_cast<const uint8_t *>(
+          global.transport.set_expr_irs[index].data()));
+      set_expr_lengths.push_back(global.transport.set_expr_irs[index].size());
+    }
+    auto *encoded = lance_distributed_create_mutation_transaction(
+        global.open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(),
+        global.option_keys.size(), LanceGetSessionHandle(context.client),
+        static_cast<uint8_t>(global.transport.write_kind),
+        global.transport.expected_version,
+        global.transport.generation_id.c_str(),
+        global.transport.operation_id.c_str(), task.query_id.c_str(),
+        task.task_attempt_id.c_str(),
+        global.transport.schema_fingerprint.c_str(),
+        global.transport.source_fragment_ids.empty()
+            ? nullptr
+            : global.transport.source_fragment_ids.data(),
+        global.transport.source_fragment_ids.size(),
+        local.mutation_row_ids.data(), local.mutation_row_ids.size(),
+        set_column_ptrs.empty() ? nullptr : set_column_ptrs.data(),
+        set_expr_ptrs.empty() ? nullptr : set_expr_ptrs.data(),
+        set_expr_lengths.empty() ? nullptr : set_expr_lengths.data(),
+        set_column_ptrs.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
+        LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE);
+    if (!encoded) {
+      throw IOException(
+          "Failed to create distributed Lance worker mutation transaction" +
+          LanceVaneFormatErrorSuffix(
+              global.transport.dataset_uri,
+              LanceVanePathRequiresRedaction(context.client,
+                                             global.transport.dataset_uri)));
+    }
+    LanceUncommittedMutationTransactionGuard transaction_guard(
+        encoded, global.transport, global.open_path, global.option_keys,
+        global.option_values);
+    auto transaction = ReadEncodedMutationTransaction(encoded, local.row_count);
+    RegisterWorkerTransaction(global, std::move(transaction));
+    transaction_guard.MarkRegistered();
+    local.mutation_row_ids.clear();
+    local.row_count = 0;
+    return;
+  }
   if (!local.writer) {
     if (local.row_count != 0) {
       throw InternalException(
@@ -2200,16 +2779,7 @@ LanceDistributedWriteCombine(ExecutionContext &context,
         "Distributed Lance worker transaction has no data artifacts");
   }
 
-  {
-    lock_guard<mutex> guard(global.lock);
-    const auto row_count = CheckedAdd(
-        global.row_count, worker_transaction.row_count, "task row count");
-    const auto byte_count = CheckedAdd(
-        global.byte_count, worker_transaction.byte_count, "task byte count");
-    global.transactions.push_back(std::move(worker_transaction));
-    global.row_count = row_count;
-    global.byte_count = byte_count;
-  }
+  RegisterWorkerTransaction(global, std::move(worker_transaction));
   transaction_guard.MarkRegistered();
 }
 
@@ -2267,7 +2837,7 @@ LanceDistributedWriteFinalize(ClientContext &context,
     DistributedWriteArtifact artifact;
     artifact.artifact_id = "data:" + to_string(index);
     artifact.uri = envelope.artifact_paths[index];
-    artifact.codec = {LANCE_DISTRIBUTED_DATA_ARTIFACT_CODEC,
+    artifact.codec = {WriteArtifactCodecName(global.transport.write_kind),
                       LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION};
     fragment.artifacts.push_back(std::move(artifact));
   }
@@ -2287,13 +2857,33 @@ LanceDistributedWriteFinalize(ClientContext &context,
         reinterpret_cast<const uint8_t *>(transaction.payload.data()));
     transaction_lengths.push_back(transaction.payload.size());
   }
-  const auto publish_result = lance_distributed_publish_attempt_manifest(
-      global.open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(),
-      global.option_keys.size(), global.transport.expected_version,
-      global.transport.operation_id.c_str(), task.query_id.c_str(),
-      task.task_attempt_id.c_str(), transaction_ptrs.data(),
-      transaction_lengths.data(), transaction_ptrs.size());
+  const auto publish_result =
+      IsMutationWrite(global.transport.write_kind)
+          ? lance_distributed_publish_mutation_attempt_manifest(
+                global.open_path.c_str(),
+                key_ptrs.empty() ? nullptr : key_ptrs.data(),
+                value_ptrs.empty() ? nullptr : value_ptrs.data(),
+                global.option_keys.size(),
+                static_cast<uint8_t>(global.transport.write_kind),
+                global.transport.expected_version,
+                global.transport.generation_id.c_str(),
+                global.transport.operation_id.c_str(), task.query_id.c_str(),
+                task.task_attempt_id.c_str(),
+                global.transport.schema_fingerprint.c_str(),
+                global.transport.source_fragment_ids.empty()
+                    ? nullptr
+                    : global.transport.source_fragment_ids.data(),
+                global.transport.source_fragment_ids.size(),
+                transaction_ptrs.data(), transaction_lengths.data(),
+                transaction_ptrs.size())
+          : lance_distributed_publish_attempt_manifest(
+                global.open_path.c_str(),
+                key_ptrs.empty() ? nullptr : key_ptrs.data(),
+                value_ptrs.empty() ? nullptr : value_ptrs.data(),
+                global.option_keys.size(), global.transport.expected_version,
+                global.transport.operation_id.c_str(), task.query_id.c_str(),
+                task.task_attempt_id.c_str(), transaction_ptrs.data(),
+                transaction_lengths.data(), transaction_ptrs.size());
   if (publish_result != 0) {
     throw IOException(
         "Failed to publish distributed Lance attempt cleanup manifest" +
@@ -2322,13 +2912,14 @@ static DistributedExtensionWriteCallbacks LanceDistributedWriteCallbacks() {
 } // namespace
 
 void RegisterLanceDistributedWrites(ExtensionLoader &loader) {
-  for (const auto *operator_name :
-       {LANCE_DISTRIBUTED_INSERT_OPERATOR, LANCE_DISTRIBUTED_CTAS_OPERATOR}) {
+  for (const auto write_kind :
+       {LanceDistributedWriteKind::INSERT, LanceDistributedWriteKind::CTAS,
+        LanceDistributedWriteKind::DELETE, LanceDistributedWriteKind::UPDATE}) {
     DistributedWriteOperatorExtension extension;
-    extension.name = operator_name;
+    extension.name = WriteOperatorName(write_kind);
     extension.protocol_version = LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION;
     extension.mode = DistributedWriteMode::CALLBACK;
-    extension.fragment_codec = {LANCE_DISTRIBUTED_WRITE_FRAGMENT_CODEC,
+    extension.fragment_codec = {WriteFragmentCodecName(write_kind),
                                 LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION};
     extension.callbacks = LanceDistributedWriteCallbacks();
     DistributedWriteOperatorExtension::Register(loader, std::move(extension));

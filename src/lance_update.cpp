@@ -6,6 +6,9 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "duckdb/parallel/meta_pipeline.hpp"
+#endif
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -18,6 +21,9 @@
 
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_distributed_write.hpp"
+#endif
 #include "lance_expr_ir.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
@@ -162,6 +168,20 @@ public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  PhysicalLanceUpdateOverwrite(
+      PhysicalPlan &physical_plan, vector<LogicalType> types_p,
+      LanceTableEntry &table_p, string predicate_ir_p,
+      vector<string> set_columns_p, vector<string> set_expr_irs_p,
+      unique_ptr<LanceDistributedWriteProvider> distributed_write_p,
+      idx_t estimated_cardinality)
+      : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
+                         std::move(types_p), estimated_cardinality),
+        table(table_p), predicate_ir(std::move(predicate_ir_p)),
+        set_columns(std::move(set_columns_p)),
+        set_expr_irs(std::move(set_expr_irs_p)),
+        distributed_write(std::move(distributed_write_p)) {}
+#else
   PhysicalLanceUpdateOverwrite(PhysicalPlan &physical_plan,
                                vector<LogicalType> types_p,
                                LanceTableEntry &table_p, string predicate_ir_p,
@@ -173,6 +193,7 @@ public:
         table(table_p), predicate_ir(std::move(predicate_ir_p)),
         set_columns(std::move(set_columns_p)),
         set_expr_irs(std::move(set_expr_irs_p)) {}
+#endif
 
   bool IsSource() const override { return true; }
 
@@ -279,11 +300,43 @@ public:
     return result;
   }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  optional_ptr<distributed::ExtensionWriteTaskProvider>
+  GetExtensionWriteTaskProvider() override {
+    if (!distributed_write) {
+      throw InternalException(
+          "Distributed Lance UPDATE has no write-task provider");
+    }
+    if (children.size() != 1) {
+      throw InvalidInputException(
+          "Distributed Lance UPDATE requires exactly one physical child");
+    }
+    return distributed_write->Select();
+  }
+
+  vector<const_reference<PhysicalOperator>> GetSources() const override {
+    return {*this};
+  }
+
+  void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override {
+    if (distributed_write && distributed_write->DistributedPlanSelected()) {
+      throw InvalidInputException(
+          "A distributed Lance UPDATE worker plan cannot execute as a native "
+          "coordinator operator");
+    }
+    op_state.reset();
+    meta_pipeline.GetState().SetPipelineSource(current, *this);
+  }
+#endif
+
 private:
   LanceTableEntry &table;
   string predicate_ir;
   vector<string> set_columns;
   vector<string> set_expr_irs;
+#ifdef LANCE_VANE_DISTRIBUTED
+  unique_ptr<LanceDistributedWriteProvider> distributed_write;
+#endif
 };
 
 PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
@@ -449,9 +502,26 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     set_expr_irs.push_back(std::move(expr_ir));
   }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto &child = planner.CreatePlan(*op.children[0]);
+  if (child.GetTypes().empty()) {
+    throw NotImplementedException(
+        "Distributed Lance UPDATE requires a row-id input column");
+  }
+  const auto row_id_index = child.GetTypes().size() - 1;
+  auto provider = CreateLanceDistributedUpdateProvider(
+      context, *lance_table, *scan_bind, child.GetTypes(), row_id_index,
+      set_columns, set_expr_irs);
+  auto &update = planner.Make<PhysicalLanceUpdateOverwrite>(
+      op.types, *lance_table, std::move(predicate_ir), std::move(set_columns),
+      std::move(set_expr_irs), std::move(provider), op.estimated_cardinality);
+  update.children.push_back(child);
+  return update;
+#else
   return planner.Make<PhysicalLanceUpdateOverwrite>(
       op.types, *lance_table, std::move(predicate_ir), std::move(set_columns),
       std::move(set_expr_irs), op.estimated_cardinality);
+#endif
 }
 
 } // namespace duckdb

@@ -723,7 +723,7 @@ jobs:
           docker rm -f lance-vane-minio || true
 
   vane-distributed-write-test:
-    name: Vane two-worker distributed writes
+    name: Vane two-worker distributed writes and mutations
     needs: [rust-quality, python-quality, vane-native-build, vane-wheel-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 50
@@ -809,7 +809,7 @@ jobs:
             "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}"
           "${RUNNER_TEMP}/mc" mb --ignore-existing "local/${LANCE_S3_BUCKET}"
 
-      - name: Run distributed write contracts
+      - name: Run distributed write and mutation contracts
         shell: bash
         env:
           PYTHONSAFEPATH: "1"

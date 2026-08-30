@@ -200,7 +200,8 @@ set(RUST_FFI_DEPENDS
 
 if(LANCE_VANE_DISTRIBUTED)
   list(APPEND RUST_FFI_DEPENDS
-       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_write.rs)
+       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_write.rs
+       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_mutation.rs)
 endif()
 
 set(RUST_CARGO_ENV CARGO_TARGET_DIR=${RUST_TARGET_DIR}

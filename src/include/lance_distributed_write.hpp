@@ -13,6 +13,7 @@ class ExtensionLoader;
 class LanceTableEntry;
 class LogicalCreateTable;
 class PhysicalPlanGenerator;
+struct LanceScanBindData;
 
 class LanceDistributedWriteProvider final
     : public distributed::ExtensionWriteTaskProvider {
@@ -45,6 +46,20 @@ private:
                                        const vector<string> &column_names,
                                        const vector<LogicalType> &column_types,
                                        const vector<LogicalType> &input_types);
+  friend unique_ptr<LanceDistributedWriteProvider>
+  CreateLanceDistributedDeleteProvider(ClientContext &context,
+                                       LanceTableEntry &table,
+                                       const LanceScanBindData &scan_bind,
+                                       const vector<LogicalType> &input_types,
+                                       idx_t row_id_index);
+  friend unique_ptr<LanceDistributedWriteProvider>
+  CreateLanceDistributedUpdateProvider(ClientContext &context,
+                                       LanceTableEntry &table,
+                                       const LanceScanBindData &scan_bind,
+                                       const vector<LogicalType> &input_types,
+                                       idx_t row_id_index,
+                                       const vector<string> &set_columns,
+                                       const vector<string> &set_expr_irs);
   friend PhysicalOperator &PlanLanceDistributedCreateTableAs(
       ClientContext &context, PhysicalPlanGenerator &planner,
       LogicalCreateTable &op, PhysicalOperator &plan, const string &root,
@@ -59,6 +74,17 @@ unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedInsertProvider(
     ClientContext &context, LanceTableEntry &table,
     const vector<string> &column_names, const vector<LogicalType> &column_types,
     const vector<LogicalType> &input_types);
+
+unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedDeleteProvider(
+    ClientContext &context, LanceTableEntry &table,
+    const LanceScanBindData &scan_bind, const vector<LogicalType> &input_types,
+    idx_t row_id_index);
+
+unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedUpdateProvider(
+    ClientContext &context, LanceTableEntry &table,
+    const LanceScanBindData &scan_bind, const vector<LogicalType> &input_types,
+    idx_t row_id_index, const vector<string> &set_columns,
+    const vector<string> &set_expr_irs);
 
 PhysicalOperator &PlanLanceDistributedCreateTableAs(
     ClientContext &context, PhysicalPlanGenerator &planner,

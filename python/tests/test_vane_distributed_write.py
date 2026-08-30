@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 import uuid
 import warnings
@@ -17,6 +18,9 @@ from vane import runners
 from vane.runners.ray import set_runner_ray
 
 WORKER_COUNT = 2
+STABLE_ROW_IDS_DATASET = (
+    Path(__file__).resolve().parents[2] / "test/data/stable_row_ids.lance"
+)
 
 
 def _sql_literal(value: str | Path) -> str:
@@ -107,8 +111,28 @@ def _data_file_count(connection, path: str | Path) -> int:
     )
 
 
+def _deletion_file_count(connection, path: str | Path) -> int:
+    pattern = f"{str(path).rstrip('/')}/_deletions/**/*"
+    return int(
+        connection.execute(
+            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
+        ).fetchone()[0]
+    )
+
+
 def _attempt_manifest_count(connection, path: str | Path) -> int:
     pattern = f"{str(path).rstrip('/')}/_vane_distributed_write_attempts/*/*.manifest"
+    return int(
+        connection.execute(
+            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
+        ).fetchone()[0]
+    )
+
+
+def _mutation_attempt_manifest_count(connection, path: str | Path) -> int:
+    pattern = (
+        f"{str(path).rstrip('/')}/_vane_distributed_mutation_attempts/*/*.manifest"
+    )
     return int(
         connection.execute(
             f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
@@ -230,6 +254,8 @@ class DistributedWriteCapture:
         expected_name: str,
         expected_rows: int,
         minimum_task_results: int,
+        minimum_artifacts: int | None = None,
+        allow_empty_tasks: bool = False,
     ) -> dict[str, object]:
         previous_count = self.dispatch_count
         self.last_result = None
@@ -254,8 +280,14 @@ class DistributedWriteCapture:
             assert fragment_count == 0
             assert artifact_count == 0
         else:
-            assert fragment_count == task_count
-            assert artifact_count >= fragment_count
+            if allow_empty_tasks:
+                assert 0 < fragment_count <= task_count
+            else:
+                assert fragment_count == task_count
+            if minimum_artifacts is None:
+                assert artifact_count >= fragment_count
+            else:
+                assert artifact_count >= minimum_artifacts
         return result
 
 
@@ -614,6 +646,344 @@ def _exercise_nested_not_null_target(
     ).fetchone() == (3, 3)
 
 
+def _exercise_update_and_delete(
+    connection,
+    capture: DistributedWriteCapture,
+    *,
+    catalog: str,
+    target_path: str | Path,
+) -> None:
+    assert _manifest_count(connection, target_path) == 1
+
+    capture.require_write(
+        "distributed Lance UPDATE",
+        lambda: connection.table(f"{catalog}.main.mutation_target").update(
+            {"value": vane.lit("updated")},
+            condition=vane.col("id") < 40,
+        ),
+        expected_name="update",
+        expected_rows=40,
+        minimum_task_results=2,
+        minimum_artifacts=1,
+        allow_empty_tasks=True,
+    )
+    assert _manifest_count(connection, target_path) == 2
+    assert _mutation_attempt_manifest_count(connection, target_path) == 0
+    assert connection.execute(
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT, "
+        "count(*) FILTER (WHERE value = 'updated')::BIGINT "
+        f"FROM {catalog}.main.mutation_target"
+    ).fetchone() == (80, 3160, 40)
+
+    capture.require_write(
+        "distributed Lance DELETE",
+        lambda: connection.table(f"{catalog}.main.mutation_target").delete(
+            condition=vane.col("id") >= 60
+        ),
+        expected_name="delete",
+        expected_rows=20,
+        minimum_task_results=2,
+        # Deleting complete fragments legitimately produces no deletion file.
+        minimum_artifacts=0,
+        allow_empty_tasks=True,
+    )
+    assert _manifest_count(connection, target_path) == 3
+    assert _mutation_attempt_manifest_count(connection, target_path) == 0
+    assert connection.execute(
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT, "
+        "count(*) FILTER (WHERE value = 'updated')::BIGINT "
+        f"FROM {catalog}.main.mutation_target"
+    ).fetchone() == (60, 1770, 40)
+
+    for name, operation in (
+        (
+            "zero-match distributed Lance UPDATE",
+            lambda: connection.table(f"{catalog}.main.mutation_target").update(
+                {"value": vane.lit("unreachable")},
+                condition=vane.col("id") < 0,
+            ),
+        ),
+        (
+            "zero-match distributed Lance DELETE",
+            lambda: connection.table(f"{catalog}.main.mutation_target").delete(
+                condition=vane.col("id") >= 1000
+            ),
+        ),
+    ):
+        capture.require_write(
+            name,
+            operation,
+            expected_name="update" if "UPDATE" in name else "delete",
+            expected_rows=0,
+            minimum_task_results=1,
+        )
+        assert _manifest_count(connection, target_path) == 3
+        assert _mutation_attempt_manifest_count(connection, target_path) == 0
+
+
+def test_two_worker_local_shared_lance_update_and_delete(
+    tmp_path: Path, write_capture: DistributedWriteCapture
+) -> None:
+    connection = _connect()
+    root = tmp_path / "distributed-mutation"
+    root.mkdir()
+    target_path = root / "mutation_target.lance"
+    try:
+        _write_source(connection, target_path)
+        connection.execute(
+            f"ATTACH {_sql_literal(root)} AS lance_mutation (TYPE LANCE)"
+        )
+        _exercise_update_and_delete(
+            connection,
+            write_capture,
+            catalog="lance_mutation",
+            target_path=target_path,
+        )
+    finally:
+        connection.close()
+
+
+def test_two_worker_single_fragment_lance_update_and_delete(
+    tmp_path: Path, write_capture: DistributedWriteCapture
+) -> None:
+    connection = _connect()
+    root = tmp_path / "single-fragment-distributed-mutation"
+    root.mkdir()
+    target_path = root / "mutation_target.lance"
+    try:
+        connection.execute(
+            "COPY (SELECT i::BIGINT AS id, "
+            "('value-' || i::VARCHAR)::VARCHAR AS value "
+            "FROM range(16) AS source(i)) "
+            f"TO {_sql_literal(target_path)} "
+            "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 64)"
+        )
+        connection.execute(
+            f"ATTACH {_sql_literal(root)} AS lance_single_mutation (TYPE LANCE)"
+        )
+
+        write_capture.require_write(
+            "single-fragment distributed Lance UPDATE",
+            lambda: connection.table(
+                "lance_single_mutation.main.mutation_target"
+            ).update(
+                {"value": vane.lit("single-updated")},
+                condition=vane.col("id") < 3,
+            ),
+            expected_name="update",
+            expected_rows=3,
+            minimum_task_results=1,
+            minimum_artifacts=2,
+            allow_empty_tasks=True,
+        )
+        write_capture.require_write(
+            "single-fragment distributed Lance DELETE",
+            lambda: connection.table(
+                "lance_single_mutation.main.mutation_target"
+            ).delete(condition=vane.col("id") >= 13),
+            expected_name="delete",
+            expected_rows=3,
+            minimum_task_results=1,
+            minimum_artifacts=1,
+            allow_empty_tasks=True,
+        )
+        assert connection.execute(
+            "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
+            "list(id ORDER BY id) FILTER (WHERE value = 'single-updated') "
+            "FROM lance_single_mutation.main.mutation_target"
+        ).fetchone() == (13, 78, [0, 1, 2])
+        assert _manifest_count(connection, target_path) == 3
+        assert _mutation_attempt_manifest_count(connection, target_path) == 0
+    finally:
+        connection.close()
+
+
+def test_distributed_lance_mutation_rejects_a_stale_bound_snapshot(
+    tmp_path: Path,
+    write_capture: DistributedWriteCapture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vane.runners.ray.driver import RayQueryDriverClient
+
+    connection = _connect()
+    evolution_connection = _connect()
+    root = tmp_path / "stale-distributed-mutation"
+    root.mkdir()
+    target_path = root / "mutation_target.lance"
+    try:
+        _write_source(connection, target_path)
+        connection.execute(
+            f"ATTACH {_sql_literal(root)} AS lance_mutation (TYPE LANCE)"
+        )
+        evolution_connection.execute(
+            f"ATTACH {_sql_literal(root)} AS lance_evolve (TYPE LANCE)"
+        )
+
+        original_run_copy_plan = RayQueryDriverClient.run_copy_plan
+        raced = False
+
+        def run_after_concurrent_commit(client, plan):
+            nonlocal raced
+            assert raced is False
+            raced = True
+            evolution_connection.execute(
+                "INSERT INTO lance_evolve.main.mutation_target "
+                "VALUES (1000, 'concurrent')"
+            )
+            return original_run_copy_plan(client, plan)
+
+        monkeypatch.setattr(
+            RayQueryDriverClient,
+            "run_copy_plan",
+            run_after_concurrent_commit,
+        )
+        previous_dispatch_count = write_capture.dispatch_count
+        with pytest.raises(
+            Exception,
+            match="changed after.*bound|changed after.*planned|target version changed",
+        ):
+            connection.table("lance_mutation.main.mutation_target").update(
+                {"value": vane.lit("stale-update")},
+                condition=vane.col("id") < 40,
+            )
+        assert raced is True
+        assert write_capture.dispatch_count == previous_dispatch_count + 1
+        assert write_capture.last_result is None
+        assert _manifest_count(evolution_connection, target_path) == 2
+        assert _mutation_attempt_manifest_count(evolution_connection, target_path) == 0
+        assert evolution_connection.execute(
+            "SELECT count(*)::BIGINT, "
+            "count(*) FILTER (WHERE value = 'stale-update')::BIGINT "
+            "FROM lance_evolve.main.mutation_target"
+        ).fetchone() == (81, 0)
+    finally:
+        evolution_connection.close()
+        connection.close()
+
+
+def test_failed_distributed_lance_update_keeps_the_target_unchanged(
+    tmp_path: Path, write_capture: DistributedWriteCapture
+) -> None:
+    connection = _connect()
+    root = tmp_path / "failed-distributed-mutation"
+    root.mkdir()
+    target_path = root / "mutation_target.lance"
+    try:
+        _write_source(connection, target_path)
+        connection.execute(
+            f"ATTACH {_sql_literal(root)} AS lance_mutation (TYPE LANCE)"
+        )
+        connection.execute(
+            "ALTER TABLE lance_mutation.main.mutation_target "
+            "ALTER COLUMN value SET NOT NULL"
+        )
+        initial_manifest_count = _manifest_count(connection, target_path)
+        initial_data_file_count = _data_file_count(connection, target_path)
+        initial_deletion_file_count = _deletion_file_count(connection, target_path)
+
+        previous_dispatch_count = write_capture.dispatch_count
+        with pytest.raises(Exception, match="NULL|NOT NULL|worker mutation"):
+            connection.table("lance_mutation.main.mutation_target").update(
+                {
+                    "value": vane.SQLExpression(
+                        "CASE WHEN id < 40 THEN value ELSE NULL END"
+                    )
+                }
+            )
+        assert write_capture.dispatch_count == previous_dispatch_count + 1
+        assert write_capture.last_result is None
+        assert _manifest_count(connection, target_path) == initial_manifest_count
+        assert _data_file_count(connection, target_path) == initial_data_file_count
+        assert (
+            _deletion_file_count(connection, target_path) == initial_deletion_file_count
+        )
+        assert _mutation_attempt_manifest_count(connection, target_path) == 0
+        assert connection.execute(
+            "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
+            "count(*) FILTER (WHERE value IS NULL)::BIGINT "
+            "FROM lance_mutation.main.mutation_target"
+        ).fetchone() == (80, 3160, 0)
+    finally:
+        connection.close()
+
+
+def test_two_worker_lance_update_preserves_stable_row_ids(
+    tmp_path: Path, write_capture: DistributedWriteCapture
+) -> None:
+    connection = _connect()
+    root = tmp_path / "distributed-stable-row-id-mutation"
+    root.mkdir()
+    target_path = root / "stable_target.lance"
+    shutil.copytree(STABLE_ROW_IDS_DATASET, target_path)
+    try:
+        initial_manifest_count = _manifest_count(connection, target_path)
+        connection.execute(
+            f"ATTACH {_sql_literal(root)} AS lance_stable_mutation (TYPE LANCE)"
+        )
+        assert connection.execute(
+            f"SELECT id, _rowid FROM {_sql_literal(target_path)} " "ORDER BY _rowid"
+        ).fetchall() == [
+            (0, 0),
+            (2, 2),
+            (3, 3),
+            (5, 5),
+            (6, 6),
+            (8, 8),
+            (9, 9),
+            (11, 11),
+        ]
+
+        write_capture.require_write(
+            "stable-row-id distributed Lance UPDATE",
+            lambda: connection.table("lance_stable_mutation.main.stable_target").update(
+                {"id": vane.col("id") + 100},
+                condition=vane.col("id") < 6,
+            ),
+            expected_name="update",
+            expected_rows=4,
+            minimum_task_results=2,
+            minimum_artifacts=1,
+            allow_empty_tasks=True,
+        )
+        assert connection.execute(
+            f"SELECT id, _rowid FROM {_sql_literal(target_path)} " "ORDER BY _rowid"
+        ).fetchall() == [
+            (100, 0),
+            (102, 2),
+            (103, 3),
+            (105, 5),
+            (6, 6),
+            (8, 8),
+            (9, 9),
+            (11, 11),
+        ]
+
+        write_capture.require_write(
+            "stable-row-id distributed Lance DELETE",
+            lambda: connection.table("lance_stable_mutation.main.stable_target").delete(
+                condition=(vane.col("id") >= 8) & (vane.col("id") < 100)
+            ),
+            expected_name="delete",
+            expected_rows=3,
+            minimum_task_results=2,
+            minimum_artifacts=0,
+            allow_empty_tasks=True,
+        )
+        assert connection.execute(
+            f"SELECT id, _rowid FROM {_sql_literal(target_path)} " "ORDER BY _rowid"
+        ).fetchall() == [
+            (100, 0),
+            (102, 2),
+            (103, 3),
+            (105, 5),
+            (6, 6),
+        ]
+        assert _manifest_count(connection, target_path) == initial_manifest_count + 2
+        assert _mutation_attempt_manifest_count(connection, target_path) == 0
+    finally:
+        connection.close()
+
+
 def test_two_worker_local_shared_lance_insert_and_ctas(
     tmp_path: Path, write_capture: DistributedWriteCapture
 ) -> None:
@@ -706,8 +1076,10 @@ def test_two_worker_s3_lance_insert_and_ctas(
         explicit_ctas_path = f"{root}/explicit_ctas_target.lance"
         required_target_path = f"{root}/required_target.lance"
         nested_required_target_path = f"{root}/nested_required_target.lance"
+        mutation_target_path = f"{root}/mutation_target.lance"
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
+        _write_source(connection, mutation_target_path)
         connection.execute(
             f"ATTACH {_sql_literal(root)} AS lance_s3_write "
             "(TYPE LANCE, READ_ONLY false)"
@@ -745,6 +1117,12 @@ def test_two_worker_s3_lance_insert_and_ctas(
             write_capture,
             catalog="lance_s3_write",
             target_path=nested_required_target_path,
+        )
+        _exercise_update_and_delete(
+            connection,
+            write_capture,
+            catalog="lance_s3_write",
+            target_path=mutation_target_path,
         )
     finally:
         connection.close()
