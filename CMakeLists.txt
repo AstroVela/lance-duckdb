@@ -9,8 +9,8 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-option(LANCE_VANE_DISTRIBUTED "Build the Vane distributed Lance scan adapter"
-       OFF)
+option(LANCE_VANE_DISTRIBUTED
+       "Build the Vane distributed Lance scan and write adapters" OFF)
 
 if(LANCE_VANE_DISTRIBUTED)
   if(NOT DEFINED DUCKDB_SOURCE_PATH OR "${DUCKDB_SOURCE_PATH}" STREQUAL "")
@@ -22,6 +22,9 @@ if(LANCE_VANE_DISTRIBUTED)
   if(NOT
      EXISTS
      "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp"
+     OR NOT
+        EXISTS
+        "${DUCKDB_SOURCE_PATH}/src/include/duckdb/execution/distributed/extension_write_task_provider.hpp"
   )
     message(
       FATAL_ERROR "LANCE_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
@@ -54,6 +57,10 @@ set(EXTENSION_SOURCES
     src/lance_index.cpp
     src/lance_arrow_compat.cpp
     src/lance_resolver.cpp)
+
+if(LANCE_VANE_DISTRIBUTED)
+  list(APPEND EXTENSION_SOURCES src/lance_distributed_write.cpp)
+endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -190,6 +197,11 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/expr_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)
+
+if(LANCE_VANE_DISTRIBUTED)
+  list(APPEND RUST_FFI_DEPENDS
+       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_write.rs)
+endif()
 
 set(RUST_CARGO_ENV CARGO_TARGET_DIR=${RUST_TARGET_DIR}
                    MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})

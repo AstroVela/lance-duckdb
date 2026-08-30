@@ -1,7 +1,7 @@
 set(LANCE_VANE_EXTENSION_CONFIG_VANE TRUE)
 set(LANCE_VANE_DISTRIBUTED
     ON
-    CACHE BOOL "Build the Vane distributed Lance scan adapter" FORCE)
+    CACHE BOOL "Build the Vane distributed Lance scan and write adapters" FORCE)
 
 # The wheel build uses the extension manifest for host tools such as protoc,
 # while Vane owns the C++ libraries linked into vane._native. Keep Protobuf and

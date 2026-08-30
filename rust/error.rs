@@ -67,6 +67,8 @@ pub enum ErrorCode {
     Exec = 52,
     DatasetMerge = 53,
     NamespaceQueryTable = 54,
+    #[cfg(feature = "vane-distributed")]
+    DistributedWrite = 55,
 }
 
 struct LastError {

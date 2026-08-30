@@ -3,6 +3,7 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
+#include "duckdb/common/crypto/md5.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #endif
@@ -4952,6 +4953,21 @@ LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
       dataset_uri(LanceNamespaceDisplayUri(config)),
       namespace_config(
           make_uniq<LanceNamespaceTableConfig>(std::move(config))) {}
+
+#ifdef LANCE_VANE_DISTRIBUTED
+string LanceTableEntry::GetLogicalWriteTargetIdentity() const {
+  if (dataset_uri.empty()) {
+    throw InternalException("Lance table '%s' has no stable dataset locator",
+                            name);
+  }
+  MD5Context digest;
+  digest.Add("lance-write-target:v1");
+  const data_t separator = 0;
+  digest.Add(&separator, 1);
+  digest.Add(dataset_uri);
+  return "lance-write-target:v1:" + digest.FinishHex();
+}
+#endif
 
 static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
   unordered_map<string, string> out;

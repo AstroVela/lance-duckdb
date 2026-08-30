@@ -9,7 +9,7 @@ crate-type = ["staticlib"]
 path = "rust/lib.rs"
 
 [features]
-vane-distributed = ["dep:lance-io", "dep:object_store", "dep:url"]
+vane-distributed = ["dep:lance-io", "dep:object_store", "dep:prost", "dep:url"]
 
 [profile.release]
 lto = "thin"
@@ -54,4 +54,5 @@ snafu = "0.8.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rand = "0.8"
 object_store = { version = "0.13.2", default-features = false, features = ["aws"], optional = true }
+prost = { version = "0.14", optional = true }
 url = { version = "2", optional = true }

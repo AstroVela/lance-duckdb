@@ -91,6 +91,40 @@ def test_single_node_lance_scan(tmp_path: Path) -> None:
         connection.close()
 
 
+def test_single_node_lance_insert_and_ctas_keep_native_execution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    connection = _connect()
+    root = tmp_path / "single-node-write"
+    root.mkdir()
+    try:
+        connection.execute(f"ATTACH {_sql_literal(root)} AS lance_write (TYPE LANCE)")
+        connection.execute(
+            "CREATE TABLE lance_write.main.insert_target " "(id BIGINT, value VARCHAR)"
+        )
+        source = connection.sql(
+            "SELECT i::BIGINT AS id, "
+            "('value-' || i::VARCHAR)::VARCHAR AS value "
+            "FROM range(12) AS source(i)"
+        )
+
+        source.insert_into("lance_write.main.insert_target")
+        source.create("lance_write.main.ctas_target")
+
+        assert connection.execute(
+            "SELECT count(*)::BIGINT, sum(id)::BIGINT "
+            "FROM lance_write.main.insert_target"
+        ).fetchone() == (12, 66)
+        assert connection.execute(
+            "SELECT count(*)::BIGINT, sum(id)::BIGINT "
+            "FROM lance_write.main.ctas_target"
+        ).fetchone() == (12, 66)
+    finally:
+        connection.close()
+
+
 def test_vane_rowid_in_uses_sql_membership_semantics(tmp_path: Path) -> None:
     connection = _connect()
     path = tmp_path / "rowid-membership.lance"

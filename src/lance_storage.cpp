@@ -13,6 +13,7 @@
 #include "duckdb/common/file_system.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #endif
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
@@ -43,6 +44,9 @@
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_distributed_write.hpp"
+#endif
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
@@ -234,9 +238,36 @@ static void PopulateColumnsFromArrowSchema(ClientContext &context,
   }
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static void PopulateVaneNotNullConstraintsFromArrowSchema(
+    const ArrowSchema &schema,
+    vector<unique_ptr<Constraint>> &out_constraints) {
+  if (schema.n_children < 0) {
+    throw IOException("Lance dataset schema has an invalid field count");
+  }
+  out_constraints.clear();
+  for (idx_t index = 0; index < static_cast<idx_t>(schema.n_children);
+       index++) {
+    auto *field = schema.children[index];
+    if (!field) {
+      throw IOException("Lance dataset schema has a null field");
+    }
+    if ((field->flags & ARROW_FLAG_NULLABLE) == 0) {
+      out_constraints.push_back(
+          make_uniq<NotNullConstraint>(LogicalIndex(index)));
+    }
+  }
+}
+#endif
+
 static void PopulateLanceTableColumnsFromDataset(
     ClientContext &context, void *dataset, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr) {
+    vector<string> *out_coerced_columns = nullptr
+#ifdef LANCE_VANE_DISTRIBUTED
+    ,
+    vector<unique_ptr<Constraint>> *out_constraints = nullptr
+#endif
+) {
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
     throw IOException("Failed to get schema from Lance dataset" +
@@ -258,6 +289,12 @@ static void PopulateLanceTableColumnsFromDataset(
   }
   PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
                                  out_columns);
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (out_constraints) {
+    PopulateVaneNotNullConstraintsFromArrowSchema(schema_root.arrow_schema,
+                                                  *out_constraints);
+  }
+#endif
 }
 
 static string JoinNamespacePath(const string &root, const string &child) {
@@ -399,7 +436,12 @@ public:
     vector<string> coerced;
     try {
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                           &coerced);
+                                           &coerced
+#ifdef LANCE_VANE_DISTRIBUTED
+                                           ,
+                                           &info.constraints
+#endif
+      );
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -467,7 +509,12 @@ private:
 
 static void PopulateLanceTableColumnsFromJsonSchema(
     ClientContext &context, const string &schema_json, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr) {
+    vector<string> *out_coerced_columns = nullptr
+#ifdef LANCE_VANE_DISTRIBUTED
+    ,
+    vector<unique_ptr<Constraint>> *out_constraints = nullptr
+#endif
+) {
   ArrowSchemaWrapper schema_root;
   memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
   if (lance_json_arrow_schema_to_c(schema_json.c_str(),
@@ -482,6 +529,12 @@ static void PopulateLanceTableColumnsFromJsonSchema(
   }
   PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
                                  out_columns);
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (out_constraints) {
+    PopulateVaneNotNullConstraintsFromArrowSchema(schema_root.arrow_schema,
+                                                  *out_constraints);
+  }
+#endif
 }
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
@@ -594,7 +647,12 @@ public:
       vector<string> coerced;
       try {
         PopulateLanceTableColumnsFromJsonSchema(context, schema_json,
-                                                info.columns, &coerced);
+                                                info.columns, &coerced
+#ifdef LANCE_VANE_DISTRIBUTED
+                                                ,
+                                                &info.constraints
+#endif
+        );
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
@@ -631,7 +689,12 @@ public:
       vector<string> coerced;
       try {
         PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                             &coerced);
+                                             &coerced
+#ifdef LANCE_VANE_DISTRIBUTED
+                                             ,
+                                             &info.constraints
+#endif
+        );
       } catch (...) {
         lance_close_dataset(dataset);
         continue;
@@ -1769,6 +1832,14 @@ public:
     if (!directory_ns || directory_ns->root.empty()) {
       throw InternalException("Lance directory namespace root is empty");
     }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+    return PlanLanceDistributedCreateTableAs(
+        context, planner, op, plan, directory_ns->root,
+        directory_ns->option_keys, directory_ns->option_values,
+        directory_ns->uses_coordinator_storage_secret,
+        directory_ns->distributed_replay_path_restricted, data_storage_version);
+#endif
 
     auto dataset_path = JoinNamespacePath(directory_ns->root,
                                           GetDatasetDirName(create_info.table));

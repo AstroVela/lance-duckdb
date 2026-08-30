@@ -74,6 +74,10 @@ public:
 
   TableStorageInfo GetStorageInfo(ClientContext &) override { return {}; }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  string GetLogicalWriteTargetIdentity() const override;
+#endif
+
   const string &DatasetUri() const { return dataset_uri; }
   bool IsNamespaceBacked() const { return namespace_config != nullptr; }
   const LanceNamespaceTableConfig &NamespaceConfig() const {

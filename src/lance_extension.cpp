@@ -2,6 +2,9 @@
 
 #include "lance_extension.hpp"
 #include "lance_secrets.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_distributed_write.hpp"
+#endif
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -28,6 +31,9 @@ static void LoadInternal(ExtensionLoader &loader) {
   RegisterLanceScan(loader);
   RegisterLanceSearch(loader);
   RegisterLanceWrite(loader);
+#ifdef LANCE_VANE_DISTRIBUTED
+  RegisterLanceDistributedWrites(loader);
+#endif
   RegisterLanceMaintenance(loader);
 }
 

@@ -3,11 +3,17 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "duckdb/parallel/meta_pipeline.hpp"
+#endif
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_distributed_write.hpp"
+#endif
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
 #include "lance_session_state.hpp"
@@ -200,10 +206,46 @@ public:
 
   string GetName() const override { return "LanceInsert"; }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  void SetDistributedWriteProvider(
+      unique_ptr<LanceDistributedWriteProvider> provider) {
+    if (distributed_write) {
+      throw InternalException(
+          "Distributed Lance INSERT provider was set more than once");
+    }
+    distributed_write = std::move(provider);
+  }
+
+  optional_ptr<distributed::ExtensionWriteTaskProvider>
+  GetExtensionWriteTaskProvider() override {
+    if (!distributed_write) {
+      throw InternalException(
+          "Distributed Lance INSERT has no write-task provider");
+    }
+    if (children.size() != 1) {
+      throw InvalidInputException(
+          "Distributed Lance INSERT requires exactly one physical child");
+    }
+    return distributed_write->Select();
+  }
+
+  void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override {
+    if (distributed_write && distributed_write->DistributedPlanSelected()) {
+      throw InvalidInputException(
+          "A distributed Lance INSERT worker plan cannot execute as a native "
+          "coordinator operator");
+    }
+    PhysicalOperator::BuildPipelines(current, meta_pipeline);
+  }
+#endif
+
 private:
   LanceTableEntry &table;
   vector<string> column_names;
   vector<LogicalType> column_types;
+#ifdef LANCE_VANE_DISTRIBUTED
+  unique_ptr<LanceDistributedWriteProvider> distributed_write;
+#endif
 };
 
 PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
@@ -246,10 +288,19 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
     column_types.push_back(col.Type());
   }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto distributed_write = CreateLanceDistributedInsertProvider(
+      context, *lance_table, column_names, column_types, plan->types);
+#endif
+
   auto &insert = planner.Make<PhysicalLanceInsert>(
       op.types, *lance_table, std::move(column_names), std::move(column_types),
       op.estimated_cardinality);
   insert.children.push_back(*plan);
+#ifdef LANCE_VANE_DISTRIBUTED
+  static_cast<PhysicalLanceInsert &>(insert).SetDistributedWriteProvider(
+      std::move(distributed_write));
+#endif
   return insert;
 }
 
