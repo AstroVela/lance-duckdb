@@ -3,6 +3,10 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "duckdb/parallel/meta_pipeline.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#endif
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -11,9 +15,15 @@
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_distributed_write.hpp"
+#endif
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_insert.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_scan_bind_data.hpp"
+#endif
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
@@ -145,12 +155,24 @@ public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  PhysicalLanceDelete(
+      PhysicalPlan &physical_plan, vector<LogicalType> types_p,
+      LanceTableEntry &table_p, string filter_ir_p,
+      unique_ptr<LanceDistributedWriteProvider> distributed_write_p,
+      idx_t estimated_cardinality)
+      : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
+                         std::move(types_p), estimated_cardinality),
+        table(table_p), filter_ir(std::move(filter_ir_p)),
+        distributed_write(std::move(distributed_write_p)) {}
+#else
   PhysicalLanceDelete(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                       LanceTableEntry &table_p, string filter_ir_p,
                       idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
         table(table_p), filter_ir(std::move(filter_ir_p)) {}
+#endif
 
   bool IsSource() const override { return true; }
 
@@ -225,9 +247,41 @@ public:
 
   string GetName() const override { return "LanceDelete"; }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  optional_ptr<distributed::ExtensionWriteTaskProvider>
+  GetExtensionWriteTaskProvider() override {
+    if (!distributed_write) {
+      throw InternalException(
+          "Distributed Lance DELETE has no write-task provider");
+    }
+    if (children.size() != 1) {
+      throw InvalidInputException(
+          "Distributed Lance DELETE requires exactly one physical child");
+    }
+    return distributed_write->Select();
+  }
+
+  vector<const_reference<PhysicalOperator>> GetSources() const override {
+    return {*this};
+  }
+
+  void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override {
+    if (distributed_write && distributed_write->DistributedPlanSelected()) {
+      throw InvalidInputException(
+          "A distributed Lance DELETE worker plan cannot execute as a native "
+          "coordinator operator");
+    }
+    op_state.reset();
+    meta_pipeline.GetState().SetPipelineSource(current, *this);
+  }
+#endif
+
 private:
   LanceTableEntry &table;
   string filter_ir;
+#ifdef LANCE_VANE_DISTRIBUTED
+  unique_ptr<LanceDistributedWriteProvider> distributed_write;
+#endif
 };
 
 PhysicalOperator &PlanLanceDelete(ClientContext &context,
@@ -252,8 +306,35 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
     throw NotImplementedException(error);
   }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  LogicalGet *get = nullptr;
+  if (!TryFindDeleteLogicalGet(*op.children[0], get, error) || !get ||
+      !get->bind_data) {
+    throw NotImplementedException(
+        error.empty() ? "Lance DELETE has no replayable scan" : error);
+  }
+  auto *scan_bind = dynamic_cast<LanceScanBindData *>(get->bind_data.get());
+  if (!scan_bind) {
+    throw InternalException("Lance DELETE is missing Lance scan bind data");
+  }
+  if (op.expressions.size() != 1 || !op.expressions[0] ||
+      op.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+    throw NotImplementedException(
+        "Distributed Lance DELETE requires one bound row-id expression");
+  }
+  const auto row_id_index = NumericCast<idx_t>(
+      op.expressions[0]->Cast<BoundReferenceExpression>().index);
+  auto &child = planner.CreatePlan(*op.children[0]);
+  auto provider = CreateLanceDistributedDeleteProvider(
+      context, *lance_table, *scan_bind, child.GetTypes(), row_id_index);
+  auto &del = planner.Make<PhysicalLanceDelete>(
+      op.types, *lance_table, std::move(filter_ir), std::move(provider),
+      op.estimated_cardinality);
+  del.children.push_back(child);
+#else
   auto &del = planner.Make<PhysicalLanceDelete>(
       op.types, *lance_table, std::move(filter_ir), op.estimated_cardinality);
+#endif
   (void)context;
   return del;
 }

@@ -2,6 +2,8 @@ mod arrow_export;
 mod dataset;
 mod dir_namespace;
 #[cfg(feature = "vane-distributed")]
+mod distributed_mutation;
+#[cfg(feature = "vane-distributed")]
 mod distributed_write;
 mod exec;
 mod index;

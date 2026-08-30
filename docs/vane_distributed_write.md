@@ -1,10 +1,11 @@
 # Vane Distributed Lance Writes
 
-The Vane build supports distributed `INSERT INTO` and `CREATE TABLE AS`
-operations for replayable Lance directory-namespace tables. The integration is
-compiled only when `LANCE_VANE_DISTRIBUTED` and the `vane-distributed` Cargo
-feature are enabled. Official DuckDB builds retain the existing native Lance
-operators and do not compile or register the Vane write adapter.
+The Vane build supports distributed `INSERT INTO`, `CREATE TABLE AS`, `UPDATE`,
+and `DELETE` operations for replayable Lance directory-namespace tables. The
+integration is compiled only when `LANCE_VANE_DISTRIBUTED` and the
+`vane-distributed` Cargo feature are enabled. Official DuckDB builds retain the
+existing native Lance operators and do not compile or register the Vane write
+adapter.
 
 ## Commit protocol
 
@@ -39,6 +40,40 @@ generation change fails the operation instead of silently rebasing it. Empty
 writes do not create an append version. An empty `CREATE TABLE AS` therefore
 keeps its prepared version-one dataset.
 
+## Mutation protocol
+
+An `UPDATE` or `DELETE` freezes the scan's exact Lance version, snapshot
+generation, Arrow schema (including nested nullability), source fragment set,
+and row-ID mode. Workers receive only fragment-owned scan splits. Every worker
+reopens the frozen generation and validates each input row ID against the
+authorized source fragments and current deletion state. Stable row IDs are
+resolved through Lance's row-ID index; physical row addresses are validated as
+live offsets before any artifact is created.
+
+A `DELETE` produces fragment deletion state. An `UPDATE` evaluates the bound
+DuckDB `SET` expressions against rows taken from the frozen dataset, writes
+replacement fragments, preserves inline stable row IDs, and produces the
+matching source deletions. Each worker returns a strict uncommitted Lance
+transaction carrying the operation, query, task-attempt, mutation kind, schema,
+and affected-row identities. The worker object-store adapter records the exact
+`data/` and `_deletions/` objects created by that attempt, so failures before a
+transaction can be encoded clean only that attempt's objects without a shared
+directory diff.
+
+The coordinator rejects duplicate transactions, multiple selected attempts for
+one logical task, overlapping source fragments, stale or unauthorized fragment
+metadata, and any version, generation, schema, fragment, or index change. It
+renumbers independently written replacement fragments, combines all selected
+changes into one Lance `UPDATE` or `DELETE` transaction, and calls the commit
+path exactly once with retries disabled. A zero-match mutation creates no
+artifacts and no dataset version. Mutation attempt manifests use the same
+winner/loser ownership lifecycle as append writes.
+
+Compaction, optimize, merge, and other maintenance operations remain
+unsupported by the distributed adapter. Vane selection fails closed instead of
+falling back to coordinator-local mutation until those operations can use the
+same source-and-destination fragment lifecycle.
+
 Before a coordinator commit starts, abort and validation failures perform
 best-effort cleanup of the exact data files named by the rejected transactions
 and durable attempt manifests. Cleanup never deletes a file referenced by the
@@ -49,10 +84,10 @@ overwrite has already made that version historical. If commit execution has
 started and its outcome is unknown, selected manifests and files are retained
 for conservative recovery.
 
-Worker finalization errors rely on Lance's native uncommitted-write failure
-contract, which drops an in-progress writer and removes already completed
-fragments before returning the error; `skip_auto_cleanup` applies only to
-post-commit version cleanup.
+Append worker finalization errors rely on Lance's native uncommitted-write
+failure contract. Mutation workers additionally track every attempt-owned data
+or deletion object and remove it on any known pre-result failure;
+`skip_auto_cleanup` applies only to post-commit version cleanup.
 
 Distributed Lance writes require DuckDB auto-commit mode. The provider rejects
 explicit transactions before freezing a worker plan, preparing a CTAS target,
@@ -96,29 +131,28 @@ the same Vane wheel retain the ordinary secret and REST behavior.
 ## Supported SQL surface
 
 The distributed path is selected through Vane's standard relation write APIs,
-which correspond to DuckDB `INSERT INTO` and directory-namespace
-`CREATE TABLE AS`. Column names, logical types, nullability, storage-version
-selection, target version, target generation, and task identities are checked
-before commit.
+which correspond to DuckDB `INSERT INTO`, directory-namespace
+`CREATE TABLE AS`, `UPDATE`, and `DELETE`. Column names, logical types,
+nullability, storage-version selection, target version, target generation, and
+task identities are checked before commit.
 
 `CREATE TABLE AS IF NOT EXISTS` and `CREATE OR REPLACE TABLE AS` are not
 distributed. If Vane selects the extension write provider for those forms, the
-adapter rejects them explicitly. Other Lance mutations, including `UPDATE`,
-`DELETE`, `MERGE`, schema evolution, index changes, and REST namespace writes,
-continue to use their existing native paths and are outside this distributed
-write contract.
+adapter rejects them explicitly. `MERGE`, schema evolution, index changes,
+maintenance, and REST namespace writes continue to use their existing native
+paths and are outside this distributed write contract.
 
 ## Validation
 
-The Vane workflow has a dedicated two-worker distributed-write job. It installs
-the statically linked wheel into a fresh environment and verifies local shared
-storage plus MinIO-backed S3. The contract tests cover distributed `INSERT`,
-distributed `CREATE TABLE AS`, empty input, worker-result metadata, exact row
-counts, single-version coordinator commits, failed-CTAS prepared-target
-retention and explicit cleanup before retry, attempt-manifest removal, explicit
-transaction rejection, and native single-node write fallback. Rust tests also
-exercise frozen target type validation, vector compatibility, winner retention,
-successful loser cleanup, and post-commit live-file protection. The local
-pipeline also evolves a target type through a second catalog connection and
-verifies that a stale bound writer cannot publish rows. The ordinary DuckDB
-build and test lane remain independent of the Vane ABI.
+The Vane workflow has a dedicated two-worker distributed-write-and-mutation
+job. It installs the statically linked wheel into a fresh environment and
+verifies local shared storage plus MinIO-backed S3. The contract tests cover
+distributed `INSERT`, `CREATE TABLE AS`, `UPDATE`, and `DELETE`; zero-match
+mutations; multiple source fragments; stable row IDs; exact readback; worker
+failure cleanup; stale-plan rejection; worker-result metadata; exact row
+counts; single-version coordinator commits; failed-CTAS prepared-target
+retention and explicit cleanup before retry; attempt-manifest removal; explicit
+transaction rejection; and native single-node fallback. Rust tests exercise
+frozen target validation, winner/loser attempt cleanup, duplicate selection,
+and post-commit live-file protection. The ordinary DuckDB build and test lane
+remains independent of the Vane ABI.

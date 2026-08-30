@@ -696,7 +696,11 @@ static string LanceDistributedSnapshotCacheKey(ClientContext &context,
   return key;
 }
 
-static void CaptureLanceDistributedSnapshot(LanceScanBindData &bind_data) {
+static void CaptureLanceDistributedSnapshot(
+#ifdef LANCE_VANE_DISTRIBUTED
+    ClientContext &context,
+#endif
+    LanceScanBindData &bind_data) {
   bind_data.dataset_version = lance_dataset_version(bind_data.dataset);
   if (bind_data.dataset_version == 0) {
     throw IOException("Failed to resolve Lance dataset version" +
@@ -706,6 +710,14 @@ static void CaptureLanceDistributedSnapshot(LanceScanBindData &bind_data) {
       LanceDatasetGenerationId(bind_data.dataset, bind_data.file_path,
                                LanceScanHasPrivateDiagnostics(bind_data));
   bind_data.distributed_scan_token = UUID::ToString(UUID::GenerateRandomUUID());
+
+#ifdef LANCE_VANE_DISTRIBUTED
+  // The bind data owns this exact snapshot for the lifetime of the current
+  // plan. Do not also retain it as the connection's latest-path cache entry:
+  // a Vane coordinator can commit a distributed mutation in another process,
+  // and the caller's next query must reopen the new latest version.
+  LanceInvalidateDatasetCacheForPath(context, bind_data.file_path);
+#endif
 }
 
 static shared_ptr<LanceDatasetCacheEntry>
@@ -1959,7 +1971,7 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
       !replay_path.empty()) {
     result->file_path = std::move(replay_path);
     result->distributed_replayable = true;
-    CaptureLanceDistributedSnapshot(*result);
+    CaptureLanceDistributedSnapshot(context, *result);
   }
 #endif
 
@@ -5536,7 +5548,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
       !replay_path.empty() && !result->distributed_namespace_session_mismatch) {
     result->file_path = std::move(replay_path);
     result->distributed_replayable = true;
-    CaptureLanceDistributedSnapshot(*result);
+    CaptureLanceDistributedSnapshot(context, *result);
   }
 #endif
 

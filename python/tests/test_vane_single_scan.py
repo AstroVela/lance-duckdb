@@ -91,7 +91,7 @@ def test_single_node_lance_scan(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_single_node_lance_insert_and_ctas_keep_native_execution(
+def test_single_node_lance_writes_and_mutations_keep_native_execution(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -112,11 +112,19 @@ def test_single_node_lance_insert_and_ctas_keep_native_execution(
 
         source.insert_into("lance_write.main.insert_target")
         source.create("lance_write.main.ctas_target")
+        connection.table("lance_write.main.insert_target").update(
+            {"value": vane.lit("native-update")},
+            condition=vane.col("id") < 4,
+        )
+        connection.table("lance_write.main.insert_target").delete(
+            condition=vane.col("id") >= 10
+        )
 
         assert connection.execute(
-            "SELECT count(*)::BIGINT, sum(id)::BIGINT "
+            "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
+            "count(*) FILTER (WHERE value = 'native-update')::BIGINT "
             "FROM lance_write.main.insert_target"
-        ).fetchone() == (12, 66)
+        ).fetchone() == (10, 45, 4)
         assert connection.execute(
             "SELECT count(*)::BIGINT, sum(id)::BIGINT "
             "FROM lance_write.main.ctas_target"

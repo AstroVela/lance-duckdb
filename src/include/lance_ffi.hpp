@@ -268,6 +268,34 @@ uint64_t lance_distributed_transaction_artifact_size(void *transaction,
 uint64_t lance_distributed_transaction_byte_count(void *transaction);
 void lance_free_distributed_transaction(void *transaction);
 
+void *lance_distributed_create_mutation_transaction(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, void *session, uint8_t mutation_kind,
+    uint64_t expected_version, const char *expected_generation,
+    const char *operation_id, const char *query_id, const char *task_attempt_id,
+    const char *schema_fingerprint, const uint64_t *source_fragment_ids,
+    size_t source_fragment_count, const uint64_t *row_ids, size_t row_id_count,
+    const char **set_columns, const uint8_t **set_expr_irs,
+    const size_t *set_expr_ir_lengths, size_t set_count,
+    uint64_t max_rows_per_file, uint64_t max_rows_per_group,
+    uint64_t max_bytes_per_file);
+void *lance_distributed_decode_mutation_transaction(
+    const uint8_t *bytes, size_t bytes_len, uint8_t mutation_kind,
+    uint64_t expected_version, const char *operation_id, const char *query_id,
+    const char *task_attempt_id, const char *schema_fingerprint,
+    const uint64_t *source_fragment_ids, size_t source_fragment_count,
+    uint64_t row_count);
+const uint8_t *lance_distributed_mutation_transaction_bytes(void *transaction,
+                                                            size_t *out_len);
+size_t lance_distributed_mutation_transaction_artifact_count(void *transaction);
+const char *
+lance_distributed_mutation_transaction_artifact_path(void *transaction,
+                                                     size_t index);
+uint64_t lance_distributed_mutation_transaction_artifact_size(void *transaction,
+                                                              size_t index);
+uint64_t lance_distributed_mutation_transaction_byte_count(void *transaction);
+void lance_free_distributed_mutation_transaction(void *transaction);
+
 int32_t lance_distributed_commit_empty_create(const char *path,
                                               const char **option_keys,
                                               const char **option_values,
@@ -278,6 +306,14 @@ int32_t lance_distributed_commit_append_transactions(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, void *session, uint64_t expected_version,
     const char *expected_generation, const char *operation_id,
+    const uint8_t **transaction_bytes, const size_t *transaction_lengths,
+    size_t transaction_count, uint8_t *out_commit_started);
+int32_t lance_distributed_commit_mutation_transactions(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, void *session, uint8_t mutation_kind,
+    uint64_t expected_version, const char *expected_generation,
+    const char *operation_id, const char *schema_fingerprint,
+    const uint64_t *source_fragment_ids, size_t source_fragment_count,
     const uint8_t **transaction_bytes, const size_t *transaction_lengths,
     size_t transaction_count, uint8_t *out_commit_started);
 int32_t lance_distributed_publish_attempt_manifest(
@@ -295,6 +331,26 @@ int32_t lance_distributed_release_attempt_manifests(
     size_t options_len, const char *operation_id,
     const char **released_task_attempt_ids, size_t released_task_attempt_count);
 int32_t lance_distributed_cleanup_append_transaction(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, const char *operation_id, const uint8_t *bytes,
+    size_t bytes_len);
+int32_t lance_distributed_publish_mutation_attempt_manifest(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, uint8_t mutation_kind, uint64_t expected_version,
+    const char *expected_generation, const char *operation_id,
+    const char *query_id, const char *task_attempt_id,
+    const char *schema_fingerprint, const uint64_t *source_fragment_ids,
+    size_t source_fragment_count, const uint8_t **transaction_bytes,
+    const size_t *transaction_lengths, size_t transaction_count);
+int32_t lance_distributed_cleanup_mutation_attempt_manifests(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, const char *operation_id,
+    const char **retained_task_attempt_ids, size_t retained_task_attempt_count);
+int32_t lance_distributed_release_mutation_attempt_manifests(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, const char *operation_id,
+    const char **released_task_attempt_ids, size_t released_task_attempt_count);
+int32_t lance_distributed_cleanup_mutation_transaction(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const char *operation_id, const uint8_t *bytes,
     size_t bytes_len);
