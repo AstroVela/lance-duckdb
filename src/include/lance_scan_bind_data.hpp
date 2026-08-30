@@ -6,6 +6,9 @@
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_vane_search.hpp"
+#endif
 
 #include <cstdint>
 
@@ -54,6 +57,10 @@ struct LanceScanBindData : public TableFunctionData {
   vector<int64_t> distributed_fragment_row_counts;
   vector<uint64_t> distributed_fragment_bytes_on_disk;
   vector<uint64_t> selected_fragment_ids;
+  // Coordinator-only standard REST resolution result. It is never serialized;
+  // an admitted worker bind is converted to the existing direct physical scan
+  // representation before transport.
+  LanceVanePhysicalCandidate distributed_rest_candidate;
 #endif
 
   bool sampling_pushed_down = false;

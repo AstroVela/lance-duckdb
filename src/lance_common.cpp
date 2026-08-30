@@ -17,6 +17,7 @@
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
+#include <algorithm>
 #include <cstdlib>
 #endif
 #include <cstring>
@@ -885,6 +886,37 @@ void ResolveLanceStorageOptionsForDistributedRead(ClientContext &context,
     // replays the query session through DuckDB's s3_* settings instead.
     FillLanceStorageOptionsFromDuckDBS3Settings(context, out_keys, out_values);
   }
+}
+
+bool LanceVaneDirectoryNamespaceSessionMatches(
+    ClientContext &context, const LanceNamespaceTableConfig &config) {
+  string current_root;
+  vector<string> current_keys;
+  vector<string> current_values;
+  ResolveLanceStorageOptionsForDistributedRead(
+      context, config.root, current_root, current_keys, current_values);
+  if (current_root != config.root ||
+      current_keys.size() != current_values.size() ||
+      config.option_keys.size() != config.option_values.size()) {
+    return false;
+  }
+
+  vector<pair<string, string>> current_options;
+  vector<pair<string, string>> attached_options;
+  current_options.reserve(current_keys.size());
+  attached_options.reserve(config.option_keys.size());
+  for (idx_t option_idx = 0; option_idx < current_keys.size(); option_idx++) {
+    current_options.emplace_back(current_keys[option_idx],
+                                 current_values[option_idx]);
+  }
+  for (idx_t option_idx = 0; option_idx < config.option_keys.size();
+       option_idx++) {
+    attached_options.emplace_back(config.option_keys[option_idx],
+                                  config.option_values[option_idx]);
+  }
+  std::sort(current_options.begin(), current_options.end());
+  std::sort(attached_options.begin(), attached_options.end());
+  return current_options == attached_options;
 }
 #endif
 

@@ -138,6 +138,10 @@ string LanceVaneTableDiagnosticPath(const LanceTableEntry &table,
                                     const string &path);
 string LanceVaneTableFormatErrorSuffix(const LanceTableEntry &table,
                                        const string &path);
+// Return whether the current query-session storage settings exactly match
+// those captured when a directory namespace was attached.
+bool LanceVaneDirectoryNamespaceSessionMatches(
+    ClientContext &context, const LanceNamespaceTableConfig &config);
 #endif
 
 void FillLanceNamespaceQueryConfig(
