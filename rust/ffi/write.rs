@@ -684,6 +684,10 @@ fn validate_frozen_target_field_values(
         ));
     }
 
+    // Mirror lance-file's FileWriter::verify_field_nullability: it recursively
+    // checks every physical child array without applying ancestor validity
+    // masks. This makes Vane reject frozen-target batches at ingestion with
+    // native Lance semantics.
     match field.data_type() {
         DataType::Struct(fields) => {
             let values = array
@@ -2187,8 +2191,17 @@ mod tests {
         let input_fields: arrow_schema::Fields =
             vec![Arc::new(Field::new("value", DataType::Int32, true))].into();
         let child = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
-        let active_struct = StructArray::new(input_fields, vec![child], None);
+        let active_struct = StructArray::new(input_fields.clone(), vec![child.clone()], None);
         let error = validate_frozen_target_field_values(&payload, &active_struct, payload.name())
+            .unwrap_err();
+        assert!(error.message.contains("'payload.value' contains a null"));
+
+        let masked_struct = StructArray::new(
+            input_fields,
+            vec![child],
+            Some(arrow::buffer::NullBuffer::from(vec![true, false])),
+        );
+        let error = validate_frozen_target_field_values(&payload, &masked_struct, payload.name())
             .unwrap_err();
         assert!(error.message.contains("'payload.value' contains a null"));
 
