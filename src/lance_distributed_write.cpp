@@ -95,6 +95,7 @@ struct LanceFrozenDirectoryTargetSnapshot {
   uint64_t version = 0;
   string generation_id;
   LanceArrowNullability nullability;
+  vector<uint64_t> fragment_ids;
 };
 
 struct LanceDistributedCommitEnvelope {
@@ -695,6 +696,16 @@ struct LanceCStringDeleter {
   }
 };
 
+struct LanceFragmentStatsListDeleter {
+  size_t len;
+
+  void operator()(LanceFragmentStats *stats) const {
+    if (stats) {
+      lance_free_fragment_stats_list(stats, len);
+    }
+  }
+};
+
 static string DatasetGenerationId(ClientContext &context, const string &path,
                                   void *dataset) {
   auto *generation = lance_dataset_generation_id(dataset);
@@ -729,10 +740,9 @@ static pair<uint64_t, string> CaptureTargetSnapshot(ClientContext &context,
   return {version, DatasetGenerationId(context, path, dataset.get())};
 }
 
-static LanceFrozenDirectoryTargetSnapshot
-CaptureFrozenDirectoryTargetSnapshot(const string &path,
-                                     const vector<string> &option_keys,
-                                     const vector<string> &option_values) {
+static LanceFrozenDirectoryTargetSnapshot CaptureFrozenDirectoryTargetSnapshot(
+    const string &path, const vector<string> &option_keys,
+    const vector<string> &option_values, bool include_fragment_ids) {
   if (option_keys.size() != option_values.size()) {
     throw InternalException(
         "Distributed Lance target has mismatched storage options");
@@ -772,6 +782,23 @@ CaptureFrozenDirectoryTargetSnapshot(const string &path,
   result.generation_id = std::move(generation_id);
   result.nullability =
       CaptureDatasetSchemaNullability(dataset.get(), path, redact);
+  if (include_fragment_ids) {
+    size_t fragment_count = 0;
+    auto *fragment_stats = lance_dataset_list_distributed_fragment_stats(
+        dataset.get(), &fragment_count);
+    if (!fragment_stats) {
+      throw IOException("Failed to list distributed Lance target fragments" +
+                        LanceVaneFormatErrorSuffix(path, redact));
+    }
+    unique_ptr<LanceFragmentStats, LanceFragmentStatsListDeleter>
+        fragment_stats_owner(fragment_stats,
+                             LanceFragmentStatsListDeleter{fragment_count});
+    result.fragment_ids.reserve(fragment_count);
+    for (size_t fragment_idx = 0; fragment_idx < fragment_count;
+         fragment_idx++) {
+      result.fragment_ids.push_back(fragment_stats[fragment_idx].fragment_id);
+    }
+  }
   return result;
 }
 
@@ -906,7 +933,6 @@ public:
   vector<LogicalType> input_types;
   uint64_t mutation_version = 0;
   string mutation_generation_id;
-  vector<uint64_t> mutation_source_fragment_ids;
   idx_t mutation_row_id_index = DConstants::INVALID_INDEX;
   vector<string> mutation_set_columns;
   vector<string> mutation_set_expr_irs;
@@ -1057,7 +1083,7 @@ void LanceDistributedWriteProvider::Impl::InitializeInsert() {
   }
   dataset_path = ResolveReplayPath(*context, dataset_path);
   auto snapshot = CaptureFrozenDirectoryTargetSnapshot(
-      dataset_path, attached_option_keys, attached_option_values);
+      dataset_path, attached_option_keys, attached_option_values, false);
 
   transport.write_kind = LanceDistributedWriteKind::INSERT;
   transport.operation_id = UUID::ToString(UUID::GenerateRandomUUID());
@@ -1122,7 +1148,7 @@ void LanceDistributedWriteProvider::Impl::InitializeMutation() {
   }
   dataset_path = ResolveReplayPath(*context, dataset_path);
   auto snapshot = CaptureFrozenDirectoryTargetSnapshot(
-      dataset_path, attached_option_keys, attached_option_values);
+      dataset_path, attached_option_keys, attached_option_values, true);
   if (snapshot.version != mutation_version ||
       snapshot.generation_id != mutation_generation_id) {
     throw TransactionException(
@@ -1162,7 +1188,7 @@ void LanceDistributedWriteProvider::Impl::InitializeMutation() {
   for (idx_t index = 0; index < input_types.size(); index++) {
     transport.input_names.push_back("input_" + to_string(index));
   }
-  transport.source_fragment_ids = mutation_source_fragment_ids;
+  transport.source_fragment_ids = std::move(snapshot.fragment_ids);
   std::sort(transport.source_fragment_ids.begin(),
             transport.source_fragment_ids.end());
   transport.row_id_index = mutation_row_id_index;
@@ -1717,7 +1743,6 @@ unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedDeleteProvider(
   impl->input_types = input_types;
   impl->mutation_version = scan_bind.dataset_version;
   impl->mutation_generation_id = scan_bind.dataset_generation_id;
-  impl->mutation_source_fragment_ids = scan_bind.distributed_fragment_ids;
   impl->mutation_row_id_index = row_id_index;
   impl->mutation_uses_take_splits = !scan_bind.take_row_ids.empty();
   return unique_ptr<LanceDistributedWriteProvider>(
@@ -1735,7 +1760,6 @@ unique_ptr<LanceDistributedWriteProvider> CreateLanceDistributedUpdateProvider(
   impl->input_types = input_types;
   impl->mutation_version = scan_bind.dataset_version;
   impl->mutation_generation_id = scan_bind.dataset_generation_id;
-  impl->mutation_source_fragment_ids = scan_bind.distributed_fragment_ids;
   impl->mutation_row_id_index = row_id_index;
   impl->mutation_set_columns = set_columns;
   impl->mutation_set_expr_irs = set_expr_irs;
