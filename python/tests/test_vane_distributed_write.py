@@ -63,6 +63,32 @@ def _write_failure_source(connection, path: str | Path) -> None:
     )
 
 
+def _write_upstream_container_target(path: Path) -> None:
+    import lance
+    import pyarrow as pa
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("values", pa.list_(pa.float32())),
+            pa.field("vector", pa.list_(pa.float32(), 3)),
+        ]
+    )
+    table = pa.Table.from_arrays(
+        [
+            pa.array([-1], type=schema.field("id").type),
+            pa.array([[0.5, 1.5]], type=schema.field("values").type),
+            pa.array([[-1.0, 0.0, 1.0]], type=schema.field("vector").type),
+        ],
+        schema=schema,
+    )
+    lance.write_dataset(table, str(path), mode="create")
+
+    written_schema = lance.dataset(str(path)).schema
+    assert written_schema.field("values").type.value_field.name == "item"
+    assert written_schema.field("vector").type.value_field.name == "item"
+
+
 def _manifest_count(connection, path: str | Path) -> int:
     pattern = f"{str(path).rstrip('/')}/_versions/*.manifest"
     return int(
@@ -325,6 +351,34 @@ def _exercise_insert_and_ctas(
     assert _manifest_count(connection, source_path) == 1
 
 
+def _exercise_upstream_container_target(
+    connection,
+    capture: DistributedWriteCapture,
+    *,
+    catalog: str,
+    target_path: Path,
+) -> None:
+    source = connection.sql(
+        f"SELECT id, [id::FLOAT, (id + 1)::FLOAT]::FLOAT[] AS values, "
+        f"[id::FLOAT, (id + 1)::FLOAT, (id + 2)::FLOAT]::FLOAT[3] AS vector "
+        f"FROM {catalog}.main.source"
+    )
+    capture.require_write(
+        "distributed Lance INSERT into an upstream container target",
+        lambda: source.insert_into(f"{catalog}.main.upstream_container_target"),
+        expected_name="insert",
+        expected_rows=80,
+        minimum_task_results=2,
+    )
+    assert _manifest_count(connection, target_path) == 2
+    assert _attempt_manifest_count(connection, target_path) == 0
+    assert connection.execute(
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT, "
+        f'sum(list_sum("values"))::DOUBLE, sum(vector[1])::DOUBLE '
+        f"FROM {catalog}.main.upstream_container_target"
+    ).fetchone() == (81, 3159, 6402.0, 3159.0)
+
+
 def _exercise_failed_ctas_retention_and_explicit_retry(
     connection,
     capture: DistributedWriteCapture,
@@ -576,9 +630,11 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
     stale_type_path = root / "stale_target.lance"
     required_target_path = root / "required_target.lance"
     nested_required_target_path = root / "nested_required_target.lance"
+    upstream_container_target_path = root / "upstream_container_target.lance"
     try:
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
+        _write_upstream_container_target(upstream_container_target_path)
         connection.execute(f"ATTACH {_sql_literal(root)} AS lance_write (TYPE LANCE)")
         _exercise_insert_and_ctas(
             connection,
@@ -588,6 +644,12 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
             insert_path=insert_path,
             ctas_path=ctas_path,
             empty_ctas_path=empty_ctas_path,
+        )
+        _exercise_upstream_container_target(
+            connection,
+            write_capture,
+            catalog="lance_write",
+            target_path=upstream_container_target_path,
         )
         _exercise_failed_ctas_retention_and_explicit_retry(
             connection,

@@ -768,6 +768,7 @@ jobs:
           "${RUNNER_TEMP}/vane-lance-distributed-write/bin/python" -m pip install \
             "${wheels[0]}" \
             "grpcio>=1.42.0" \
+            "pylance==1.0.0" \
             "pytest>=8" \
             "ray==2.58.0"
 

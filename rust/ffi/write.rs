@@ -522,6 +522,22 @@ fn select_writer_output_schema(state: &WriterState, inferred_schema: SchemaRef) 
 }
 
 #[cfg(feature = "vane-distributed")]
+fn frozen_target_container_field_name_compatible(input: &str, target: &str) -> bool {
+    fn is_synthetic(name: &str) -> bool {
+        name.is_empty() || matches!(name, "item" | "l")
+    }
+
+    input == target || (is_synthetic(input) && is_synthetic(target))
+}
+
+#[cfg(feature = "vane-distributed")]
+fn frozen_target_container_field_compatible(input: &Field, target: &Field) -> bool {
+    frozen_target_container_field_name_compatible(input.name(), target.name())
+        && input.is_nullable() == target.is_nullable()
+        && frozen_target_type_compatible(input.data_type(), target.data_type())
+}
+
+#[cfg(feature = "vane-distributed")]
 fn frozen_target_vector_dimension(input_type: &DataType, target_type: &DataType) -> Option<usize> {
     let input_child = match input_type {
         DataType::List(child) | DataType::LargeList(child)
@@ -534,7 +550,7 @@ fn frozen_target_vector_dimension(input_type: &DataType, target_type: &DataType)
     let DataType::FixedSizeList(target_child, dimension) = target_type else {
         return None;
     };
-    if *dimension <= 0 || input_child.as_ref() != target_child.as_ref() {
+    if *dimension <= 0 || !frozen_target_container_field_compatible(input_child, target_child) {
         return None;
     }
     usize::try_from(*dimension).ok()
@@ -568,13 +584,13 @@ fn frozen_target_type_compatible(input: &DataType, target: &DataType) -> bool {
         (
             DataType::List(input_field) | DataType::LargeList(input_field),
             DataType::List(target_field) | DataType::LargeList(target_field),
-        ) => frozen_target_field_compatible(input_field, target_field),
+        ) => frozen_target_container_field_compatible(input_field, target_field),
         (
             DataType::FixedSizeList(input_field, input_dimension),
             DataType::FixedSizeList(target_field, target_dimension),
         ) => {
             input_dimension == target_dimension
-                && frozen_target_field_compatible(input_field, target_field)
+                && frozen_target_container_field_compatible(input_field, target_field)
         }
         (DataType::Struct(input_fields), DataType::Struct(target_fields)) => {
             input_fields.len() == target_fields.len()
@@ -2154,15 +2170,16 @@ mod tests {
         )]));
         configure_frozen_target_schema(&string_input, &string_target, &mut candidates).unwrap();
 
-        let vector_child = Arc::new(Field::new("item", DataType::Float32, true));
+        let duckdb_list_child = Arc::new(Field::new("l", DataType::Float32, true));
+        let upstream_list_child = Arc::new(Field::new("item", DataType::Float32, true));
         let vector_input = Arc::new(Schema::new(vec![Field::new(
             "vector",
-            DataType::List(vector_child.clone()),
+            DataType::List(duckdb_list_child),
             true,
         )]));
         let vector_target = Schema::new(vec![Field::new(
             "vector",
-            DataType::FixedSizeList(vector_child, 3),
+            DataType::FixedSizeList(upstream_list_child.clone(), 3),
             true,
         )]);
         let mut candidates = vec![VectorConversion {
@@ -2175,9 +2192,41 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].dim, 3);
 
-        let variable_target = vector_input.as_ref().clone();
+        let variable_target = Schema::new(vec![Field::new(
+            "vector",
+            DataType::List(upstream_list_child.clone()),
+            true,
+        )]);
         configure_frozen_target_schema(&vector_input, &variable_target, &mut candidates).unwrap();
         assert!(candidates.is_empty());
+
+        let duckdb_fixed =
+            DataType::FixedSizeList(Arc::new(Field::new("", DataType::Float32, true)), 3);
+        let upstream_fixed = DataType::FixedSizeList(upstream_list_child, 3);
+        assert!(frozen_target_type_compatible(
+            &duckdb_fixed,
+            &upstream_fixed
+        ));
+
+        let custom_list = DataType::List(Arc::new(Field::new(
+            "custom_element",
+            DataType::Float32,
+            true,
+        )));
+        assert!(!frozen_target_type_compatible(
+            &custom_list,
+            vector_input.field(0).data_type()
+        ));
+
+        let renamed_nested_target = Schema::new(vec![Field::new(
+            "value",
+            DataType::Struct(vec![Arc::new(Field::new("renamed", DataType::Int32, true))].into()),
+            true,
+        )]);
+        let error =
+            configure_frozen_target_schema(&nested_input, &renamed_nested_target, &mut candidates)
+                .unwrap_err();
+        assert!(error.message.contains("frozen target has type Struct"));
     }
 
     #[test]
