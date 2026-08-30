@@ -37,6 +37,38 @@ cross-worker cache. Appends made after planning therefore do not change the
 query snapshot. Worker-backed scans fail explicitly if the required snapshot is
 deleted or replaced before it can be reopened.
 
+## Global search contract
+
+Vector, full-text, and hybrid search are admitted as global operations. Each
+search node produces exactly one authenticated global split, and Vane schedules
+that split on one worker. The worker executes Lance's global top-k operation,
+including hybrid reranking, against the frozen coordinator snapshot. Vane does
+not currently divide one search node into fragment candidates across multiple
+workers; that parallel execution model is tracked in
+[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
+
+Before split creation, the coordinator freezes the source class, physical URI,
+dataset version and generation, schema fingerprint, filter state, search
+arguments, and selected index plan. The index plan records the exact index
+segments selected for the snapshot and the fragments that require flat search
+when an index has partial coverage. A worker validates the complete state and
+its assigned split before execution. Retries must reuse the same assignment,
+and execution fails closed if the snapshot, dataset generation, schema, or
+selected index segments no longer match.
+
+For a standard REST namespace, the coordinator obtains a stable physical table
+URI and detailed metadata for the already-bound version. Credentials, vended
+storage options, presigned URLs, and REST endpoint details are not serialized.
+Workers open that physical snapshot directly and do not contact the namespace
+control plane. REST tables that cannot supply this stable, credential-free
+physical identity are rejected during planning.
+
+Search filter placement follows native Lance semantics. The search function's
+named filter participates in prefiltering, while namespace outer SQL predicates
+remain after top-k. A direct full-text or hybrid search with `prefilter = true`
+is rejected if every predicate cannot be represented at the same stage as the
+native implementation.
+
 ## SQL semantics
 
 Projection and Lance filter pushdown remain enabled inside each split. Global
@@ -117,14 +149,32 @@ registration time, including for single-node queries made with that wheel.
 Vane owns those global operators so a plan cannot apply them independently in
 each fragment split. The official DuckDB build retains these pushdowns.
 
+## Feature matrix
+
+| SQL surface | Vane execution | Current constraints |
+| --- | --- | --- |
+| Ordinary Lance scan | One split per fragment, scheduled across workers | The physical dataset and frozen snapshot must be replayable by every worker. |
+| `rowid`/`_rowid` point lookup | Ordered take splits, scheduled across workers | Duplicate `IN` candidates are normalized; final row order still requires `ORDER BY`. |
+| `lance_vector_search` | One authenticated global split on one worker | Global top-k semantics are preserved; cross-worker candidate search is tracked in #9. |
+| `lance_fts` | One authenticated global split on one worker | Global score ordering is preserved; cross-worker candidate search is tracked in #9. |
+| `lance_hybrid_search` | One authenticated global split on one worker | Vector/text retrieval and reranking remain one global operation; cross-worker execution is tracked in #9. |
+| Directory namespace reads | Resolved to a frozen replayable physical URI | Attach-time and planning-time storage state must agree. |
+| Standard REST namespace reads | Coordinator resolves the bound version; workers read the physical snapshot | Requires a materialized table URI plus detailed version and schema metadata; workers do not use the REST control plane. |
+| Coordinator-only `TYPE LANCE` storage secrets | Rejected for distributed execution | Use Vane's replayable query-session settings or credential provider. Native local queries retain secret support. |
+| `memory:` and `shared-memory:` datasets | Rejected for distributed execution | Their process-local state cannot be reopened by an independent worker. |
+
 ## Boundary
 
-The scan integration covers read-only table scans, including filters, projections,
-point-lookups, aggregates, sampling, global limits, empty datasets, and
-directory namespace tables. It deliberately excludes vector search, full-text
-search, hybrid search, and all index planning. REST namespace query scans are
-also excluded until that control plane can provide a stable replayable physical
-snapshot. Distributed writes have a separate
+The scan integration covers read-only table scans, including filters,
+projections, point lookups, aggregates, sampling, global limits, empty datasets,
+directory namespace tables, vector search, full-text search, hybrid search, and
+standard REST tables that provide a stable replayable physical snapshot.
+Parallelizing one global search across multiple workers remains outside this
+contract and is tracked in
+[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). Additional
+defensive limits for malformed internal `LSI1` collection counts are tracked in
+[Issue #10](https://github.com/AstroVela/lance-duckdb/issues/10). Distributed
+writes have a separate
 [write contract](./vane_distributed_write.md). Distributed replay of
 `TYPE LANCE` secret catalog entries is not part of either contract.
 
@@ -138,7 +188,11 @@ static wheel at the exact Vane and vcpkg revisions recorded in
 `vane-extension.toml`. The Vane-only vcpkg pin does not alter the root manifest
 used by official DuckDB builds. The wheel tests run from a fresh non-editable
 installation on a local Ray cluster with a coordinator-only head node and two
-execution workers. They cover split
-parallelism, point lookups, sampling, global limits, fixed snapshots,
-replacement detection, empty scans, directory namespaces, and MinIO-backed S3
-session replay, including static and temporary-profile credentials.
+execution workers. They cover split parallelism, point lookups, sampling,
+global limits, fixed snapshots, replacement detection, empty scans, directory
+namespaces, and MinIO-backed S3 session replay, including static and
+temporary-profile credentials. Advanced-read coverage also compares vector,
+full-text, and hybrid results with native execution; verifies singleton search
+splits, partial index coverage, frozen selected-index segments, retry identity,
+and stale-state rejection; and proves standard REST scans and searches continue
+from their physical snapshot after the namespace service is unavailable.
