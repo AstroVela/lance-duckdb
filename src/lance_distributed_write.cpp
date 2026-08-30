@@ -2074,6 +2074,9 @@ static void LanceDistributedWriteSink(ExecutionContext &context,
   if (input.size() == 0) {
     return;
   }
+  // Top-level DuckDB vectors can be checked directly here. The Rust writer
+  // validates nested Arrow values against the restored frozen schema after
+  // conversion and before buffering a worker batch.
   idx_t column_index = 0;
   for (idx_t field_index = 0;
        field_index < global.transport.target_schema_field_depths.size();

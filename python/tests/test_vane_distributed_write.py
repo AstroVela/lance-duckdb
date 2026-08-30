@@ -510,6 +510,7 @@ def _exercise_nested_not_null_target(
     capture: DistributedWriteCapture,
     *,
     catalog: str,
+    target_path: str | Path,
 ) -> None:
     connection.execute(
         f"CREATE TABLE {catalog}.main.nested_required_target "
@@ -536,6 +537,28 @@ def _exercise_nested_not_null_target(
         f"FROM {catalog}.main.nested_required_target"
     ).fetchone() == (3, 3)
 
+    manifest_count = _manifest_count(connection, target_path)
+    data_file_count = _data_file_count(connection, target_path)
+    previous_count = capture.dispatch_count
+    capture.last_result = None
+    child_null_source = connection.sql(
+        "SELECT struct_pack(value := NULL::INTEGER) AS payload"
+    )
+    with pytest.raises(
+        Exception,
+        match="Failed to write distributed Lance worker batch",
+    ):
+        child_null_source.insert_into(f"{catalog}.main.nested_required_target")
+    assert capture.dispatch_count == previous_count + 1
+    assert capture.last_result is None
+    assert _manifest_count(connection, target_path) == manifest_count
+    assert _data_file_count(connection, target_path) == data_file_count
+    assert _attempt_manifest_count(connection, target_path) == 0
+    assert connection.execute(
+        f"SELECT count(*)::BIGINT, sum(payload.value)::BIGINT "
+        f"FROM {catalog}.main.nested_required_target"
+    ).fetchone() == (3, 3)
+
 
 def test_two_worker_local_shared_lance_insert_and_ctas(
     tmp_path: Path, write_capture: DistributedWriteCapture
@@ -552,6 +575,7 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
     explicit_ctas_path = root / "explicit_ctas_target.lance"
     stale_type_path = root / "stale_target.lance"
     required_target_path = root / "required_target.lance"
+    nested_required_target_path = root / "nested_required_target.lance"
     try:
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
@@ -594,6 +618,7 @@ def test_two_worker_local_shared_lance_insert_and_ctas(
             connection,
             write_capture,
             catalog="lance_write",
+            target_path=nested_required_target_path,
         )
     finally:
         connection.close()
@@ -618,6 +643,7 @@ def test_two_worker_s3_lance_insert_and_ctas(
         failed_ctas_path = f"{root}/failed_ctas_target.lance"
         explicit_ctas_path = f"{root}/explicit_ctas_target.lance"
         required_target_path = f"{root}/required_target.lance"
+        nested_required_target_path = f"{root}/nested_required_target.lance"
         _write_source(connection, source_path)
         _write_failure_source(connection, failure_source_path)
         connection.execute(
@@ -656,6 +682,7 @@ def test_two_worker_s3_lance_insert_and_ctas(
             connection,
             write_capture,
             catalog="lance_s3_write",
+            target_path=nested_required_target_path,
         )
     finally:
         connection.close()

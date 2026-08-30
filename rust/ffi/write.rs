@@ -8,6 +8,8 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, Float64Builder};
+#[cfg(feature = "vane-distributed")]
+use arrow_array::MapArray;
 use arrow_array::{
     make_array, Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
     RecordBatch, RecordBatchReader, StructArray,
@@ -658,6 +660,109 @@ fn configure_frozen_target_schema(
         }
     }
     *vector_candidates = configured_candidates;
+    Ok(())
+}
+
+#[cfg(feature = "vane-distributed")]
+fn frozen_target_value_error(path: &str, message: &str) -> FfiError {
+    FfiError::new(
+        ErrorCode::DistributedWrite,
+        format!("distributed Lance worker input field '{path}' {message}"),
+    )
+}
+
+#[cfg(feature = "vane-distributed")]
+fn validate_frozen_target_field_values(
+    field: &Field,
+    array: &dyn Array,
+    path: &str,
+) -> FfiResult<()> {
+    if !field.is_nullable() && array.null_count() > 0 {
+        return Err(frozen_target_value_error(
+            path,
+            "contains a null, but the frozen target field is non-nullable",
+        ));
+    }
+
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    frozen_target_value_error(path, "has an invalid nested Arrow type")
+                })?;
+            if fields.len() != values.num_columns() {
+                return Err(frozen_target_value_error(
+                    path,
+                    "has an invalid nested Arrow field count",
+                ));
+            }
+            for (child_field, child_array) in fields.iter().zip(values.columns()) {
+                let child_path = format!("{path}.{}", child_field.name());
+                validate_frozen_target_field_values(
+                    child_field,
+                    child_array.as_ref(),
+                    &child_path,
+                )?;
+            }
+        }
+        DataType::List(child_field) => {
+            let values = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                frozen_target_value_error(path, "has an invalid nested Arrow type")
+            })?;
+            let child_path = format!("{path}.{}", child_field.name());
+            validate_frozen_target_field_values(
+                child_field,
+                values.values().as_ref(),
+                &child_path,
+            )?;
+        }
+        DataType::LargeList(child_field) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| {
+                    frozen_target_value_error(path, "has an invalid nested Arrow type")
+                })?;
+            let child_path = format!("{path}.{}", child_field.name());
+            validate_frozen_target_field_values(
+                child_field,
+                values.values().as_ref(),
+                &child_path,
+            )?;
+        }
+        DataType::FixedSizeList(child_field, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    frozen_target_value_error(path, "has an invalid nested Arrow type")
+                })?;
+            let child_path = format!("{path}.{}", child_field.name());
+            validate_frozen_target_field_values(
+                child_field,
+                values.values().as_ref(),
+                &child_path,
+            )?;
+        }
+        DataType::Map(entries_field, _) => {
+            let values = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                frozen_target_value_error(path, "has an invalid nested Arrow type")
+            })?;
+            let child_path = format!("{path}.{}", entries_field.name());
+            validate_frozen_target_field_values(entries_field, values.entries(), &child_path)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vane-distributed")]
+fn validate_frozen_target_values(batch: &RecordBatch) -> FfiResult<()> {
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        validate_frozen_target_field_values(field, column.as_ref(), field.name())?;
+    }
     Ok(())
 }
 
@@ -1454,6 +1559,11 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        #[cfg(feature = "vane-distributed")]
+        if guard.frozen_target_schema.is_some() {
+            validate_frozen_target_values(&input_batch)?;
+        }
+
         if guard.output_sender.is_none() {
             guard.buffered_batches.push(input_batch);
 
@@ -1938,7 +2048,8 @@ pub unsafe extern "C" fn lance_free_transaction(transaction: *mut c_void) {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::builder::{Int32Builder, ListBuilder, MapBuilder};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance::dataset::progress::WriteFragmentProgress;
@@ -2063,6 +2174,59 @@ mod tests {
         let variable_target = vector_input.as_ref().clone();
         configure_frozen_target_schema(&vector_input, &variable_target, &mut candidates).unwrap();
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn frozen_target_values_enforce_nested_nullability() {
+        let required_value = Arc::new(Field::new("value", DataType::Int32, false));
+        let payload = Field::new(
+            "payload",
+            DataType::Struct(vec![required_value].into()),
+            true,
+        );
+        let input_fields: arrow_schema::Fields =
+            vec![Arc::new(Field::new("value", DataType::Int32, true))].into();
+        let child = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
+        let active_struct = StructArray::new(input_fields, vec![child], None);
+        let error = validate_frozen_target_field_values(&payload, &active_struct, payload.name())
+            .unwrap_err();
+        assert!(error.message.contains("'payload.value' contains a null"));
+
+        let required_item = Arc::new(Field::new("item", DataType::Int32, false));
+        let items = Field::new("items", DataType::List(required_item), true);
+        let mut active_list_builder = ListBuilder::new(Int32Builder::new());
+        active_list_builder.values().append_value(1);
+        active_list_builder.values().append_null();
+        active_list_builder.append(true);
+        let active_list = active_list_builder.finish();
+        let error =
+            validate_frozen_target_field_values(&items, &active_list, items.name()).unwrap_err();
+        assert!(error.message.contains("'items.item' contains a null"));
+
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("keys", DataType::Int32, false)),
+                    Arc::new(Field::new("values", DataType::Int32, false)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let attributes = Field::new("attributes", DataType::Map(entries, false), true);
+        let mut active_map_builder =
+            MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+        active_map_builder.keys().append_value(1);
+        active_map_builder.values().append_null();
+        active_map_builder.append(true).unwrap();
+        let active_map = active_map_builder.finish();
+        let error =
+            validate_frozen_target_field_values(&attributes, &active_map, attributes.name())
+                .unwrap_err();
+        assert!(error
+            .message
+            .contains("'attributes.entries.values' contains a null"));
     }
 
     #[test]
