@@ -5,7 +5,6 @@
 #ifdef LANCE_VANE_DISTRIBUTED
 #include "duckdb/common/crypto/md5.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include "duckdb/main/client_context_state.hpp"
 #endif
 #include "duckdb/common/string_util.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
@@ -57,6 +56,7 @@
 #include "lance_table_entry.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
 #include "lance_vane_rest_resolution.hpp"
+#include "lance_vane_snapshot.hpp"
 #endif
 
 #include <algorithm>
@@ -587,47 +587,6 @@ static string LanceDatasetGenerationId(void *dataset,
   return generation;
 }
 
-class LanceDistributedSnapshotCacheState final : public ClientContextState {
-public:
-  shared_ptr<LanceDatasetCacheEntry> Get(const string &key) {
-    lock_guard<mutex> guard(lock);
-    auto entry = entries.find(key);
-    return entry == entries.end() ? nullptr : entry->second;
-  }
-
-  shared_ptr<LanceDatasetCacheEntry>
-  PutOrGetExisting(const string &key,
-                   shared_ptr<LanceDatasetCacheEntry> entry) {
-    lock_guard<mutex> guard(lock);
-    auto existing = entries.find(key);
-    if (existing != entries.end()) {
-      return existing->second;
-    }
-    entries.emplace(key, entry);
-    return entry;
-  }
-
-private:
-  mutex lock;
-  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> entries;
-};
-
-struct LanceDatasetHandleDeleter {
-  void operator()(void *dataset) const {
-    if (dataset) {
-      lance_close_dataset(dataset);
-    }
-  }
-};
-
-static shared_ptr<LanceDatasetCacheEntry>
-AdoptLanceDatasetHandle(void *dataset, const string &display_uri) {
-  std::unique_ptr<void, LanceDatasetHandleDeleter> owned(dataset);
-  auto entry = make_shared_ptr<LanceDatasetCacheEntry>(dataset, display_uri);
-  owned.release();
-  return entry;
-}
-
 static bool LanceScanHasPrivateDiagnostics(const LanceScanBindData &bind_data) {
   return bind_data.private_uri_diagnostics ||
          bind_data.distributed_replay_path_restricted ||
@@ -655,16 +614,6 @@ static string LanceScanDiagnosticPath(const LanceScanBindData &bind_data) {
 static string LanceScanErrorSuffix(const LanceScanBindData &bind_data) {
   return LanceVaneFormatErrorSuffix(bind_data.file_path,
                                     LanceScanHasPrivateDiagnostics(bind_data));
-}
-
-static string LanceDistributedSnapshotCacheKey(ClientContext &context,
-                                               const string &path,
-                                               uint64_t version,
-                                               const string &generation_id) {
-  auto key = LanceBuildPathDatasetCacheKey(context, path);
-  key += "|fixed-snapshot|" + to_string(version) + "|" +
-         to_string(generation_id.size()) + ":" + generation_id;
-  return key;
 }
 
 static void CaptureLanceDistributedSnapshot(
@@ -696,42 +645,8 @@ OpenLanceDistributedSnapshot(ClientContext &context, const string &path,
                              uint64_t version, const string &generation_id) {
   const bool private_diagnostics =
       LanceVanePathRequiresRedaction(context, path);
-  auto cache_key =
-      LanceDistributedSnapshotCacheKey(context, path, version, generation_id);
-  auto cache =
-      context.registered_state->GetOrCreate<LanceDistributedSnapshotCacheState>(
-          "lance_distributed_snapshot_cache_state");
-  if (auto cached = cache->Get(cache_key)) {
-    return cached;
-  }
-
-  auto *latest_dataset = LanceOpenDatasetForDistributedScan(context, path);
-  if (!latest_dataset) {
-    throw IOException("Failed to reopen Lance dataset on worker" +
-                      LanceVaneFormatErrorSuffix(path, private_diagnostics));
-  }
-  auto latest = AdoptLanceDatasetHandle(latest_dataset, path);
-  if (lance_dataset_version(latest_dataset) == version) {
-    if (LanceDatasetGenerationId(latest_dataset, path, private_diagnostics) !=
-        generation_id) {
-      throw IOException("Reopened Lance dataset generation does not match "
-                        "the coordinator snapshot");
-    }
-    return cache->PutOrGetExisting(cache_key, latest);
-  }
-
-  auto *fixed_dataset = lance_dataset_checkout_version(latest_dataset, version);
-  if (!fixed_dataset) {
-    throw IOException("Failed to reopen fixed Lance dataset version" +
-                      LanceVaneFormatErrorSuffix(path, private_diagnostics));
-  }
-  auto fixed = AdoptLanceDatasetHandle(fixed_dataset, path);
-  if (LanceDatasetGenerationId(fixed_dataset, path, private_diagnostics) !=
-      generation_id) {
-    throw IOException("Reopened Lance dataset generation does not match the "
-                      "coordinator snapshot");
-  }
-  return cache->PutOrGetExisting(cache_key, fixed);
+  return LanceVaneGetOrOpenSnapshot(context, path, version, generation_id,
+                                    private_diagnostics);
 }
 
 unique_ptr<FunctionData> LanceScanBindData::Copy() const {

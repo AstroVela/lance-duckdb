@@ -4,6 +4,7 @@
 #include "lance_secrets.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
 #include "lance_distributed_write.hpp"
+#include "lance_session_state.hpp"
 #endif
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -48,6 +49,9 @@ void LanceExtension::Load(ExtensionLoader &loader) {
                             "Enable deferred materialization for heavy columns "
                             "when filter pushdown fails",
                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+#ifdef LANCE_VANE_DISTRIBUTED
+  RegisterLanceVaneSessionOptions(config);
+#endif
   RegisterLanceScanOptimizer(config);
   RegisterLanceStorage(config);
   RegisterLanceReplacement(config);

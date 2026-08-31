@@ -228,6 +228,143 @@ fn open_dataset_with_storage_options_inner(
     Ok(DatasetHandle::new(dataset))
 }
 
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_open_dataset_version_with_session(
+    path: *const c_char,
+    version: u64,
+    session: *mut c_void,
+) -> *mut c_void {
+    match vane_open_dataset_version_inner(path, version, None, session) {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_open_dataset_version_with_storage_options_and_session(
+    path: *const c_char,
+    version: u64,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    session: *mut c_void,
+) -> *mut c_void {
+    let storage_options = match unsafe {
+        // SAFETY: The caller supplies arrays containing `options_len` C string pointers.
+        vane_storage_options_from_ffi(option_keys, option_values, options_len)
+    } {
+        Ok(storage_options) => storage_options,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return ptr::null_mut();
+        }
+    };
+    match vane_open_dataset_version_inner(path, version, Some(storage_options), session) {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+unsafe fn vane_storage_options_from_ffi(
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+) -> FfiResult<HashMap<String, String>> {
+    if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "option_keys/option_values is null with non-zero length",
+        ));
+    }
+    if options_len == 0 {
+        return Ok(HashMap::new());
+    }
+
+    // SAFETY: The caller guarantees both pointer arrays contain `options_len` entries.
+    let keys = unsafe { slice_from_ptr(option_keys, options_len, "option_keys")? };
+    // SAFETY: The caller guarantees both pointer arrays contain `options_len` entries.
+    let values = unsafe { slice_from_ptr(option_values, options_len, "option_values")? };
+    let mut storage_options = HashMap::with_capacity(options_len);
+    for (idx, (&key_ptr, &value_ptr)) in keys.iter().zip(values.iter()).enumerate() {
+        if key_ptr.is_null() || value_ptr.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("option key/value is null at index {idx}"),
+            ));
+        }
+        // SAFETY: Each non-null pointer is required to reference a NUL-terminated C string.
+        let key = unsafe { CStr::from_ptr(key_ptr) }.to_str().map_err(|err| {
+            FfiError::new(ErrorCode::Utf8, format!("option_keys[{idx}] utf8: {err}"))
+        })?;
+        // SAFETY: Each non-null pointer is required to reference a NUL-terminated C string.
+        let value = unsafe { CStr::from_ptr(value_ptr) }
+            .to_str()
+            .map_err(|err| {
+                FfiError::new(ErrorCode::Utf8, format!("option_values[{idx}] utf8: {err}"))
+            })?;
+        storage_options.insert(key.to_string(), value.to_string());
+    }
+    Ok(storage_options)
+}
+
+#[cfg(feature = "vane-distributed")]
+fn vane_open_dataset_version_inner(
+    path: *const c_char,
+    version: u64,
+    storage_options: Option<HashMap<String, String>>,
+    session: *mut c_void,
+) -> FfiResult<DatasetHandle> {
+    if version == 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "dataset version must be greater than zero",
+        ));
+    }
+    // SAFETY: The FFI caller supplies a NUL-terminated path string.
+    let path_str = unsafe { cstr_to_str(path, "path")? };
+    // SAFETY: A non-null pointer is owned by this library and points to a SessionHandle.
+    let session = unsafe { optional_session_handle(session)? };
+    let dataset = match runtime::block_on(async {
+        let mut builder = DatasetBuilder::from_uri(path_str).with_version(version);
+        if let Some(storage_options) = storage_options {
+            builder = with_explicit_aws_credentials(builder, &storage_options);
+            builder = builder.with_storage_options(storage_options);
+        }
+        if let Some(session) = session {
+            builder = builder.with_session(session);
+        }
+        builder.load().await
+    }) {
+        Ok(Ok(dataset)) => Arc::new(dataset),
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("dataset version {version} open '{path_str}': {err}"),
+            ));
+        }
+        Err(err) => {
+            return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")));
+        }
+    };
+    record_dataset_open();
+    Ok(DatasetHandle::new(dataset))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     if !dataset.is_null() {

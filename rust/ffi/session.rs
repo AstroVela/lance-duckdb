@@ -8,6 +8,8 @@ use lance::session::Session;
 use lance_core::cache::{CacheBackend, MokaCacheBackend};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
+#[cfg(feature = "vane-distributed")]
+use crate::runtime;
 
 use super::types::SessionHandle;
 use super::util::{optional_session_handle, u64_to_usize, FfiError, FfiResult};
@@ -21,6 +23,20 @@ static COMMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 pub struct LanceSessionStats {
     pub size_bytes: u64,
     pub approx_num_items: u64,
+}
+
+#[cfg(feature = "vane-distributed")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LanceVaneSessionCacheStats {
+    pub index_hits: u64,
+    pub index_misses: u64,
+    pub index_num_entries: u64,
+    pub index_size_bytes: u64,
+    pub metadata_hits: u64,
+    pub metadata_misses: u64,
+    pub metadata_num_entries: u64,
+    pub metadata_size_bytes: u64,
 }
 
 #[repr(C)]
@@ -58,6 +74,18 @@ pub unsafe extern "C" fn lance_create_session(
             ptr::null_mut()
         }
     }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub extern "C" fn lance_vane_default_index_cache_size_bytes() -> u64 {
+    DEFAULT_INDEX_CACHE_SIZE as u64
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub extern "C" fn lance_vane_default_metadata_cache_size_bytes() -> u64 {
+    DEFAULT_METADATA_CACHE_SIZE as u64
 }
 
 fn create_session_inner(
@@ -141,6 +169,63 @@ fn session_get_stats_inner(session: *mut c_void) -> FfiResult<LanceSessionStats>
     })
 }
 
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_session_get_cache_stats(
+    session: *mut c_void,
+    out_stats: *mut LanceVaneSessionCacheStats,
+) -> i32 {
+    if !out_stats.is_null() {
+        // SAFETY: The caller provides writable storage for the output structure.
+        unsafe {
+            std::ptr::write_unaligned(out_stats, LanceVaneSessionCacheStats::default());
+        }
+    }
+
+    match vane_session_get_cache_stats_inner(session) {
+        Ok(stats) => {
+            clear_last_error();
+            if !out_stats.is_null() {
+                // SAFETY: The caller provides writable storage for the output structure.
+                unsafe {
+                    std::ptr::write_unaligned(out_stats, stats);
+                }
+            }
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+fn vane_session_get_cache_stats_inner(
+    session: *mut c_void,
+) -> FfiResult<LanceVaneSessionCacheStats> {
+    // SAFETY: A non-null pointer is owned by this library and points to a SessionHandle.
+    let Some(session) = (unsafe { optional_session_handle(session)? }) else {
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "session is null"));
+    };
+    let (index, metadata) = runtime::block_on(async {
+        let index = session.index_cache_stats().await;
+        let metadata = session.metadata_cache_stats().await;
+        (index, metadata)
+    })
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?;
+    Ok(LanceVaneSessionCacheStats {
+        index_hits: index.hits,
+        index_misses: index.misses,
+        index_num_entries: index.num_entries as u64,
+        index_size_bytes: index.size_bytes as u64,
+        metadata_hits: metadata.hits,
+        metadata_misses: metadata.misses,
+        metadata_num_entries: metadata.num_entries as u64,
+        metadata_size_bytes: metadata.size_bytes as u64,
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_debug_get_counters(out_counters: *mut LanceDebugCounters) -> i32 {
     if out_counters.is_null() {
@@ -176,6 +261,8 @@ mod tests {
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
+    #[cfg(feature = "vane-distributed")]
+    use lance::dataset::WriteMode;
     use lance::dataset::WriteParams;
     use lance::Dataset;
 
@@ -236,6 +323,101 @@ mod tests {
             let mut stats = LanceSessionStats::default();
             assert_eq!(lance_session_get_stats(session, &mut stats), 0);
 
+            lance_close_session(session);
+        }
+
+        let _ = fs::remove_dir_all(dataset_dir);
+    }
+
+    #[cfg(feature = "vane-distributed")]
+    #[test]
+    fn test_versioned_open_reuses_session_metadata_cache() {
+        let dataset_dir =
+            std::env::temp_dir().join(format!("ffi-versioned-session-{}", rand::random::<u64>()));
+        let uri = dataset_dir.to_string_lossy().to_string();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let first_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let first_reader =
+            RecordBatchIterator::new(vec![Ok(first_batch)].into_iter(), schema.clone());
+        let first = runtime::block_on(Dataset::write(
+            first_reader,
+            &uri,
+            Some(WriteParams::default()),
+        ))
+        .unwrap()
+        .unwrap();
+        let frozen_version = first.version_id();
+
+        let second_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))])
+                .unwrap();
+        let second_reader = RecordBatchIterator::new(vec![Ok(second_batch)].into_iter(), schema);
+        let latest = runtime::block_on(Dataset::write(
+            second_reader,
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..WriteParams::default()
+            }),
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(latest.version_id() > frozen_version);
+
+        unsafe {
+            lance_debug_reset_counters();
+            let session = lance_create_session(0, 0);
+            assert!(!session.is_null());
+            assert!(lance_vane_default_index_cache_size_bytes() > 0);
+            assert!(lance_vane_default_metadata_cache_size_bytes() > 0);
+
+            let uri_c = CString::new(uri.clone()).unwrap();
+            let first_open = super::super::dataset::lance_vane_open_dataset_version_with_session(
+                uri_c.as_ptr(),
+                frozen_version,
+                session,
+            );
+            assert!(!first_open.is_null());
+            assert_eq!(
+                super::super::dataset::lance_dataset_version(first_open),
+                frozen_version
+            );
+
+            let mut after_first = LanceVaneSessionCacheStats::default();
+            assert_eq!(
+                lance_vane_session_get_cache_stats(session, &mut after_first),
+                0
+            );
+            assert!(after_first.metadata_misses > 0);
+
+            let second_open = super::super::dataset::lance_vane_open_dataset_version_with_session(
+                uri_c.as_ptr(),
+                frozen_version,
+                session,
+            );
+            assert!(!second_open.is_null());
+            assert_eq!(
+                super::super::dataset::lance_dataset_version(second_open),
+                frozen_version
+            );
+
+            let mut after_second = LanceVaneSessionCacheStats::default();
+            assert_eq!(
+                lance_vane_session_get_cache_stats(session, &mut after_second),
+                0
+            );
+            assert!(after_second.metadata_hits > after_first.metadata_hits);
+
+            let mut counters = LanceDebugCounters::default();
+            assert_eq!(lance_debug_get_counters(&mut counters), 0);
+            assert_eq!(counters.dataset_open_count, 2);
+
+            super::super::dataset::lance_close_dataset(first_open);
+            super::super::dataset::lance_close_dataset(second_open);
             lance_close_session(session);
         }
 

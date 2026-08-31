@@ -29,13 +29,32 @@ The worker plan contains only portable scan state:
 - projection and filter state; and
 - the worker's assigned opaque fragment or take splits.
 
-Each worker opens the dataset with its replayed DuckDB session credential state,
-checks out the coordinator's exact version when necessary, and validates the
-snapshot identity.
+Each worker opens the coordinator's exact dataset version directly with its
+replayed DuckDB session credential state and validates the snapshot identity.
 There is no fallback to the latest version and no extension-specific lease or
 cross-worker cache. Appends made after planning therefore do not change the
 query snapshot. Worker-backed scans fail explicitly if the required snapshot is
 deleted or replaced before it can be reopened.
+
+Within one worker DuckDB database, ordinary scans and `lance_vector_search`,
+`lance_fts`, and `lance_hybrid_search` share the same Lance `Session`. Lance's
+native index and metadata caches are therefore reused instead of being
+reimplemented by the Vane adapter. The worker also keeps one connection-local
+fixed-snapshot handle cache keyed by resolved storage identity, version, and
+generation. Both ordinary scans and all three search functions use that cache.
+The frozen search index plan still selects the exact index segments for each
+query; a cache hit never changes index selection or snapshot validation.
+
+The in-memory caches are process-local, so each Ray worker warms independently.
+They are most effective when the runner keeps worker actors and their DuckDB
+database alive across tasks. The Vane-only database-global settings
+`lance_vane_index_cache_size_bytes` and
+`lance_vane_metadata_cache_size_bytes` set the per-database capacity before the
+first Lance access. Their defaults follow the linked Lance release. They cannot
+be changed after the shared Session is created. Configure them with `SET GLOBAL`
+on the source connection before its first Lance access. Vane captures those
+non-default DuckDB settings with the query connection snapshot and replays them
+after loading the statically linked extension on each worker database.
 
 ## Global search contract
 

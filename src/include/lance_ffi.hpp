@@ -25,6 +25,23 @@ int32_t lance_debug_get_counters(LanceDebugCounters *out_counters);
 void lance_debug_reset_counters();
 
 #ifdef LANCE_VANE_DISTRIBUTED
+typedef struct LanceVaneSessionCacheStats {
+  uint64_t index_hits;
+  uint64_t index_misses;
+  uint64_t index_num_entries;
+  uint64_t index_size_bytes;
+  uint64_t metadata_hits;
+  uint64_t metadata_misses;
+  uint64_t metadata_num_entries;
+  uint64_t metadata_size_bytes;
+} LanceVaneSessionCacheStats;
+
+uint64_t lance_vane_default_index_cache_size_bytes();
+uint64_t lance_vane_default_metadata_cache_size_bytes();
+int32_t
+lance_vane_session_get_cache_stats(void *session,
+                                   LanceVaneSessionCacheStats *out_stats);
+
 // Bit flags returned by lance_vane_classify_path. The implementation uses the
 // same URL conversion routine as Lance's object-store layer.
 static constexpr uint8_t LANCE_VANE_PATH_IS_URI = 1U << 0;
@@ -96,6 +113,12 @@ void lance_close_dataset(void *dataset);
 uint64_t lance_dataset_version(void *dataset);
 const char *lance_dataset_generation_id(void *dataset);
 void *lance_dataset_checkout_version(void *dataset, uint64_t version);
+void *lance_vane_open_dataset_version_with_session(const char *path,
+                                                   uint64_t version,
+                                                   void *session);
+void *lance_vane_open_dataset_version_with_storage_options_and_session(
+    const char *path, uint64_t version, const char **option_keys,
+    const char **option_values, size_t options_len, void *session);
 
 int32_t lance_vane_sha256(const uint8_t *input, size_t input_len,
                           uint8_t *output);
