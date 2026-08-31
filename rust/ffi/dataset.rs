@@ -16,6 +16,12 @@ use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
+#[cfg(feature = "vane-distributed")]
+use lance::session::Session;
+#[cfg(feature = "vane-distributed")]
+use lance_table::format::pb;
+#[cfg(feature = "vane-distributed")]
+use prost::Message;
 use roaring::RoaringTreemap;
 
 use crate::constants::ROW_ID_COLUMN;
@@ -323,6 +329,55 @@ unsafe fn vane_storage_options_from_ffi(
 }
 
 #[cfg(feature = "vane-distributed")]
+fn vane_versioned_dataset_builder(
+    path: &str,
+    version: u64,
+    storage_options: Option<&HashMap<String, String>>,
+) -> DatasetBuilder {
+    let mut builder = DatasetBuilder::from_uri(path).with_version(version);
+    if let Some(storage_options) = storage_options {
+        builder = with_explicit_aws_credentials(builder, storage_options);
+        builder = builder.with_storage_options(storage_options.clone());
+    }
+    builder
+}
+
+#[cfg(feature = "vane-distributed")]
+async fn vane_load_dataset_version(
+    path: &str,
+    version: u64,
+    storage_options: Option<&HashMap<String, String>>,
+    shared_session: Option<Arc<Session>>,
+) -> lance::Result<lance::Dataset> {
+    // A persistent worker Session can contain a manifest for an earlier dataset
+    // that occupied the same URI and version. Resolve and load the current
+    // manifest through a cache-free validation Session before accepting it.
+    let mut validation_builder = vane_versioned_dataset_builder(path, version, storage_options);
+    if let Some(shared_session) = shared_session.as_ref() {
+        validation_builder = validation_builder.with_session(Arc::new(Session::new(
+            0,
+            0,
+            shared_session.store_registry(),
+        )));
+    }
+    let current = validation_builder.load().await?;
+
+    let Some(shared_session) = shared_session else {
+        return Ok(current);
+    };
+
+    // Rebuild from the independently loaded manifest so the returned Dataset
+    // uses the worker's shared index/metadata caches without consulting a stale
+    // manifest entry in that Session.
+    let manifest = pb::Manifest::from(current.manifest()).encode_to_vec();
+    vane_versioned_dataset_builder(path, version, storage_options)
+        .with_serialized_manifest(&manifest)?
+        .with_session(shared_session)
+        .load()
+        .await
+}
+
+#[cfg(feature = "vane-distributed")]
 fn vane_open_dataset_version_inner(
     path: *const c_char,
     version: u64,
@@ -339,17 +394,12 @@ fn vane_open_dataset_version_inner(
     let path_str = unsafe { cstr_to_str(path, "path")? };
     // SAFETY: A non-null pointer is owned by this library and points to a SessionHandle.
     let session = unsafe { optional_session_handle(session)? };
-    let dataset = match runtime::block_on(async {
-        let mut builder = DatasetBuilder::from_uri(path_str).with_version(version);
-        if let Some(storage_options) = storage_options {
-            builder = with_explicit_aws_credentials(builder, &storage_options);
-            builder = builder.with_storage_options(storage_options);
-        }
-        if let Some(session) = session {
-            builder = builder.with_session(session);
-        }
-        builder.load().await
-    }) {
+    let dataset = match runtime::block_on(vane_load_dataset_version(
+        path_str,
+        version,
+        storage_options.as_ref(),
+        session,
+    )) {
         Ok(Ok(dataset)) => Arc::new(dataset),
         Ok(Err(err)) => {
             return Err(FfiError::new(

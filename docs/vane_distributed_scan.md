@@ -46,6 +46,12 @@ within a query, and query completion releases every cached dataset handle. The
 frozen search index plan still selects the exact index segments for each query;
 a cache hit never changes index selection or snapshot validation.
 
+Before a worker accepts a fixed snapshot, it reads that version's current
+manifest through a cache-free Lance validation Session. It then installs the
+validated manifest on the worker's shared Session, preserving index and file
+metadata reuse without trusting a possibly stale manifest cached for a dataset
+that previously occupied the same URI and version.
+
 The in-memory caches are process-local, so each Ray worker warms independently.
 They are most effective when the runner keeps worker actors and their DuckDB
 database alive across tasks. The Vane-only database-global settings

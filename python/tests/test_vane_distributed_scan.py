@@ -4313,6 +4313,9 @@ def test_worker_fails_if_the_coordinator_snapshot_was_vacuumed(
 def test_worker_rejects_a_same_version_dataset_replacement(tmp_path: Path) -> None:
     connection = _connect()
     path = tmp_path / "replaced.lance"
+    worker = None
+    cursor = None
+    worker_plan = None
     try:
         _write_dataset(connection, path)
         physical = _physical_plan(
@@ -4323,6 +4326,12 @@ def test_worker_rejects_a_same_version_dataset_replacement(tmp_path: Path) -> No
         node_id, batches = next(iter(split_map.items()))
         split_batch = bytes(batches[0])
 
+        worker = _connect()
+        cursor = worker.cursor()
+        assert cursor.execute(
+            f"SELECT count(*) FROM {_sql_literal(path)}"
+        ).fetchone() == (12,)
+
         shutil.rmtree(path)
         replacement = _connect()
         try:
@@ -4330,22 +4339,19 @@ def test_worker_rejects_a_same_version_dataset_replacement(tmp_path: Path) -> No
         finally:
             replacement.close()
 
-        worker = _connect()
-        cursor = worker.cursor()
-        worker_plan = None
-        try:
-            worker_plan = physical.clone(worker)
-            with pytest.raises(Exception, match="generation does not match"):
-                vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-                    cursor,
-                    worker_plan,
-                    scan_split_batch={str(node_id): split_batch},
-                )
-        finally:
-            worker_plan = None
-            cursor.close()
-            worker.close()
+        worker_plan = physical.clone(worker)
+        with pytest.raises(Exception, match="generation does not match"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                cursor,
+                worker_plan,
+                scan_split_batch={str(node_id): split_batch},
+            )
     finally:
+        worker_plan = None
+        if cursor is not None:
+            cursor.close()
+        if worker is not None:
+            worker.close()
         connection.close()
 
 

@@ -255,14 +255,14 @@ pub unsafe extern "C" fn lance_debug_reset_counters() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vane-distributed")]
+    use std::ffi::CStr;
     use std::ffi::CString;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
-    #[cfg(feature = "vane-distributed")]
-    use lance::dataset::WriteMode;
     use lance::dataset::WriteParams;
     use lance::Dataset;
 
@@ -270,6 +270,8 @@ mod tests {
 
     use super::super::dataset::{lance_close_dataset, lance_open_dataset_with_session};
     use super::*;
+
+    static DEBUG_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_create_session_and_get_stats() {
@@ -287,6 +289,9 @@ mod tests {
 
     #[test]
     fn test_open_dataset_with_session_records_debug_counters() {
+        let _counter_guard = DEBUG_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dataset_dir =
             std::env::temp_dir().join(format!("ffi-session-{}", rand::random::<u64>()));
         let uri = dataset_dir.to_string_lossy().to_string();
@@ -331,7 +336,10 @@ mod tests {
 
     #[cfg(feature = "vane-distributed")]
     #[test]
-    fn test_versioned_open_reuses_session_metadata_cache() {
+    fn test_versioned_open_revalidates_manifest_with_shared_session() {
+        let _counter_guard = DEBUG_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dataset_dir =
             std::env::temp_dir().join(format!("ffi-versioned-session-{}", rand::random::<u64>()));
         let uri = dataset_dir.to_string_lossy().to_string();
@@ -351,22 +359,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let frozen_version = first.version_id();
-
-        let second_batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))])
-                .unwrap();
-        let second_reader = RecordBatchIterator::new(vec![Ok(second_batch)].into_iter(), schema);
-        let latest = runtime::block_on(Dataset::write(
-            second_reader,
-            &uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..WriteParams::default()
-            }),
-        ))
-        .unwrap()
-        .unwrap();
-        assert!(latest.version_id() > frozen_version);
+        assert_eq!(frozen_version, 1);
+        drop(first);
 
         unsafe {
             lance_debug_reset_counters();
@@ -376,48 +370,72 @@ mod tests {
             assert!(lance_vane_default_metadata_cache_size_bytes() > 0);
 
             let uri_c = CString::new(uri.clone()).unwrap();
-            let first_open = super::super::dataset::lance_vane_open_dataset_version_with_session(
-                uri_c.as_ptr(),
-                frozen_version,
-                session,
-            );
+            // Seed the persistent Session with dataset A's version-1 manifest.
+            let first_open = lance_open_dataset_with_session(uri_c.as_ptr(), session);
             assert!(!first_open.is_null());
             assert_eq!(
                 super::super::dataset::lance_dataset_version(first_open),
                 frozen_version
             );
+            let first_generation_ptr =
+                super::super::dataset::lance_dataset_generation_id(first_open);
+            assert!(!first_generation_ptr.is_null());
+            let first_generation = CStr::from_ptr(first_generation_ptr)
+                .to_str()
+                .unwrap()
+                .to_string();
+            crate::error::lance_free_string(first_generation_ptr);
+            lance_close_dataset(first_open);
 
-            let mut after_first = LanceVaneSessionCacheStats::default();
-            assert_eq!(
-                lance_vane_session_get_cache_stats(session, &mut after_first),
-                0
-            );
-            assert!(after_first.metadata_misses > 0);
+            fs::remove_dir_all(&dataset_dir).unwrap();
+            let replacement_batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))])
+                    .unwrap();
+            let replacement_reader =
+                RecordBatchIterator::new(vec![Ok(replacement_batch)].into_iter(), schema);
+            let replacement = runtime::block_on(Dataset::write(
+                replacement_reader,
+                &uri,
+                Some(WriteParams::default()),
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(replacement.version_id(), frozen_version);
+            drop(replacement);
 
-            let second_open = super::super::dataset::lance_vane_open_dataset_version_with_session(
-                uri_c.as_ptr(),
-                frozen_version,
-                session,
-            );
-            assert!(!second_open.is_null());
+            let replacement_open =
+                super::super::dataset::lance_vane_open_dataset_version_with_session(
+                    uri_c.as_ptr(),
+                    frozen_version,
+                    session,
+                );
+            assert!(!replacement_open.is_null());
             assert_eq!(
-                super::super::dataset::lance_dataset_version(second_open),
+                super::super::dataset::lance_dataset_version(replacement_open),
                 frozen_version
             );
+            let replacement_generation_ptr =
+                super::super::dataset::lance_dataset_generation_id(replacement_open);
+            assert!(!replacement_generation_ptr.is_null());
+            let replacement_generation = CStr::from_ptr(replacement_generation_ptr)
+                .to_str()
+                .unwrap()
+                .to_string();
+            crate::error::lance_free_string(replacement_generation_ptr);
+            assert_ne!(replacement_generation, first_generation);
 
-            let mut after_second = LanceVaneSessionCacheStats::default();
-            assert_eq!(
-                lance_vane_session_get_cache_stats(session, &mut after_second),
-                0
-            );
-            assert!(after_second.metadata_hits > after_first.metadata_hits);
+            let session_handle = &*(session as *const super::super::types::SessionHandle);
+            let dataset_handle = &*(replacement_open as *const super::super::types::DatasetHandle);
+            assert!(Arc::ptr_eq(
+                &dataset_handle.dataset.session(),
+                &session_handle.session
+            ));
 
             let mut counters = LanceDebugCounters::default();
             assert_eq!(lance_debug_get_counters(&mut counters), 0);
             assert_eq!(counters.dataset_open_count, 2);
 
-            super::super::dataset::lance_close_dataset(first_open);
-            super::super::dataset::lance_close_dataset(second_open);
+            lance_close_dataset(replacement_open);
             lance_close_session(session);
         }
 
