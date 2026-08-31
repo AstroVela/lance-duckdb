@@ -96,6 +96,46 @@ void lance_close_dataset(void *dataset);
 uint64_t lance_dataset_version(void *dataset);
 const char *lance_dataset_generation_id(void *dataset);
 void *lance_dataset_checkout_version(void *dataset, uint64_t version);
+
+int32_t lance_vane_sha256(const uint8_t *input, size_t input_len,
+                          uint8_t *output);
+void lance_vane_free_bytes(uint8_t *data, size_t len);
+int32_t lance_vane_dataset_schema_fingerprint(void *dataset, uint8_t *output);
+int32_t lance_vane_arrow_schema_fingerprint(const ArrowSchema *schema,
+                                            uint8_t *output);
+int32_t lance_vane_plan_namespace_filter(void *dataset, const char *sql,
+                                         uint8_t **out_data, size_t *out_len);
+int32_t lance_vane_build_search_index_plan(
+    void *dataset, const char *generation, uint8_t search_kind,
+    const char *vector_column, const char *text_column,
+    uint8_t use_vector_index, uint8_t **out_data, size_t *out_len);
+void *lance_vane_create_knn_stream_ir(
+    void *dataset, const char *generation, const char *vector_column,
+    const float *query_values, size_t query_len, uint64_t k, uint64_t nprobes,
+    uint64_t refine_factor, const uint8_t *filter_ir, size_t filter_ir_len,
+    const uint8_t *namespace_filter_plan, size_t namespace_filter_plan_len,
+    uint8_t prefilter, uint8_t use_index, const uint8_t *index_plan,
+    size_t index_plan_len);
+void *lance_vane_create_fts_stream_ir(
+    void *dataset, const char *generation, const char *text_column,
+    const char *query, uint64_t k, const uint8_t *filter_ir,
+    size_t filter_ir_len, const uint8_t *namespace_filter_plan,
+    size_t namespace_filter_plan_len, uint8_t prefilter,
+    const uint8_t *index_plan, size_t index_plan_len);
+void *lance_vane_create_hybrid_stream_ir(
+    void *dataset, const char *generation, const char *vector_column,
+    const float *query_values, size_t query_len, const char *text_column,
+    const char *text_query, uint64_t k, uint64_t nprobes,
+    uint64_t refine_factor, const uint8_t *filter_ir, size_t filter_ir_len,
+    const uint8_t *namespace_filter_plan, size_t namespace_filter_plan_len,
+    uint8_t prefilter, uint8_t use_index, float alpha,
+    uint32_t oversample_factor, const uint8_t *index_plan,
+    size_t index_plan_len);
+int32_t lance_vane_resolve_rest_table(
+    const char *endpoint, const char *table_id, const char *bearer_token,
+    const char *api_key, const char *delimiter, const char *headers_tsv,
+    uint64_t expected_version, const char **out_table_uri,
+    const char **out_schema_json, uint64_t *out_version);
 #endif
 
 void *lance_get_schema(void *dataset);

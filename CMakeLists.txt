@@ -59,7 +59,9 @@ set(EXTENSION_SOURCES
     src/lance_resolver.cpp)
 
 if(LANCE_VANE_DISTRIBUTED)
-  list(APPEND EXTENSION_SOURCES src/lance_distributed_write.cpp)
+  list(APPEND EXTENSION_SOURCES src/lance_distributed_write.cpp
+       src/lance_vane_search.cpp
+       src/lance_vane_rest_resolution.cpp)
 endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -201,7 +203,10 @@ set(RUST_FFI_DEPENDS
 if(LANCE_VANE_DISTRIBUTED)
   list(APPEND RUST_FFI_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_write.rs
-       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_mutation.rs)
+       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_mutation.rs
+       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_distributed_search.rs
+       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_rest_resolution.rs
+       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_search_plan.rs)
 endif()
 
 set(RUST_CARGO_ENV CARGO_TARGET_DIR=${RUST_TARGET_DIR}

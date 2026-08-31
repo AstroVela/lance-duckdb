@@ -55,6 +55,9 @@
 #include "lance_logical_exec.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_vane_rest_resolution.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -355,38 +358,6 @@ static void ThrowNamespaceSessionMismatchDistributedScanError() {
   throw NotImplementedException(
       "Distributed Lance directory namespace scans require the query session "
       "storage settings to match the settings captured by ATTACH");
-}
-
-static bool
-LanceDirectoryNamespaceSessionMatches(ClientContext &context,
-                                      const LanceNamespaceTableConfig &config) {
-  string current_root;
-  vector<string> current_keys;
-  vector<string> current_values;
-  ResolveLanceStorageOptionsForDistributedRead(
-      context, config.root, current_root, current_keys, current_values);
-  if (current_root != config.root ||
-      current_keys.size() != current_values.size() ||
-      config.option_keys.size() != config.option_values.size()) {
-    return false;
-  }
-
-  vector<pair<string, string>> current_options;
-  vector<pair<string, string>> attached_options;
-  current_options.reserve(current_keys.size());
-  attached_options.reserve(config.option_keys.size());
-  for (idx_t option_idx = 0; option_idx < current_keys.size(); option_idx++) {
-    current_options.emplace_back(current_keys[option_idx],
-                                 current_values[option_idx]);
-  }
-  for (idx_t option_idx = 0; option_idx < config.option_keys.size();
-       option_idx++) {
-    attached_options.emplace_back(config.option_keys[option_idx],
-                                  config.option_values[option_idx]);
-  }
-  std::sort(current_options.begin(), current_options.end());
-  std::sort(attached_options.begin(), attached_options.end());
-  return current_options == attached_options;
 }
 
 static string LanceScanErrorSuffix(const LanceScanBindData &bind_data);
@@ -815,6 +786,7 @@ unique_ptr<FunctionData> LanceScanBindData::Copy() const {
   result->distributed_fragment_bytes_on_disk =
       distributed_fragment_bytes_on_disk;
   result->selected_fragment_ids = selected_fragment_ids;
+  result->distributed_rest_candidate = distributed_rest_candidate;
   return result;
 }
 
@@ -827,10 +799,14 @@ static vector<DistributedScanSplit> LancePlanDistributedScanSplits(
   if (bind_data.distributed_namespace_session_mismatch) {
     ThrowNamespaceSessionMismatchDistributedScanError();
   }
-  if (bind_data.UsesNamespaceQuery()) {
+  if (bind_data.UsesNamespaceQuery() &&
+      (!bind_data.distributed_rest_candidate.attempted ||
+       !bind_data.distributed_rest_candidate.qualified)) {
     throw NotImplementedException(
-        "Distributed Lance REST namespace scans require a stable physical "
-        "dataset snapshot");
+        bind_data.distributed_rest_candidate.safe_failure.empty()
+            ? "Distributed Lance REST namespace scans require a standard-"
+              "resolved physical dataset snapshot"
+            : bind_data.distributed_rest_candidate.safe_failure);
   }
   if (!bind_data.distributed_replayable) {
     throw NotImplementedException(
@@ -884,8 +860,11 @@ static vector<DistributedScanSplit> LancePlanDistributedScanSplits(
     fragment_row_counts = bind_data.distributed_fragment_row_counts;
     fragment_bytes_on_disk = bind_data.distributed_fragment_bytes_on_disk;
   } else {
-    ReadLanceDistributedFragmentStats(bind_data, bind_data.dataset,
-                                      fragment_ids, fragment_row_counts,
+    auto planning_dataset = bind_data.UsesNamespaceQuery()
+                                ? bind_data.distributed_rest_candidate.dataset
+                                : bind_data.dataset;
+    ReadLanceDistributedFragmentStats(bind_data, planning_dataset, fragment_ids,
+                                      fragment_row_counts,
                                       fragment_bytes_on_disk);
   }
   if (fragment_ids.size() != fragment_row_counts.size() ||
@@ -922,21 +901,31 @@ static unique_ptr<FunctionData> LanceCreateDistributedScanWorkerBind(
   if (source.distributed_namespace_session_mismatch) {
     ThrowNamespaceSessionMismatchDistributedScanError();
   }
-  if (source.UsesNamespaceQuery() || !source.distributed_replayable ||
-      source.dataset_version == 0 || source.dataset_generation_id.empty() ||
+  const bool resolved_rest = source.UsesNamespaceQuery() &&
+                             source.distributed_rest_candidate.attempted &&
+                             source.distributed_rest_candidate.qualified;
+  if ((source.UsesNamespaceQuery() && !resolved_rest) ||
+      !source.distributed_replayable || source.dataset_version == 0 ||
+      source.dataset_generation_id.empty() ||
       !IsValidLanceScanToken(source.distributed_scan_token)) {
     throw NotImplementedException(
         "Lance scan cannot create a replayable fixed-snapshot worker bind");
   }
   auto result = make_uniq<LanceScanBindData>();
-  result->file_path = source.file_path;
+  result->file_path = resolved_rest
+                          ? source.distributed_rest_candidate.physical_uri
+                          : source.file_path;
   result->explain_verbose = source.explain_verbose;
   result->names = source.names;
   result->types = source.types;
   result->lance_pushed_filter_ir_parts = source.lance_pushed_filter_ir_parts;
   result->take_row_ids = source.take_row_ids;
-  result->dataset_version = source.dataset_version;
-  result->dataset_generation_id = source.dataset_generation_id;
+  result->dataset_version =
+      resolved_rest ? source.distributed_rest_candidate.dataset_version
+                    : source.dataset_version;
+  result->dataset_generation_id =
+      resolved_rest ? source.distributed_rest_candidate.dataset_generation_id
+                    : source.dataset_generation_id;
   result->distributed_scan_token = source.distributed_scan_token;
   result->distributed_replayable = true;
   result->distributed_replay_path_restricted =
@@ -948,8 +937,11 @@ static unique_ptr<FunctionData> LanceCreateDistributedScanWorkerBind(
   result->distributed_fragment_bytes_on_disk =
       source.distributed_fragment_bytes_on_disk;
   if (!source.distributed_worker && source.take_row_ids.empty()) {
+    auto planning_dataset = resolved_rest
+                                ? source.distributed_rest_candidate.dataset
+                                : source.dataset;
     ReadLanceDistributedFragmentStats(
-        source, source.dataset, result->distributed_fragment_ids,
+        source, planning_dataset, result->distributed_fragment_ids,
         result->distributed_fragment_row_counts,
         result->distributed_fragment_bytes_on_disk);
   }
@@ -1816,11 +1808,34 @@ static void LanceScanSerialize(Serializer &serializer,
   if (bind_data.distributed_namespace_session_mismatch) {
     ThrowNamespaceSessionMismatchDistributedScanError();
   }
-  if (bind_data.UsesNamespaceQuery() || !bind_data.distributed_replayable ||
-      LanceScanHasNonReplayablePrivateState(bind_data) ||
-      bind_data.dataset_version == 0 ||
-      bind_data.dataset_generation_id.empty() ||
-      !IsValidLanceScanToken(bind_data.distributed_scan_token)) {
+  const bool resolved_rest = bind_data.UsesNamespaceQuery() &&
+                             bind_data.distributed_rest_candidate.attempted &&
+                             bind_data.distributed_rest_candidate.qualified;
+  if (bind_data.UsesNamespaceQuery() && !resolved_rest) {
+    throw SerializationException(
+        bind_data.distributed_rest_candidate.safe_failure.empty()
+            ? "Distributed Lance REST scans require a standard-resolved "
+              "physical dataset snapshot"
+            : bind_data.distributed_rest_candidate.safe_failure);
+  }
+  const auto &file_path =
+      resolved_rest ? bind_data.distributed_rest_candidate.physical_uri
+                    : bind_data.file_path;
+  const auto dataset_version =
+      resolved_rest ? bind_data.distributed_rest_candidate.dataset_version
+                    : bind_data.dataset_version;
+  const auto &dataset_generation_id =
+      resolved_rest ? bind_data.distributed_rest_candidate.dataset_generation_id
+                    : bind_data.dataset_generation_id;
+  const auto &scan_token =
+      resolved_rest ? bind_data.distributed_rest_candidate.search_node_uuid
+                    : bind_data.distributed_scan_token;
+  const bool nonreplayable_private_state =
+      resolved_rest ? LanceVanePathHasPrivateUriComponents(file_path)
+                    : LanceScanHasNonReplayablePrivateState(bind_data);
+  if (!bind_data.distributed_replayable || nonreplayable_private_state ||
+      file_path.empty() || dataset_version == 0 ||
+      dataset_generation_id.empty() || !IsValidLanceScanToken(scan_token)) {
     throw SerializationException(
         "Lance scan does not have a replayable fixed dataset snapshot");
   }
@@ -1828,14 +1843,16 @@ static void LanceScanSerialize(Serializer &serializer,
   auto fragment_row_counts = bind_data.distributed_fragment_row_counts;
   auto fragment_bytes_on_disk = bind_data.distributed_fragment_bytes_on_disk;
   if (!bind_data.distributed_worker && bind_data.take_row_ids.empty()) {
-    ReadLanceDistributedFragmentStats(bind_data, bind_data.dataset,
-                                      fragment_ids, fragment_row_counts,
+    auto planning_dataset = resolved_rest
+                                ? bind_data.distributed_rest_candidate.dataset
+                                : bind_data.dataset;
+    ReadLanceDistributedFragmentStats(bind_data, planning_dataset, fragment_ids,
+                                      fragment_row_counts,
                                       fragment_bytes_on_disk);
   }
-  serializer.WriteProperty(100, "file_path", bind_data.file_path);
-  serializer.WriteProperty(101, "dataset_version", bind_data.dataset_version);
-  serializer.WriteProperty(102, "dataset_generation_id",
-                           bind_data.dataset_generation_id);
+  serializer.WriteProperty(100, "file_path", file_path);
+  serializer.WriteProperty(101, "dataset_version", dataset_version);
+  serializer.WriteProperty(102, "dataset_generation_id", dataset_generation_id);
   serializer.WriteProperty(103, "explain_verbose", bind_data.explain_verbose);
   serializer.WriteProperty(104, "lance_filter_ir_parts",
                            bind_data.lance_pushed_filter_ir_parts);
@@ -1854,7 +1871,7 @@ static void LanceScanSerialize(Serializer &serializer,
     // validate take-split ranges before it becomes authorization-restricted.
     serializer.WriteProperty(108, "take_row_ids", bind_data.take_row_ids);
   }
-  serializer.WriteProperty(109, "scan_token", bind_data.distributed_scan_token);
+  serializer.WriteProperty(109, "scan_token", scan_token);
   // A worker physical plan can be deserialized before Vane applies resolved
   // profile/role credentials to its execution connection. Carry the bound SQL
   // schema so deserialization stays side-effect free; the fixed snapshot is
@@ -5470,7 +5487,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         result->distributed_requires_coordinator_secret ||
         (NamespaceConfig().IsDirectory()
              ? NamespaceConfig().uses_coordinator_storage_secret
-             : NamespaceConfig().uses_coordinator_auth_secret);
+             : false);
   }
 #endif
 
@@ -5525,6 +5542,32 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
     result->namespace_query_config =
         make_uniq<LanceNamespaceTableConfig>(NamespaceConfig());
     result->namespace_query_config->snapshot_version = snapshot_version;
+    try {
+      LanceVaneResolveRestPhysicalCandidate(context, *this,
+                                            result->dataset_entry,
+                                            result->distributed_rest_candidate);
+    } catch (Exception &) {
+      result->distributed_rest_candidate = {};
+      result->distributed_rest_candidate.attempted = true;
+      result->distributed_rest_candidate.source_class =
+          LanceVaneSearchSourceClass::STANDARD_REST;
+      result->distributed_rest_candidate.private_uri_diagnostics = true;
+      result->distributed_rest_candidate.safe_failure =
+          "Distributed Lance REST scans could not freeze a standard-resolved "
+          "physical candidate";
+    }
+    if (result->distributed_rest_candidate.qualified) {
+      result->dataset_version =
+          result->distributed_rest_candidate.dataset_version;
+      result->dataset_generation_id =
+          result->distributed_rest_candidate.dataset_generation_id;
+      result->distributed_scan_token =
+          result->distributed_rest_candidate.search_node_uuid;
+      result->distributed_replayable = true;
+      result->distributed_replay_path_restricted = false;
+      result->distributed_requires_coordinator_secret = false;
+      result->distributed_namespace_session_mismatch = false;
+    }
     PopulateNamespaceQueryScanSchema(context, *this, *result);
     bind_data = std::move(result);
     auto function = LanceTableScanFunction();
@@ -5540,7 +5583,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         result->distributed_requires_coordinator_secret ||
         NamespaceConfig().uses_coordinator_storage_secret;
     result->distributed_namespace_session_mismatch =
-        !LanceDirectoryNamespaceSessionMatches(context, NamespaceConfig());
+        !LanceVaneDirectoryNamespaceSessionMatches(context, NamespaceConfig());
   }
   auto replay_path = LanceVaneReplayPath(context, result->file_path);
   if (!result->distributed_replay_path_restricted &&

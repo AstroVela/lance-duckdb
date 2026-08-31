@@ -307,6 +307,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
 dependencies = [
  "bitflags",
+ "serde",
  "serde_core",
  "serde_json",
 ]
@@ -2061,6 +2062,43 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "datafusion-proto"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67791dcfacd142a9d95f8f73c2a161094cc936d231d80c235f5017dacf24e84e"
+dependencies = [
+ "arrow",
+ "chrono",
+ "datafusion-catalog",
+ "datafusion-catalog-listing",
+ "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-datasource-arrow",
+ "datafusion-datasource-csv",
+ "datafusion-datasource-json",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions-table",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "datafusion-proto-common",
+ "object_store",
+ "prost",
+]
+
+[[package]]
+name = "datafusion-proto-common"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8cd9e80d637891645d074db0f6c650b591117367247deb313fdfb78dff559cb"
+dependencies = [
+ "arrow",
+ "datafusion-common",
+ "prost",
 ]
 
 [[package]]
@@ -3872,11 +3910,13 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-functions",
+ "datafusion-proto",
  "datafusion-sql",
  "futures",
  "lance",
  "lance-arrow",
  "lance-core",
+ "lance-datafusion",
  "lance-index",
  "lance-io",
  "lance-linalg",
@@ -3889,6 +3929,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "snafu 0.8.9",
  "tokio",
  "url",

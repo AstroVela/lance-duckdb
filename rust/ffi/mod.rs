@@ -22,3 +22,10 @@ mod types;
 mod update;
 mod util;
 mod write;
+
+#[cfg(feature = "vane-distributed")]
+mod vane_distributed_search;
+#[cfg(feature = "vane-distributed")]
+mod vane_rest_resolution;
+#[cfg(feature = "vane-distributed")]
+mod vane_search_plan;

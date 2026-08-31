@@ -7,8 +7,10 @@ import concurrent.futures
 import contextlib
 import http.server
 import json
+import multiprocessing
 import os
 import pickle
+import queue
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,29 @@ WORKER_COUNT = 2
 STABLE_ROW_ID_FIXTURE = (
     Path(__file__).resolve().parents[2] / "test/data/stable_row_ids.lance"
 )
+SEARCH_FIXTURE_REST_SCHEMA = {
+    "fields": [
+        {"name": "id", "nullable": False, "type": {"type": "int64"}},
+        {"name": "label", "nullable": False, "type": {"type": "int32"}},
+        {"name": "text", "nullable": False, "type": {"type": "utf8"}},
+        {"name": "keywords", "nullable": False, "type": {"type": "utf8"}},
+        {
+            "name": "vec",
+            "nullable": False,
+            "type": {
+                "type": "fixed_size_list",
+                "length": 4,
+                "fields": [
+                    {
+                        "name": "item",
+                        "nullable": True,
+                        "type": {"type": "float32"},
+                    }
+                ],
+            },
+        },
+    ]
+}
 S3_TEST_ENV = (
     "AWS_ACCESS_KEY_ID",
     "AWS_ALLOW_HTTP",
@@ -40,8 +65,10 @@ _FTE_RETRY_GATE_ATTR = "_lance_distributed_scan_retry_gate"
 _FTE_WORKER_RETRY_GATE_ATTR = "_lance_distributed_scan_worker_retry_gate"
 
 
-def _install_fte_worker_retry_gate(actor, target_attempt_id: str) -> None:
-    """Fail one attempt only after its real native scan finishes."""
+def _install_fte_worker_retry_gate(
+    actor, target_attempt_id: str, failure_phase: str
+) -> None:
+    """Fail one attempt either before execution or after its native scan."""
     import asyncio
     import threading
     import types
@@ -50,6 +77,8 @@ def _install_fte_worker_retry_gate(actor, target_attempt_id: str) -> None:
 
     if hasattr(actor, _FTE_WORKER_RETRY_GATE_ATTR):
         raise RuntimeError("the Lance worker retry gate is already installed")
+    if failure_phase not in {"before-output", "after-output"}:
+        raise ValueError(f"unsupported Lance retry failure phase: {failure_phase}")
     target_attempt = FteTaskAttemptId.coerce(target_attempt_id)
     manager = actor._get_fte_task_manager()
     original_method = actor._execute_fte_request
@@ -60,6 +89,7 @@ def _install_fte_worker_retry_gate(actor, target_attempt_id: str) -> None:
         "release": threading.Event(),
         "attempt": None,
         "failure_injected": False,
+        "failure_phase": failure_phase,
         "target_attempt_id": str(target_attempt),
         "had_instance_method": had_instance_method,
         "original_manager_execute_fn": original_manager_execute_fn,
@@ -67,7 +97,6 @@ def _install_fte_worker_retry_gate(actor, target_attempt_id: str) -> None:
     }
 
     async def fail_first_scan_attempt(_actor, request):
-        result = await original_method(request)
         attempt = FteTaskAttemptId.coerce(request.get("task_id"))
         should_fail = False
         with state["lock"]:
@@ -79,6 +108,17 @@ def _install_fte_worker_retry_gate(actor, target_attempt_id: str) -> None:
                     "query_id": str(attempt.query_id),
                 }
                 should_fail = True
+        if failure_phase == "before-output" and should_fail:
+            released = await asyncio.to_thread(state["release"].wait, 90)
+            if not released:
+                raise TimeoutError(
+                    f"timed out waiting to fail Lance FTE attempt {attempt}"
+                )
+            with state["lock"]:
+                state["failure_injected"] = True
+            raise RuntimeError("injected retryable Lance scan task failure")
+
+        result = await original_method(request)
         if not should_fail:
             return result
         released = await asyncio.to_thread(state["release"].wait, 90)
@@ -147,7 +187,7 @@ def _restore_fte_worker_retry_gate(actor) -> None:
     delattr(actor, _FTE_WORKER_RETRY_GATE_ATTR)
 
 
-def _install_fte_retry_gate(actor) -> dict[str, dict[str, object]]:
+def _install_fte_retry_gate(actor, failure_phase: str) -> dict[str, dict[str, object]]:
     """Gate one real scan attempt and its task retry inside the query driver."""
     import hashlib
     import pickle as actor_pickle
@@ -160,6 +200,8 @@ def _install_fte_retry_gate(actor) -> dict[str, dict[str, object]]:
 
     if hasattr(actor, _FTE_RETRY_GATE_ATTR):
         raise RuntimeError("the Lance FTE retry gate is already installed")
+    if failure_phase not in {"before-output", "after-output"}:
+        raise ValueError(f"unsupported Lance retry failure phase: {failure_phase}")
 
     def digest(value: object) -> str:
         return hashlib.sha256(actor_pickle.dumps(value, protocol=5)).hexdigest()
@@ -223,7 +265,6 @@ def _install_fte_retry_gate(actor) -> dict[str, dict[str, object]]:
             for field in (
                 "descriptor_version",
                 "context",
-                "no_more_splits",
                 "resource_request",
                 "dynamic_scan_source_node_ids",
                 "source_node_ids",
@@ -286,6 +327,7 @@ def _install_fte_retry_gate(actor) -> dict[str, dict[str, object]]:
                 handle.actor_handle.__ray_call__.remote(
                     _install_fte_worker_retry_gate,
                     str(attempt),
+                    failure_phase,
                 )
             )
         status = original_create(handle, request)
@@ -357,7 +399,11 @@ def _connect():
             "autoload_known_extensions": "false",
         }
     )
-    connection.execute("LOAD lance")
+    extension_path = os.environ.get("LANCE_TEST_EXTENSION_PATH")
+    if extension_path:
+        connection.execute(f"LOAD {_sql_literal(extension_path)}")
+    else:
+        connection.execute("LOAD lance")
     return connection
 
 
@@ -475,6 +521,145 @@ def _authenticated_rest_namespace_server(table_uri: str):
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+def _serve_standard_rest_physical(
+    table_uri: str,
+    schema: dict[str, object],
+    response_version,
+    bearer_token: str,
+    storage_secret_marker: str,
+    stop_event,
+    request_queue,
+    ready_pipe,
+) -> None:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _write_json(self, status: int, payload: object) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _record(self, body: object | None = None) -> None:
+            request_queue.put(
+                {
+                    "method": self.command,
+                    "path": self.path,
+                    "authorization": self.headers.get("Authorization"),
+                    "body": body,
+                }
+            )
+
+        def _authorized(self) -> bool:
+            return self.headers.get("Authorization") == f"Bearer {bearer_token}"
+
+        def do_GET(self) -> None:
+            self._record()
+            if not self._authorized():
+                self._write_json(401, {"error": "unauthorized"})
+                return
+            if not self.path.startswith("/v1/namespace/safe-namespace-id/table/list?"):
+                self._write_json(404, {"error": "unexpected path"})
+                return
+            self._write_json(200, {"tables": ["safe-namespace-id$items"]})
+
+        def do_POST(self) -> None:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(content_length)
+            body = json.loads(raw_body) if raw_body else {}
+            self._record(body)
+            if not self._authorized():
+                self._write_json(401, {"error": "unauthorized"})
+                return
+            if not self.path.startswith("/v1/table/") or "/describe?" not in self.path:
+                self._write_json(404, {"error": "unexpected path"})
+                return
+            response: dict[str, object] = {
+                "table": "items",
+                "namespace": ["safe-namespace-id"],
+                "version": int(response_version.value),
+                "location": table_uri,
+                "table_uri": table_uri,
+                "schema": schema,
+            }
+            if body.get("vend_credentials") is False:
+                response["storage_options"] = {
+                    "secret_access_key": storage_secret_marker,
+                }
+            self._write_json(200, response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    server.timeout = 0.1
+    host, port = server.server_address
+    ready_pipe.send((host, port))
+    ready_pipe.close()
+    try:
+        while not stop_event.is_set():
+            server.handle_request()
+    finally:
+        server.server_close()
+
+
+@contextlib.contextmanager
+def _standard_rest_physical_server(
+    table_uri: str,
+    schema: dict[str, object],
+    version: int,
+):
+    bearer_token = "standard-rest-control-token"
+    storage_secret_marker = "response-storage-options-must-not-be-used"
+    observed_requests: list[dict[str, object]] = []
+    process_context = multiprocessing.get_context("spawn")
+    response_version = process_context.Value("q", version)
+    stop_event = process_context.Event()
+    request_queue = process_context.Queue()
+    ready_parent, ready_child = process_context.Pipe(duplex=False)
+    process = process_context.Process(
+        target=_serve_standard_rest_physical,
+        args=(
+            table_uri,
+            schema,
+            response_version,
+            bearer_token,
+            storage_secret_marker,
+            stop_event,
+            request_queue,
+            ready_child,
+        ),
+    )
+    process.start()
+    ready_child.close()
+    try:
+        if not ready_parent.poll(15):
+            raise RuntimeError("standard REST test server did not start")
+        host, port = ready_parent.recv()
+        yield (
+            f"http://{host}:{port}",
+            bearer_token,
+            storage_secret_marker,
+            observed_requests,
+            response_version,
+        )
+    finally:
+        ready_parent.close()
+        stop_event.set()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        assert process.exitcode == 0
+        while True:
+            try:
+                observed_requests.append(request_queue.get_nowait())
+            except queue.Empty:
+                break
+        request_queue.close()
 
 
 @contextlib.contextmanager
@@ -1078,6 +1263,35 @@ try:
             ]
             assert namespace_rows == [(row_id,) for row_id in range(12)]
 
+            search_source = sql_literal("credential_ns.main.search_items")
+            namespace_searches = (
+                (
+                    "vector",
+                    "SELECT id FROM lance_vector_search("
+                    f"{search_source}, 'vec', "
+                    "[0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+                    "k = 2, use_index = false) ORDER BY _distance, id",
+                ),
+                (
+                    "fts",
+                    "SELECT id FROM lance_fts("
+                    f"{search_source}, 'text', 'puppy', k = 5) "
+                    "ORDER BY _score DESC, id",
+                ),
+                (
+                    "hybrid",
+                    "SELECT id FROM lance_hybrid_search("
+                    f"{search_source}, 'vec', "
+                    "[0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+                    "'text', 'puppy', k = 2, use_index = false) "
+                    "ORDER BY _hybrid_score DESC, id",
+                ),
+            )
+            namespace_search_results = {
+                name: connection.execute(sql).fetchall()
+                for name, sql in namespace_searches
+            }
+
             # The attached catalog entry keeps using its already-opened
             # coordinator dataset after the session changes, but replaying its
             # captured ATTACH options on workers would use the new values. The
@@ -1110,6 +1324,31 @@ try:
                     "a directory namespace with changed session storage "
                     "settings produced a distributed plan"
                 )
+            for name, sql in namespace_searches:
+                assert connection.execute(sql).fetchall() == namespace_search_results[
+                    name
+                ]
+                search_relation = connection.sql(sql)
+                try:
+                    search_logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                        search_relation,
+                        f"lance-s3-namespace-search-session-drift-{name}",
+                    )
+                    search_physical = search_logical.to_physical_plan(connection)
+                    # Global-search split planning is lazy. Materialize the split
+                    # map so the namespace-session admission check runs here.
+                    search_physical.scan_split_batch_map()
+                except Exception as error:
+                    message = str(error)
+                    assert "query session storage settings to match" in message
+                    assert all(
+                        value not in message for value in sensitive_values
+                    )
+                else:
+                    raise AssertionError(
+                        f"a {name} directory namespace search with changed "
+                        "session storage settings produced a distributed plan"
+                    )
         client = runner.query_driver_client
         assert client is not None
         stats = ray.get(client.runner.fragment_stats.remote())
@@ -1339,6 +1578,16 @@ def _run(runner, relation) -> list[tuple[object, ...]]:
     ]
 
 
+def _run_serialized_logical(runner, serialized: bytes) -> list[tuple[object, ...]]:
+    logical = pickle.loads(serialized)
+    client = runner._client_for_session(str(logical.session_id()))
+    return [
+        tuple(row.values())
+        for partition in client.stream_plan(logical)
+        for row in partition.partition().to_pylist()
+    ]
+
+
 def _execution_node_ids(ray) -> frozenset[str]:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -1509,6 +1758,978 @@ def ray_retry_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
         yield runners.get_or_create_runner()
     finally:
         vane.teardown_runner()
+
+
+def test_global_search_overloads_match_native_and_emit_one_task(ray_runner) -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    searches = (
+        (
+            "vector-float",
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 3, use_index = false) ORDER BY _distance, id",
+        ),
+        (
+            "vector-double",
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::DOUBLE[4], "
+            "k = 3, use_index = false) ORDER BY _distance, id",
+        ),
+        (
+            "fts",
+            "SELECT id, _score FROM lance_fts("
+            f"{path_sql}, 'text', 'puppy', k = 10) ORDER BY _score DESC, id",
+        ),
+        (
+            "hybrid-float",
+            "SELECT id, _distance, _score, _hybrid_score "
+            "FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, use_index = false, alpha = 0.5, "
+            "oversample_factor = 4) ORDER BY _hybrid_score DESC, id",
+        ),
+        (
+            "hybrid-double",
+            "SELECT id, _distance, _score, _hybrid_score "
+            "FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::DOUBLE[4], "
+            "'text', 'puppy', k = 3, use_index = false, alpha = 0.5, "
+            "oversample_factor = 4) ORDER BY _hybrid_score DESC, id",
+        ),
+        (
+            "fts-empty-query",
+            "SELECT id, _score FROM lance_fts("
+            f"{path_sql}, 'text', '', k = 10) ORDER BY _score DESC, id",
+        ),
+        (
+            "hybrid-empty-query",
+            "SELECT id, _distance, _score, _hybrid_score "
+            "FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', '', k = 3, use_index = false) "
+            "ORDER BY _hybrid_score DESC, id",
+        ),
+        (
+            "vector-prefilter",
+            "SELECT id FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 10, prefilter = true, use_index = false) "
+            "WHERE label >= 4 ORDER BY id",
+        ),
+        (
+            "fts-prefilter",
+            "SELECT id FROM lance_fts("
+            f"{path_sql}, 'text', 'puppy', k = 10, prefilter = true) "
+            "WHERE label >= 3 ORDER BY id",
+        ),
+        (
+            "hybrid-empty-prefilter",
+            "SELECT id FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, prefilter = true, use_index = false) "
+            "WHERE label > 100 ORDER BY id",
+        ),
+        (
+            "vector-controls-postfilter-offset",
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 5, nprobs = 2, refine_factor = 2, prefilter = false, "
+            "use_index = false) WHERE label >= 2 "
+            "ORDER BY _distance, id LIMIT 2 OFFSET 1",
+        ),
+        (
+            "fts-postfilter",
+            "SELECT id, _score FROM lance_fts("
+            f"{path_sql}, 'text', 'puppy', k = 10, prefilter = false) "
+            "WHERE label >= 3 ORDER BY _score DESC, id",
+        ),
+        (
+            "hybrid-clamped-alpha-default-oversample",
+            "SELECT id, _hybrid_score FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, use_index = false, alpha = 2.0, "
+            "oversample_factor = 0) ORDER BY _hybrid_score DESC, id",
+        ),
+    )
+
+    connection = _connect()
+    try:
+        for name, sql in searches:
+            expected = connection.execute(sql).fetchall()
+            relation = connection.sql(sql)
+            split_batches = _split_batches(connection, relation)
+            flattened = [
+                batch for batches in split_batches.values() for batch in batches
+            ]
+            assert len(flattened) == 1, name
+            assert flattened[0].count(b"LGS1") == 1, name
+            assert b"global:" in flattened[0], name
+            assert _run(ray_runner, relation) == expected, name
+    finally:
+        connection.close()
+
+
+def test_global_search_computed_score_postfilters_match_native(ray_runner) -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    searches = (
+        (
+            "vector-distance",
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 3, prefilter = true, use_index = false) "
+            "WHERE abs(_distance) < 1000000 ORDER BY _distance, id",
+        ),
+        (
+            "fts-score",
+            "SELECT id, _score FROM lance_fts("
+            f"{path_sql}, 'text', 'puppy', k = 10, prefilter = true) "
+            "WHERE abs(_score) < 1000000 ORDER BY _score DESC, id",
+        ),
+        (
+            "hybrid-score",
+            "SELECT id, _hybrid_score FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, prefilter = true, use_index = false) "
+            "WHERE abs(_hybrid_score) < 1000000 "
+            "ORDER BY _hybrid_score DESC, id",
+        ),
+    )
+
+    connection = _connect()
+    try:
+        for name, sql in searches:
+            expected = connection.execute(sql).fetchall()
+            relation = connection.sql(sql)
+            assert _split_count(connection, relation) == 1, name
+            assert _run(ray_runner, relation) == expected, name
+    finally:
+        connection.close()
+
+
+def test_direct_fts_and_hybrid_reject_complex_prefilter_rewrite() -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    searches = (
+        (
+            "fts",
+            "SELECT id FROM lance_fts("
+            f"{path_sql}, 'text', 'puppy', k = 1, prefilter = true) "
+            "WHERE lower(text) = 'puppy'",
+        ),
+        (
+            "hybrid",
+            "SELECT id FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 1, prefilter = true, use_index = false) "
+            "WHERE lower(text) = 'puppy'",
+        ),
+    )
+
+    connection = _connect()
+    try:
+        for name, sql in searches:
+            connection.execute(sql).fetchall()
+            with pytest.raises(Exception, match="complete filter pushdown"):
+                relation = connection.sql(sql)
+                logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                    relation, f"lance-native-complex-prefilter-{name}"
+                )
+                physical = logical.to_physical_plan(connection)
+                physical.scan_split_batch_map()
+    finally:
+        connection.close()
+
+
+def test_global_search_repeated_serialization_preserves_pending_filters() -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    sql = (
+        "SELECT id, _distance FROM lance_vector_search("
+        f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+        "k = 1, prefilter = true, use_index = false) "
+        "WHERE lower(text) = 'puppy eats food' ORDER BY _distance, id"
+    )
+
+    connection = _connect()
+    try:
+        logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            connection.sql(sql), "lance-repeated-search-serialization"
+        )
+        serialized_once = pickle.dumps(logical)
+        serialized_twice = pickle.dumps(pickle.loads(serialized_once))
+        serialized_thrice = pickle.dumps(pickle.loads(serialized_twice))
+
+        signatures = []
+        for serialized in (serialized_once, serialized_twice, serialized_thrice):
+            replay = pickle.loads(serialized)
+            physical = replay.to_physical_plan(connection)
+            signature = tuple(
+                sorted(
+                    (
+                        str(node_id),
+                        tuple(bytes(batch) for batch in batches),
+                    )
+                    for node_id, batches in physical.scan_split_batch_map().items()
+                )
+            )
+            assert sum(len(batches) for _, batches in signature) == 1
+            signatures.append(signature)
+        # The split payload authenticates the finalized search state. Losing
+        # pending Filter IR during the second serialization changes its digest.
+        assert signatures[0] == signatures[1] == signatures[2]
+
+        rejected_sql = (
+            "SELECT id FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 3, prefilter = true, use_index = false) "
+            "WHERE length(text) > 0"
+        )
+        rejected = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            connection.sql(rejected_sql), "lance-repeated-search-rejection"
+        )
+        rejected_serialized = pickle.dumps(pickle.loads(pickle.dumps(rejected)))
+        with pytest.raises(Exception, match="complete filter pushdown"):
+            rejected_physical = pickle.loads(rejected_serialized).to_physical_plan(
+                connection
+            )
+            rejected_physical.scan_split_batch_map()
+    finally:
+        connection.close()
+
+
+def test_namespace_outer_filters_remain_after_top_k(ray_runner) -> None:
+    root = (Path(__file__).resolve().parents[2] / "test/data").resolve()
+    source = _sql_literal("postfilter_ns.main.search_test_data")
+    calls = (
+        (
+            "vector",
+            "lance_vector_search("
+            f"{source}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 1, prefilter = true, use_index = false, "
+            "filter = 'label >= 0')",
+        ),
+        (
+            "fts",
+            "lance_fts("
+            f"{source}, 'text', 'puppy', k = 1, prefilter = true, "
+            "filter = 'label >= 0')",
+        ),
+        (
+            "hybrid",
+            "lance_hybrid_search("
+            f"{source}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 1, prefilter = true, use_index = false)",
+        ),
+    )
+
+    connection = _connect()
+    try:
+        connection.execute(f"ATTACH {_sql_literal(root)} AS postfilter_ns (TYPE LANCE)")
+        for name, call in calls:
+            top = connection.execute(f"SELECT id FROM {call}").fetchone()
+            assert top is not None, name
+            sql = f"SELECT id FROM {call} WHERE id <> {int(top[0])} ORDER BY id"
+            expected = connection.execute(sql).fetchall()
+            if name != "hybrid":
+                assert expected == [], name
+            relation = connection.sql(sql)
+            assert _split_count(connection, relation) == 1, name
+            assert _run(ray_runner, relation) == expected, name
+    finally:
+        connection.close()
+
+
+def test_two_global_search_nodes_keep_independent_singleton_tasks(ray_runner) -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    sql = (
+        "SELECT source, id FROM ("
+        "SELECT 'vector' AS source, id FROM lance_vector_search("
+        f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+        "k = 3, use_index = false) "
+        "UNION ALL "
+        "SELECT 'fts' AS source, id FROM lance_fts("
+        f"{path_sql}, 'text', 'puppy', k = 10)) "
+        "ORDER BY source, id"
+    )
+
+    connection = _connect()
+    try:
+        expected = connection.execute(sql).fetchall()
+        relation = connection.sql(sql)
+        batches = [
+            batch
+            for node_batches in _split_batches(connection, relation).values()
+            for batch in node_batches
+        ]
+        assert len(batches) == 2
+        assert all(batch.count(b"LGS1") == 1 for batch in batches)
+        assert len({batch[batch.index(b"global:") :][:43] for batch in batches}) == 2
+        assert _run(ray_runner, relation) == expected
+    finally:
+        connection.close()
+
+
+def test_indexed_partial_coverage_global_search_matches_native(
+    tmp_path: Path, ray_runner
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path = tmp_path / "distributed-search-indexed.lance"
+    path_sql = _sql_literal(path)
+
+    connection = _connect()
+    try:
+        connection.execute(
+            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
+            "(FORMAT LANCE, MODE 'create')"
+        )
+        connection.execute(
+            f"CREATE INDEX vec_idx ON {path_sql} (vec) "
+            "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2')"
+        )
+        connection.execute(f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED")
+        connection.execute(
+            f"CREATE TEMP TABLE lance_search_append AS "
+            f"SELECT * FROM {path_sql} ORDER BY id LIMIT 2"
+        )
+        connection.execute(
+            "UPDATE lance_search_append SET id = id + 100, " "text = text || ' puppy'"
+        )
+        connection.execute(
+            f"COPY lance_search_append TO {path_sql} " "(FORMAT LANCE, MODE 'append')"
+        )
+
+        searches = (
+            (
+                "indexed-vector",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+                "k = 5, nprobs = 1, refine_factor = 2, use_index = true) "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "partial-coverage-fts",
+                "SELECT id, _score FROM lance_fts("
+                f"{path_sql}, 'text', 'puppy', k = 10) "
+                "ORDER BY _score DESC, id",
+            ),
+            (
+                "partial-coverage-hybrid",
+                "SELECT id, _distance, _score, _hybrid_score "
+                "FROM lance_hybrid_search("
+                f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+                "'text', 'puppy', k = 5, nprobs = 1, refine_factor = 2, "
+                "use_index = true, alpha = 0.25, oversample_factor = 4) "
+                "ORDER BY _hybrid_score DESC, id",
+            ),
+        )
+        for name, sql in searches:
+            expected = connection.execute(sql).fetchall()
+            relation = connection.sql(sql)
+            assert _split_count(connection, relation) == 1, name
+            assert _run(ray_runner, relation) == expected, name
+    finally:
+        connection.close()
+
+
+def test_global_search_keeps_snapshot_and_flat_index_plan_after_mutation(
+    tmp_path: Path, ray_runner
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path = tmp_path / "distributed-search-frozen-flat.lance"
+    path_sql = _sql_literal(path)
+    searches = (
+        (
+            "vector",
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 3, use_index = true) ORDER BY _distance, id",
+        ),
+        (
+            "fts",
+            "SELECT id, _score FROM lance_fts("
+            f"{path_sql}, 'text', 'puppy', k = 10) "
+            "ORDER BY _score DESC, id",
+        ),
+        (
+            "hybrid",
+            "SELECT id, _distance, _score, _hybrid_score "
+            "FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, use_index = true, alpha = 0.25) "
+            "ORDER BY _hybrid_score DESC, id",
+        ),
+    )
+
+    connection = _connect()
+    plans: list[
+        tuple[
+            str,
+            str,
+            bytes,
+            tuple[tuple[str, tuple[bytes, ...]], ...],
+            list[tuple[object, ...]],
+        ]
+    ] = []
+    try:
+        connection.execute(
+            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
+            "(FORMAT LANCE, MODE 'create')"
+        )
+        for name, sql in searches:
+            expected = connection.execute(sql).fetchall()
+            logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                connection.sql(sql), f"lance-frozen-flat-{name}"
+            )
+            serialized = pickle.dumps(logical)
+            physical = logical.to_physical_plan(connection)
+            split_signature = tuple(
+                sorted(
+                    (
+                        str(node_id),
+                        tuple(bytes(batch) for batch in batches),
+                    )
+                    for node_id, batches in physical.scan_split_batch_map().items()
+                )
+            )
+            assert sum(len(batches) for _, batches in split_signature) == 1
+            plans.append((name, sql, serialized, split_signature, expected))
+
+        mutator = _connect()
+        try:
+            mutator.execute(
+                "COPY (SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
+                "'puppy puppy puppy'::VARCHAR AS text, "
+                "'puppy'::VARCHAR AS keywords, "
+                "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec) "
+                f"TO {path_sql} (FORMAT LANCE, MODE 'append')"
+            )
+            mutator.execute(
+                f"CREATE INDEX vec_idx ON {path_sql} (vec) "
+                "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2')"
+            )
+            mutator.execute(
+                f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED"
+            )
+            latest_results = {
+                name: mutator.execute(sql).fetchall() for name, sql in searches
+            }
+        finally:
+            mutator.close()
+
+        assert all(
+            any(row[0] == -1 for row in latest_results[name]) for name, _ in searches
+        )
+        for name, _sql, serialized, split_signature, expected in plans:
+            planning_connection = _connect()
+            try:
+                physical = pickle.loads(serialized).to_physical_plan(
+                    planning_connection
+                )
+                replay_signature = tuple(
+                    sorted(
+                        (
+                            str(node_id),
+                            tuple(bytes(batch) for batch in batches),
+                        )
+                        for node_id, batches in physical.scan_split_batch_map().items()
+                    )
+                )
+            finally:
+                planning_connection.close()
+            assert replay_signature == split_signature, name
+            assert _run_serialized_logical(ray_runner, serialized) == expected, name
+    finally:
+        connection.close()
+
+
+def test_global_search_keeps_selected_index_segments_after_replacement(
+    tmp_path: Path, ray_runner
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    scenarios = (
+        ("vector", ("vector",)),
+        ("fts", ("fts",)),
+        ("hybrid", ("vector", "fts")),
+    )
+
+    for kind, branches in scenarios:
+        path = tmp_path / f"distributed-search-replaced-{kind}.lance"
+        path_sql = _sql_literal(path)
+        connection = _connect()
+        try:
+            connection.execute(
+                f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
+                "(FORMAT LANCE, MODE 'create')"
+            )
+            if "vector" in branches:
+                connection.execute(
+                    f"CREATE INDEX vec_idx ON {path_sql} (vec) "
+                    "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2')"
+                )
+            if "fts" in branches:
+                connection.execute(
+                    f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED"
+                )
+
+            if kind == "vector":
+                sql = (
+                    "SELECT id, _distance FROM lance_vector_search("
+                    f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+                    "k = 3, use_index = true) ORDER BY _distance, id"
+                )
+            elif kind == "fts":
+                sql = (
+                    "SELECT id, _score FROM lance_fts("
+                    f"{path_sql}, 'text', 'puppy', k = 10) "
+                    "ORDER BY _score DESC, id"
+                )
+            else:
+                sql = (
+                    "SELECT id, _distance, _score, _hybrid_score "
+                    "FROM lance_hybrid_search("
+                    f"{path_sql}, 'vec', "
+                    "[0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+                    "'text', 'puppy', k = 3, use_index = true, alpha = 0.25) "
+                    "ORDER BY _hybrid_score DESC, id"
+                )
+
+            expected = connection.execute(sql).fetchall()
+            logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                connection.sql(sql), f"lance-index-replacement-{kind}"
+            )
+            serialized = pickle.dumps(logical)
+            physical = logical.to_physical_plan(connection)
+            planned_batches = tuple(
+                bytes(batch)
+                for batches in physical.scan_split_batch_map().values()
+                for batch in batches
+            )
+            assert len(planned_batches) == 1
+
+            old_index_ids = {entry.name for entry in (path / "_indices").iterdir()}
+            assert len(old_index_ids) == len(branches)
+            if "vector" in branches:
+                connection.execute(
+                    f"CREATE INDEX vec_idx ON {path_sql} (vec) "
+                    "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2', "
+                    "replace=true)"
+                )
+            if "fts" in branches:
+                connection.execute(
+                    f"CREATE INDEX text_idx ON {path_sql} (text) "
+                    "USING INVERTED WITH (replace=true)"
+                )
+            current_index_ids = {entry.name for entry in (path / "_indices").iterdir()}
+            assert old_index_ids < current_index_ids
+            assert len(current_index_ids - old_index_ids) == len(branches)
+
+            planning_connection = _connect()
+            try:
+                replay_physical = pickle.loads(serialized).to_physical_plan(
+                    planning_connection
+                )
+                replay_batches = tuple(
+                    bytes(batch)
+                    for batches in replay_physical.scan_split_batch_map().values()
+                    for batch in batches
+                )
+            finally:
+                planning_connection.close()
+            assert replay_batches == planned_batches, kind
+            assert _run_serialized_logical(ray_runner, serialized) == expected, kind
+        finally:
+            connection.close()
+
+
+def test_global_search_fails_when_the_frozen_snapshot_is_vacuumed(
+    tmp_path: Path, ray_runner
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path = tmp_path / "distributed-search-vacuumed.lance"
+    path_sql = _sql_literal(path)
+    sql = (
+        "SELECT id, _distance FROM lance_vector_search("
+        f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+        "k = 3, use_index = false) ORDER BY _distance, id"
+    )
+
+    connection = _connect()
+    try:
+        connection.execute(
+            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
+            "(FORMAT LANCE, MODE 'create')"
+        )
+        logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            connection.sql(sql), "lance-search-vacuumed-snapshot"
+        )
+        serialized = pickle.dumps(logical)
+        assert (
+            sum(
+                len(batches)
+                for batches in logical.to_physical_plan(connection)
+                .scan_split_batch_map()
+                .values()
+            )
+            == 1
+        )
+
+        connection.execute(
+            "COPY (SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
+            "'puppy'::VARCHAR AS text, 'puppy'::VARCHAR AS keywords, "
+            "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec) "
+            f"TO {path_sql} (FORMAT LANCE, MODE 'append')"
+        )
+        cleanup = connection.execute(
+            f"VACUUM LANCE {path_sql} WITH ("
+            "older_than_seconds = 0, delete_unverified = true, "
+            "error_if_tagged_old_versions = false, retain_n_versions = 1)"
+        ).fetchone()
+        assert cleanup[0] == "cleanup"
+        assert '"old_versions":1' in cleanup[2]
+
+        with pytest.raises(
+            Exception,
+            match="Failed to reopen the frozen distributed Lance search version",
+        ):
+            _run_serialized_logical(ray_runner, serialized)
+    finally:
+        connection.close()
+
+
+def test_global_search_fails_when_a_selected_index_segment_is_removed(
+    tmp_path: Path, ray_runner
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path = tmp_path / "distributed-search-missing-index.lance"
+    path_sql = _sql_literal(path)
+    sql = (
+        "SELECT id, _distance FROM lance_vector_search("
+        f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+        "k = 3, use_index = true) ORDER BY _distance, id"
+    )
+
+    connection = _connect()
+    try:
+        connection.execute(
+            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
+            "(FORMAT LANCE, MODE 'create')"
+        )
+        connection.execute(
+            f"CREATE INDEX vec_idx ON {path_sql} (vec) "
+            "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2')"
+        )
+        logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            connection.sql(sql), "lance-search-missing-index"
+        )
+        serialized = pickle.dumps(logical)
+        assert (
+            sum(
+                len(batches)
+                for batches in logical.to_physical_plan(connection)
+                .scan_split_batch_map()
+                .values()
+            )
+            == 1
+        )
+
+        index_directories = list((path / "_indices").iterdir())
+        assert len(index_directories) == 1
+        shutil.rmtree(index_directories[0])
+        with pytest.raises(Exception, match="index"):
+            _run_serialized_logical(ray_runner, serialized)
+    finally:
+        connection.close()
+
+
+def test_global_search_rejects_a_same_uri_dataset_recreation(
+    tmp_path: Path, ray_runner
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path = tmp_path / "distributed-search-recreated.lance"
+    path_sql = _sql_literal(path)
+    sql = (
+        "SELECT id, _score FROM lance_fts("
+        f"{path_sql}, 'text', 'puppy', k = 10) ORDER BY _score DESC, id"
+    )
+
+    connection = _connect()
+    try:
+        connection.execute(
+            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
+            "(FORMAT LANCE, MODE 'create')"
+        )
+        logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            connection.sql(sql), "lance-search-recreated-dataset"
+        )
+        serialized = pickle.dumps(logical)
+        assert (
+            sum(
+                len(batches)
+                for batches in logical.to_physical_plan(connection)
+                .scan_split_batch_map()
+                .values()
+            )
+            == 1
+        )
+
+        shutil.rmtree(path)
+        replacement = _connect()
+        try:
+            replacement.execute(
+                f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
+                "(FORMAT LANCE, MODE 'create')"
+            )
+        finally:
+            replacement.close()
+
+        with pytest.raises(Exception, match="snapshot generation changed"):
+            _run_serialized_logical(ray_runner, serialized)
+    finally:
+        connection.close()
+
+
+def test_standard_rest_physical_reads_survive_namespace_shutdown(ray_runner) -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    namespace_source = "standard_rest.main.items"
+    namespace_source_sql = _sql_literal(namespace_source)
+    query_pairs = (
+        (
+            "scan",
+            f"SELECT id, label FROM {path_sql} ORDER BY id",
+            f"SELECT id, label FROM {namespace_source} ORDER BY id",
+        ),
+        (
+            "vector",
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 3, use_index = false) ORDER BY _distance, id",
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{namespace_source_sql}, 'vec', "
+            "[0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 3, use_index = false) "
+            "ORDER BY _distance, id",
+        ),
+        (
+            "fts",
+            "SELECT id, _score FROM lance_fts("
+            f"{path_sql}, 'text', 'puppy', k = 10) "
+            "ORDER BY _score DESC, id",
+            "SELECT id, _score FROM lance_fts("
+            f"{namespace_source_sql}, 'text', 'puppy', k = 10) "
+            "ORDER BY _score DESC, id",
+        ),
+        (
+            "hybrid",
+            "SELECT id, _distance, _score, _hybrid_score "
+            "FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, use_index = false, alpha = 0.25) "
+            "ORDER BY _hybrid_score DESC, id",
+            "SELECT id, _distance, _score, _hybrid_score "
+            "FROM lance_hybrid_search("
+            f"{namespace_source_sql}, 'vec', "
+            "[0.0, 0.0, 0.0, 0.0]::FLOAT[4], 'text', 'puppy', "
+            "k = 3, use_index = false, alpha = 0.25) "
+            "ORDER BY _hybrid_score DESC, id",
+        ),
+    )
+
+    connection = _connect()
+    logical_plans: list[tuple[str, bytes, list[tuple[object, ...]]]] = []
+    observed_requests: list[dict[str, object]] = []
+    endpoint = ""
+    bearer_token = ""
+    storage_secret_marker = ""
+    planning_error: Exception | None = None
+    try:
+        direct_results = {
+            name: connection.execute(direct_sql).fetchall()
+            for name, direct_sql, _ in query_pairs
+        }
+        with _standard_rest_physical_server(
+            f"file:{path}",
+            SEARCH_FIXTURE_REST_SCHEMA,
+            version=3,
+        ) as server:
+            (
+                endpoint,
+                bearer_token,
+                storage_secret_marker,
+                observed_requests,
+                _response_version,
+            ) = server
+            connection.execute(
+                "ATTACH 'safe-namespace-id' AS standard_rest (TYPE LANCE, "
+                f"ENDPOINT {_sql_literal(endpoint)}, "
+                f"BEARER_TOKEN {_sql_literal(bearer_token)})"
+            )
+            for name, _direct_sql, namespace_sql in query_pairs:
+                relation = connection.sql(namespace_sql)
+                try:
+                    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                        relation, f"lance-standard-rest-{name}"
+                    )
+                except Exception as error:
+                    planning_error = error
+                    break
+                serialized = pickle.dumps(logical)
+                for sensitive in (endpoint, bearer_token, storage_secret_marker):
+                    assert sensitive.encode() not in serialized
+
+                physical = logical.to_physical_plan(connection)
+                split_count = sum(
+                    len(batches) for batches in physical.scan_split_batch_map().values()
+                )
+                assert split_count >= 1, name
+                if name != "scan":
+                    assert split_count == 1, name
+                logical_plans.append((name, serialized, direct_results[name]))
+
+        if planning_error is not None:
+            raise AssertionError(
+                f"REST planning failed after requests {observed_requests!r}"
+            ) from planning_error
+        distributed_describes = [
+            request
+            for request in observed_requests
+            if isinstance(request.get("body"), dict)
+            and request["body"].get("with_table_uri") is True
+            and request["body"].get("load_detailed_metadata") is True
+            and request["body"].get("vend_credentials") is False
+        ]
+        assert len(distributed_describes) >= len(query_pairs)
+        assert all(
+            "context" not in request["body"] for request in distributed_describes
+        )
+        assert all(
+            request["body"].get("version") == 3 for request in distributed_describes
+        )
+        request_count_after_plan = len(observed_requests)
+
+        for name, serialized, expected in logical_plans:
+            assert _run_serialized_logical(ray_runner, serialized) == expected, name
+            assert len(observed_requests) == request_count_after_plan
+    finally:
+        connection.close()
+
+
+def test_standard_rest_resolution_stays_on_the_bound_snapshot(
+    tmp_path: Path,
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path = tmp_path / "rest-snapshot.lance"
+    shutil.copytree(source, path)
+    path_sql = _sql_literal(path)
+    namespace_source = _sql_literal("rest_snapshot.main.items")
+    queries = (
+        (
+            "scan",
+            "SELECT id FROM rest_snapshot.main.items ORDER BY id",
+        ),
+        (
+            "vector",
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{namespace_source}, 'vec', "
+            "[0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 1, use_index = false) ORDER BY _distance, id",
+        ),
+    )
+
+    connection = _connect()
+    observed_requests: list[dict[str, object]] = []
+    planning_errors: list[Exception] = []
+    try:
+        with _standard_rest_physical_server(
+            f"file:{path}", SEARCH_FIXTURE_REST_SCHEMA, version=3
+        ) as server:
+            (
+                endpoint,
+                bearer_token,
+                _storage_secret_marker,
+                observed_requests,
+                response_version,
+            ) = server
+            connection.execute(
+                "ATTACH 'safe-namespace-id' AS rest_snapshot (TYPE LANCE, "
+                f"ENDPOINT {_sql_literal(endpoint)}, "
+                f"BEARER_TOKEN {_sql_literal(bearer_token)})"
+            )
+            # Prime the namespace dataset cache while DescribeTable reports
+            # version 3. The regression requires these already-bound relations
+            # to retain that snapshot while their distributed DescribeTable
+            # calls run after the remote table has advanced.
+            bound_relations = [(name, connection.sql(sql)) for name, sql in queries]
+
+            mutator = _connect()
+            try:
+                mutator.execute(
+                    "COPY (SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
+                    "'puppy'::VARCHAR AS text, 'puppy'::VARCHAR AS keywords, "
+                    "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec) "
+                    f"TO {path_sql} (FORMAT LANCE, MODE 'append')"
+                )
+            finally:
+                mutator.close()
+            response_version.value = 4
+
+            for name, relation in bound_relations:
+                try:
+                    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                        relation, f"lance-rest-bound-snapshot-{name}"
+                    )
+                    physical = logical.to_physical_plan(connection)
+                    physical.scan_split_batch_map()
+                except Exception as error:
+                    planning_errors.append(error)
+                else:
+                    raise AssertionError(
+                        f"REST {name} planned from a newer DescribeTable snapshot"
+                    )
+
+        assert len(planning_errors) == len(queries)
+        distributed_describes = [
+            request
+            for request in observed_requests
+            if isinstance(request.get("body"), dict)
+            and request["body"].get("with_table_uri") is True
+            and request["body"].get("load_detailed_metadata") is True
+            and request["body"].get("vend_credentials") is False
+        ]
+        assert len(distributed_describes) >= len(queries)
+        assert all(
+            request["body"].get("version") == 3 for request in distributed_describes
+        )
+    finally:
+        connection.close()
 
 
 def test_fragment_scan_preserves_filter_projection_aggregate_and_global_limit(
@@ -2767,6 +3988,18 @@ def test_s3_connection_credentials_override_process_environment(
     seed = _connect()
     try:
         _write_dataset(seed, path)
+        namespace_root = path.rsplit("/", 1)[0]
+        search_path = f"{namespace_root}/search_items.lance"
+        # Seed every remote dataset before the isolated subprocess replaces its
+        # ambient credentials. This test exercises distributed read credential
+        # precedence, not native COPY credential resolution.
+        seed.execute(
+            "COPY (SELECT i::BIGINT AS id, i::INTEGER AS label, "
+            "CASE WHEN i % 2 = 0 THEN 'puppy' ELSE 'kitten' END::VARCHAR "
+            "AS text, [i::FLOAT, 0.0, 0.0, 0.0]::FLOAT[4] AS vec "
+            "FROM range(5) AS source(i)) "
+            f"TO {_sql_literal(search_path)} (FORMAT LANCE, MODE 'create')"
+        )
     finally:
         seed.close()
 
@@ -3118,17 +4351,28 @@ def test_worker_rejects_overlapping_take_split_ranges(
         connection.close()
 
 
-def test_real_ray_fte_task_retry_preserves_lance_snapshot_exactly_once(
-    tmp_path: Path, ray_retry_runner
+@pytest.mark.parametrize("query_kind", ("fragment-scan", "global-search"))
+@pytest.mark.parametrize("failure_phase", ("before-output", "after-output"))
+def test_real_ray_fte_task_retry_preserves_lance_state_exactly_once(
+    tmp_path: Path, ray_retry_runner, query_kind: str, failure_phase: str
 ) -> None:
     import ray
     import ray.cloudpickle
 
-    path = tmp_path / "retry_snapshot.lance"
-    sql = (
-        "SELECT id, CAST(to_timestamp(1704067200 + id) AS VARCHAR) AS local_time "
-        f"FROM {_sql_literal(path)}"
-    )
+    path = tmp_path / f"retry_{query_kind.replace('-', '_')}.lance"
+    if query_kind == "fragment-scan":
+        sql = (
+            "SELECT id, "
+            "CAST(to_timestamp(1704067200 + id) AS VARCHAR) AS local_time "
+            f"FROM {_sql_literal(path)}"
+        )
+    else:
+        sql = (
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{_sql_literal(path)}, 'vec', "
+            "[0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 3, use_index = false) ORDER BY _distance, id"
+        )
     writer = _connect()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = None
@@ -3137,8 +4381,17 @@ def test_real_ray_fte_task_retry_preserves_lance_snapshot_exactly_once(
     test_module = sys.modules[__name__]
     ray.cloudpickle.register_pickle_by_value(test_module)
     try:
-        _write_dataset(writer, path)
-        writer.execute("SET TimeZone = 'Pacific/Honolulu'")
+        if query_kind == "fragment-scan":
+            _write_dataset(writer, path)
+            writer.execute("SET TimeZone = 'Pacific/Honolulu'")
+        else:
+            source = (
+                Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+            ).resolve()
+            writer.execute(
+                f"COPY (SELECT * FROM {_sql_literal(source)}) "
+                f"TO {_sql_literal(path)} (FORMAT LANCE, MODE 'create')"
+            )
         expected = sorted(writer.execute(sql).fetchall())
 
         # Materialize the job-scoped query driver and its two real worker actors
@@ -3148,14 +4401,20 @@ def test_real_ray_fte_task_retry_preserves_lance_snapshot_exactly_once(
         client = ray_retry_runner.query_driver_client
         assert client is not None
         driver_actor = client.runner
-        workers = ray.get(driver_actor.__ray_call__.remote(_install_fte_retry_gate))
+        workers = ray.get(
+            driver_actor.__ray_call__.remote(
+                _install_fte_retry_gate,
+                failure_phase,
+            )
+        )
         assert len(workers) == WORKER_COUNT
         worker_actors = [worker["actor"] for worker in workers.values()]
 
         def run_query() -> list[tuple[object, ...]]:
             connection = _connect()
             try:
-                connection.execute("SET TimeZone = 'Pacific/Honolulu'")
+                if query_kind == "fragment-scan":
+                    connection.execute("SET TimeZone = 'Pacific/Honolulu'")
                 return _run(ray_retry_runner, connection.sql(sql))
             finally:
                 connection.close()
@@ -3198,30 +4457,41 @@ def test_real_ray_fte_task_retry_preserves_lance_snapshot_exactly_once(
                 break
             if future.done():
                 raise AssertionError(
-                    "query completed before the native scan reached its retry gate: "
+                    "query completed before the worker reached its retry gate: "
                     f"{future.result()!r}"
                 )
             time.sleep(0.05)
         assert (
             worker_attempt0 is not None
-        ), "timed out waiting for the real native Lance scan to finish"
+        ), "timed out waiting for the worker retry gate"
         assert worker_attempt0["attempt_number"] == 0
         assert worker_attempt0["task_id"] == attempt0["task_id"]
         assert worker_attempt0["query_id"] == attempt0["query_id"]
 
-        # Commit a deletion after the worker completed the real native scan for
-        # attempt 0, but before that attempt reports its injected retryable
-        # failure. A retry that silently reopens latest would lose these rows.
-        writer.execute(
-            f"ATTACH {_sql_literal(tmp_path)} AS retry_ns "
-            "(TYPE LANCE, READ_ONLY false)"
-        )
-        writer.execute(
-            "DELETE FROM retry_ns.main.retry_snapshot WHERE id IN (1, 4, 7, 10)"
-        )
-        assert writer.execute(
-            f"SELECT id FROM {_sql_literal(path)} ORDER BY id"
-        ).fetchall() == [(row_id,) for row_id in (0, 2, 3, 5, 6, 8, 9, 11)]
+        # Commit after attempt 0 captured the immutable plan and before its
+        # injected retryable failure is reported. Reopening latest would make
+        # the retried result observably different in either query shape.
+        if query_kind == "fragment-scan":
+            writer.execute(
+                f"ATTACH {_sql_literal(tmp_path)} AS retry_ns "
+                "(TYPE LANCE, READ_ONLY false)"
+            )
+            writer.execute(
+                "DELETE FROM retry_ns.main.retry_fragment_scan "
+                "WHERE id IN (1, 4, 7, 10)"
+            )
+            assert writer.execute(
+                f"SELECT id FROM {_sql_literal(path)} ORDER BY id"
+            ).fetchall() == [(row_id,) for row_id in (0, 2, 3, 5, 6, 8, 9, 11)]
+        else:
+            writer.execute(
+                "COPY (SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
+                "'puppy puppy puppy'::VARCHAR AS text, "
+                "'puppy'::VARCHAR AS keywords, "
+                "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec) "
+                f"TO {_sql_literal(path)} (FORMAT LANCE, MODE 'append')"
+            )
+            assert any(row[0] == -1 for row in writer.execute(sql).fetchall())
 
         ray.get(
             attempt0_worker_actor.__ray_call__.remote(_release_fte_worker_retry_gate)
@@ -3317,9 +4587,12 @@ def test_real_ray_fte_task_retry_preserves_lance_snapshot_exactly_once(
         rows = sorted(future.result(timeout=60))
         ids = [int(row[0]) for row in rows]
         assert rows == expected
-        assert ids == list(range(12))
-        assert len(ids) == len(set(ids)) == 12
-        assert all(row_id in ids for row_id in (1, 4, 7, 10))
+        assert len(ids) == len(set(ids)) == len(expected)
+        if query_kind == "fragment-scan":
+            assert ids == list(range(12))
+            assert all(row_id in ids for row_id in (1, 4, 7, 10))
+        else:
+            assert -1 not in ids
         completed_snapshot = ray.get(
             driver_actor.__ray_call__.remote(
                 _fte_retry_gate_snapshot,

@@ -9,6 +9,11 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "duckdb/function/distributed_table_function.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#endif
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/qualified_name.hpp"
@@ -24,13 +29,17 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
+#ifdef LANCE_VANE_DISTRIBUTED
+#include "lance_vane_rest_resolution.hpp"
+#include "lance_vane_search.hpp"
+#endif
 
 #include <atomic>
 #include <cmath>
@@ -249,6 +258,129 @@ static void PopulateNamespaceSearchSchema(
   return_types = result_types;
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+enum class LanceVaneSearchColumnReferenceClass : uint8_t {
+  NONE = 0,
+  BASE_ONLY = 1,
+  COMPUTED_ONLY = 2,
+  MIXED_OR_UNRESOLVED = 3
+};
+
+static LanceVaneSearchColumnReferenceClass
+ClassifyVaneSearchColumnReferences(const LogicalGet &get,
+                                   const vector<string> &names,
+                                   const Expression &expression) {
+  bool saw_base = false;
+  bool saw_computed = false;
+  bool unresolved = false;
+  auto classify_scan_index = [&](idx_t scan_index) {
+    auto &column_ids = get.GetColumnIds();
+    if (scan_index >= column_ids.size()) {
+      unresolved = true;
+      return;
+    }
+    auto &column_index = column_ids[scan_index];
+    if (column_index.IsVirtualColumn() || !column_index.HasPrimaryIndex()) {
+      unresolved = true;
+      return;
+    }
+    auto column_id = column_index.GetPrimaryIndex();
+    if (column_id >= names.size()) {
+      unresolved = true;
+      return;
+    }
+    if (IsComputedSearchColumn(names[column_id])) {
+      saw_computed = true;
+    } else {
+      saw_base = true;
+    }
+  };
+
+  ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+      expression, [&](const BoundColumnRefExpression &column_ref) {
+        if (column_ref.depth != 0 ||
+            column_ref.binding.table_index != get.table_index) {
+          unresolved = true;
+          return;
+        }
+        classify_scan_index(column_ref.binding.column_index);
+      });
+  ExpressionIterator::VisitExpression<BoundReferenceExpression>(
+      expression, [&](const BoundReferenceExpression &reference) {
+        classify_scan_index(reference.index);
+      });
+
+  if (unresolved || (saw_base && saw_computed)) {
+    return LanceVaneSearchColumnReferenceClass::MIXED_OR_UNRESOLVED;
+  }
+  if (saw_computed) {
+    return LanceVaneSearchColumnReferenceClass::COMPUTED_ONLY;
+  }
+  if (saw_base) {
+    return LanceVaneSearchColumnReferenceClass::BASE_ONLY;
+  }
+  return LanceVaneSearchColumnReferenceClass::NONE;
+}
+
+static void PrepareVaneSearchCandidate(
+    ClientContext &context, const Value &source_value,
+    const shared_ptr<LanceDatasetCacheEntry> &dataset_entry,
+    const string &physical_path, bool private_uri_diagnostics,
+    LanceVanePhysicalCandidate &out_candidate) {
+  try {
+    auto *table =
+        TryResolveLanceTableEntry(context, source_value.GetValue<string>());
+    if (table && table->IsNamespaceBacked() &&
+        table->NamespaceConfig().IsRest()) {
+      LanceVaneResolveRestPhysicalCandidate(context, *table, dataset_entry,
+                                            out_candidate);
+      return;
+    }
+    auto source_class = table && table->IsNamespaceBacked()
+                            ? LanceVaneSearchSourceClass::DIRECTORY_NAMESPACE
+                            : LanceVaneSearchSourceClass::DIRECT;
+    if (source_class == LanceVaneSearchSourceClass::DIRECTORY_NAMESPACE &&
+        !LanceVaneDirectoryNamespaceSessionMatches(context,
+                                                   table->NamespaceConfig())) {
+      out_candidate = {};
+      out_candidate.attempted = true;
+      out_candidate.source_class = source_class;
+      out_candidate.private_uri_diagnostics = private_uri_diagnostics;
+      out_candidate.safe_failure =
+          "Distributed Lance directory namespace searches require the query "
+          "session storage settings to match the settings captured by ATTACH";
+      return;
+    }
+    auto requires_secret =
+        table && table->IsNamespaceBacked()
+            ? table->NamespaceConfig().uses_coordinator_storage_secret
+            : LanceHasMatchingStorageSecret(context, physical_path);
+    LanceVaneCapturePhysicalCandidate(context, physical_path, dataset_entry,
+                                      source_class, private_uri_diagnostics,
+                                      requires_secret, out_candidate);
+  } catch (Exception &) {
+    out_candidate = {};
+    out_candidate.attempted = true;
+    out_candidate.safe_failure =
+        "Distributed Lance search could not freeze a replayable physical "
+        "candidate";
+  }
+}
+
+static LanceVaneSearchOverload VaneVectorOverload(const LogicalType &query_type,
+                                                  bool hybrid) {
+  auto child_type = ListType::GetChildType(query_type);
+  if (hybrid) {
+    return child_type.id() == LogicalTypeId::DOUBLE
+               ? LanceVaneSearchOverload::HYBRID_DOUBLE
+               : LanceVaneSearchOverload::HYBRID_FLOAT;
+  }
+  return child_type.id() == LogicalTypeId::DOUBLE
+             ? LanceVaneSearchOverload::VECTOR_DOUBLE
+             : LanceVaneSearchOverload::VECTOR_FLOAT;
+}
+#endif
+
 struct LanceKnnBindData : public TableFunctionData {
   string file_path;
 #ifdef LANCE_VANE_DISTRIBUTED
@@ -275,7 +407,47 @@ struct LanceKnnBindData : public TableFunctionData {
   vector<LogicalType> types;
 
   vector<string> lance_pushed_filter_ir_parts;
+#ifdef LANCE_VANE_DISTRIBUTED
+  bool complex_filter_pushdown_failed = false;
+  LanceVaneSearchOverload vane_overload = LanceVaneSearchOverload::VECTOR_FLOAT;
+  LanceVanePhysicalCandidate vane_candidate;
+  LanceVaneGlobalSearchState vane_state;
+
+  unique_ptr<FunctionData> Copy() const override {
+    auto result = make_uniq<LanceKnnBindData>();
+    result->column_ids = column_ids;
+    result->file_path = file_path;
+    result->private_uri_diagnostics = private_uri_diagnostics;
+    result->vector_column = vector_column;
+    result->query = query;
+    result->k = k;
+    result->nprobes = nprobes;
+    result->refine_factor = refine_factor;
+    result->prefilter = prefilter;
+    result->use_index = use_index;
+    result->explain_verbose = explain_verbose;
+    result->namespace_backed = namespace_backed;
+    result->namespace_config = namespace_config;
+    result->namespace_filter = namespace_filter;
+    result->dataset_entry = dataset_entry;
+    result->dataset = dataset;
+    result->dataset_cache_hit = dataset_cache_hit;
+    result->arrow_table = arrow_table;
+    result->names = names;
+    result->types = types;
+    result->lance_pushed_filter_ir_parts = lance_pushed_filter_ir_parts;
+    result->complex_filter_pushdown_failed = complex_filter_pushdown_failed;
+    result->vane_overload = vane_overload;
+    result->vane_candidate = vane_candidate;
+    result->vane_state = vane_state;
+    return result;
+  }
+#endif
 };
+
+#ifdef LANCE_VANE_DISTRIBUTED
+static void LancePrepareKnnVaneState(LanceKnnBindData &bind_data);
+#endif
 
 struct LanceKnnGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> lines_read{0};
@@ -293,6 +465,11 @@ struct LanceKnnGlobalState : public GlobalTableFunctionState {
   string explain_plan;
   string explain_error;
   std::mutex explain_mutex;
+
+#ifdef LANCE_VANE_DISTRIBUTED
+  shared_ptr<LanceDatasetCacheEntry> vane_dataset_entry;
+  void *vane_dataset = nullptr;
+#endif
 
   idx_t MaxThreads() const override { return 1; }
   bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
@@ -329,7 +506,17 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
   }
 
   for (auto &expr : filters) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    if (expr &&
+        ClassifyVaneSearchColumnReferences(get, scan_bind.names, *expr) ==
+            LanceVaneSearchColumnReferenceClass::COMPUTED_ONLY) {
+      continue;
+    }
+#endif
     if (!expr || expr->HasParameter() || expr->IsVolatile()) {
+#ifdef LANCE_VANE_DISTRIBUTED
+      scan_bind.complex_filter_pushdown_failed = true;
+#endif
       continue;
     }
     if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
@@ -369,6 +556,9 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
     string filter_ir;
     if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, true,
                                    *expr, filter_ir)) {
+#ifdef LANCE_VANE_DISTRIBUTED
+      scan_bind.complex_filter_pushdown_failed = true;
+#endif
       continue;
     }
     scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
@@ -410,6 +600,7 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
 #ifdef LANCE_VANE_DISTRIBUTED
   result->private_uri_diagnostics = LanceVanePathRequiresRedaction(
       context, input.inputs[0].GetValue<string>());
+  result->vane_overload = VaneVectorOverload(input.inputs[2].type(), false);
 #endif
   result->vector_column = input.inputs[1].GetValue<string>();
   result->query = ParseQueryVector(input.inputs[2], "lance_vector_search");
@@ -517,6 +708,12 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
     PopulateNamespaceSearchSchema(
         context, *table, "_distance", result->schema_root, result->arrow_table,
         result->names, result->types, names, return_types);
+#ifdef LANCE_VANE_DISTRIBUTED
+    PrepareVaneSearchCandidate(
+        context, input.inputs[0], result->dataset_entry, result->file_path,
+        result->private_uri_diagnostics, result->vane_candidate);
+    LancePrepareKnnVaneState(*result);
+#endif
     return std::move(result);
   }
 
@@ -596,13 +793,19 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+#ifdef LANCE_VANE_DISTRIBUTED
+  PrepareVaneSearchCandidate(context, input.inputs[0], result->dataset_entry,
+                             result->file_path, result->private_uri_diagnostics,
+                             result->vane_candidate);
+  LancePrepareKnnVaneState(*result);
+#endif
   names = result->names;
   return_types = result->types;
   return std::move(result);
 }
 
 static unique_ptr<GlobalTableFunctionState>
-LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto state = make_uniq_base<GlobalTableFunctionState, LanceKnnGlobalState>();
   auto &global = state->Cast<LanceKnnGlobalState>();
@@ -617,6 +820,18 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
       global.scanned_types.push_back(bind_data.types[col_id]);
     }
   }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (bind_data.vane_state.worker_bind) {
+    LanceVaneValidateExecutionInput(input, bind_data.vane_state);
+    global.vane_dataset_entry =
+        LanceVaneOpenSearchSnapshot(context, bind_data.vane_state);
+    global.vane_dataset = global.vane_dataset_entry->Handle();
+    global.lance_filter_ir = bind_data.vane_state.final_filter_ir;
+    global.filter_pushed_down = bind_data.vane_state.filter_pushed_down;
+    return state;
+  }
+#endif
 
   if (bind_data.namespace_backed) {
     return state;
@@ -671,6 +886,47 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   if (global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, global.scanned_types);
   }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (bind_data.vane_state.worker_bind) {
+    auto &search = bind_data.vane_state;
+    const uint8_t *filter_ir =
+        search.final_filter_ir.empty()
+            ? nullptr
+            : reinterpret_cast<const uint8_t *>(search.final_filter_ir.data());
+    auto create_stream = [&](const uint8_t *ir, size_t ir_len) {
+      return lance_vane_create_knn_stream_ir(
+          global.vane_dataset, search.dataset_generation_id.c_str(),
+          search.arguments.vector_column.c_str(),
+          search.arguments.vector_query.data(),
+          search.arguments.vector_query.size(), search.arguments.k,
+          search.arguments.nprobes, search.arguments.refine_factor, ir, ir_len,
+          search.namespace_filter_plan.empty()
+              ? nullptr
+              : reinterpret_cast<const uint8_t *>(
+                    search.namespace_filter_plan.data()),
+          search.namespace_filter_plan.size(),
+          search.arguments.prefilter ? 1 : 0,
+          search.arguments.use_index ? 1 : 0,
+          reinterpret_cast<const uint8_t *>(search.index_plan.data()),
+          search.index_plan.size());
+    };
+    result->stream = create_stream(filter_ir, search.final_filter_ir.size());
+    if (!result->stream && filter_ir && !search.arguments.prefilter) {
+      global.filter_pushdown_fallbacks.fetch_add(1);
+      global.filter_pushed_down = false;
+      result->filter_pushed_down = false;
+      result->stream = create_stream(nullptr, 0);
+    }
+    if (!result->stream) {
+      throw IOException(
+          "Failed to create exact distributed Lance vector search stream" +
+          LanceVaneFormatErrorSuffix(search.physical_uri,
+                                     search.private_uri_diagnostics));
+    }
+    return result;
+  }
+#endif
 
   if (bind_data.namespace_backed) {
     vector<const char *> option_key_ptrs;
@@ -1015,6 +1271,147 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
   return result;
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static LanceVaneSearchArguments
+LanceKnnVaneArguments(const LanceKnnBindData &bind_data) {
+  LanceVaneSearchArguments result;
+  result.kind = LanceVaneSearchKind::VECTOR;
+  result.overload = bind_data.vane_overload;
+  result.vector_column = bind_data.vector_column;
+  result.vector_query = bind_data.query;
+  result.k = bind_data.k;
+  result.nprobes = bind_data.nprobes;
+  result.refine_factor = bind_data.refine_factor;
+  result.prefilter = bind_data.prefilter;
+  result.use_index = bind_data.use_index;
+  result.explain_verbose = bind_data.explain_verbose;
+  result.namespace_backed = bind_data.namespace_backed;
+  result.namespace_filter = bind_data.namespace_filter;
+  return result;
+}
+
+static void LancePrepareKnnVaneState(LanceKnnBindData &bind_data) {
+  bind_data.vane_state = LanceVanePrepareGlobalSearchState(
+      bind_data.vane_candidate, LanceKnnVaneArguments(bind_data),
+      bind_data.names, bind_data.types);
+}
+
+static LanceVaneGlobalSearchState
+LanceBuildKnnVaneState(const TableFunctionDistributedScanInput &input,
+                       const LanceKnnBindData &bind_data) {
+  if (bind_data.vane_state.worker_bind) {
+    LanceVaneValidateDistributedInput(input, bind_data.vane_state);
+    return bind_data.vane_state;
+  }
+  return LanceVaneFinalizeGlobalSearchState(
+      input, bind_data.vane_state, bind_data.lance_pushed_filter_ir_parts,
+      bind_data.complex_filter_pushdown_failed);
+}
+
+static vector<DistributedScanSplit> LancePlanDistributedKnnSearch(
+    const TableFunctionDistributedScanPlanningInput &input) {
+  auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
+  auto state = LanceBuildKnnVaneState(input, bind_data);
+  auto split = LanceVaneCreateGlobalSearchSplit(state);
+  if (state.authorization_restricted) {
+    if (state.empty_assignment) {
+      return {};
+    }
+    if (state.authorized_split_ids != vector<string>{split.split_id} ||
+        state.authorized_split_payloads != vector<string>{split.payload}) {
+      throw InvalidInputException(
+          "Distributed Lance vector search clone changed authorization");
+    }
+  }
+  return {std::move(split)};
+}
+
+static unique_ptr<FunctionData> LanceCreateDistributedKnnWorkerBind(
+    const TableFunctionDistributedScanInput &input) {
+  auto &source = input.bind_data->Cast<LanceKnnBindData>();
+  auto state = LanceBuildKnnVaneState(input, source);
+  state.worker_bind = true;
+
+  auto result = make_uniq<LanceKnnBindData>();
+  result->column_ids = source.column_ids;
+  result->file_path = state.physical_uri;
+  result->private_uri_diagnostics = state.private_uri_diagnostics;
+  result->vector_column = state.arguments.vector_column;
+  result->query = state.arguments.vector_query;
+  result->k = state.arguments.k;
+  result->nprobes = state.arguments.nprobes;
+  result->refine_factor = state.arguments.refine_factor;
+  result->prefilter = state.arguments.prefilter;
+  result->use_index = state.arguments.use_index;
+  result->explain_verbose = state.arguments.explain_verbose;
+  result->namespace_backed = false;
+  result->namespace_filter = state.arguments.namespace_filter;
+  result->names = state.output_names;
+  result->types = state.output_types;
+  result->vane_overload = state.arguments.overload;
+  result->vane_state = std::move(state);
+  return result;
+}
+
+static void
+LanceApplyDistributedKnnSearch(optional_ptr<FunctionData> worker_bind,
+                               const vector<DistributedScanSplit> &splits) {
+  auto &bind_data = worker_bind->Cast<LanceKnnBindData>();
+  LanceVaneApplyGlobalSearchSplits(bind_data.vane_state, splits);
+}
+
+static void LanceKnnSerialize(Serializer &serializer,
+                              const optional_ptr<FunctionData> bind_data,
+                              const TableFunction &) {
+  auto &data = bind_data->Cast<LanceKnnBindData>();
+  auto state = data.vane_state;
+  if (!state.finalized) {
+    LanceVaneAccumulatePendingGlobalSearchFilters(
+        state, data.lance_pushed_filter_ir_parts,
+        data.complex_filter_pushdown_failed);
+  }
+  LanceVaneSerializeGlobalSearchState(serializer, state);
+}
+
+static unique_ptr<FunctionData> LanceKnnDeserialize(Deserializer &deserializer,
+                                                    TableFunction &) {
+  auto state = LanceVaneDeserializeGlobalSearchState(deserializer);
+  if (state.arguments.kind != LanceVaneSearchKind::VECTOR ||
+      (state.arguments.overload != LanceVaneSearchOverload::VECTOR_FLOAT &&
+       state.arguments.overload != LanceVaneSearchOverload::VECTOR_DOUBLE)) {
+    throw SerializationException(
+        "Distributed Lance vector search overload identity mismatch");
+  }
+  auto result = make_uniq<LanceKnnBindData>();
+  result->file_path = state.physical_uri;
+  result->private_uri_diagnostics = state.private_uri_diagnostics;
+  result->vector_column = state.arguments.vector_column;
+  result->query = state.arguments.vector_query;
+  result->k = state.arguments.k;
+  result->nprobes = state.arguments.nprobes;
+  result->refine_factor = state.arguments.refine_factor;
+  result->prefilter = state.arguments.prefilter;
+  result->use_index = state.arguments.use_index;
+  result->explain_verbose = state.arguments.explain_verbose;
+  result->namespace_filter = state.arguments.namespace_filter;
+  result->names = state.output_names;
+  result->types = state.output_types;
+  result->vane_overload = state.arguments.overload;
+  result->vane_state = std::move(state);
+  auto &context = deserializer.Get<ClientContext &>();
+  LanceVanePopulateSearchSchema(context, result->names, result->types,
+                                result->schema_root, result->arrow_table);
+  return result;
+}
+
+static TableFunctionDistributedScanCallbacks
+LanceKnnDistributedSearchCallbacks() {
+  return LanceVaneGlobalSearchCallbacks(LancePlanDistributedKnnSearch,
+                                        LanceCreateDistributedKnnWorkerBind,
+                                        LanceApplyDistributedKnnSearch);
+}
+#endif
+
 static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
     fun.named_parameters["k"] = LogicalType::BIGINT;
@@ -1031,6 +1428,11 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
     fun.pushdown_complex_filter = LancePushdownComplexFilter;
     fun.to_string = LanceKnnToString;
     fun.dynamic_to_string = LanceKnnDynamicToString;
+#ifdef LANCE_VANE_DISTRIBUTED
+    fun.serialize = LanceKnnSerialize;
+    fun.deserialize = LanceKnnDeserialize;
+    fun.SetDistributedScanCallbacks(LanceKnnDistributedSearchCallbacks());
+#endif
   };
 
   TableFunction search_f32("lance_vector_search",
@@ -1089,7 +1491,53 @@ struct LanceSearchBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+#ifdef LANCE_VANE_DISTRIBUTED
+  vector<string> lance_pushed_filter_ir_parts;
+  bool complex_filter_pushdown_failed = false;
+  LanceVaneSearchOverload vane_overload = LanceVaneSearchOverload::FTS;
+  LanceVanePhysicalCandidate vane_candidate;
+  LanceVaneGlobalSearchState vane_state;
+
+  unique_ptr<FunctionData> Copy() const override {
+    auto result = make_uniq<LanceSearchBindData>();
+    result->column_ids = column_ids;
+    result->mode = mode;
+    result->file_path = file_path;
+    result->private_uri_diagnostics = private_uri_diagnostics;
+    result->prefilter = prefilter;
+    result->namespace_backed = namespace_backed;
+    result->namespace_config = namespace_config;
+    result->namespace_filter = namespace_filter;
+    result->text_column = text_column;
+    result->query = query;
+    result->vector_column = vector_column;
+    result->vector_query = vector_query;
+    result->text_query = text_query;
+    result->nprobes = nprobes;
+    result->refine_factor = refine_factor;
+    result->use_index = use_index;
+    result->alpha = alpha;
+    result->oversample_factor = oversample_factor;
+    result->k = k;
+    result->dataset_entry = dataset_entry;
+    result->dataset = dataset;
+    result->dataset_cache_hit = dataset_cache_hit;
+    result->arrow_table = arrow_table;
+    result->names = names;
+    result->types = types;
+    result->lance_pushed_filter_ir_parts = lance_pushed_filter_ir_parts;
+    result->complex_filter_pushdown_failed = complex_filter_pushdown_failed;
+    result->vane_overload = vane_overload;
+    result->vane_candidate = vane_candidate;
+    result->vane_state = vane_state;
+    return result;
+  }
+#endif
 };
+
+#ifdef LANCE_VANE_DISTRIBUTED
+static void LancePrepareSharedVaneState(LanceSearchBindData &bind_data);
+#endif
 
 struct LanceSearchGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> lines_read{0};
@@ -1103,9 +1551,47 @@ struct LanceSearchGlobalState : public GlobalTableFunctionState {
   vector<LogicalType> scanned_types;
   vector<string> namespace_columns;
 
+#ifdef LANCE_VANE_DISTRIBUTED
+  shared_ptr<LanceDatasetCacheEntry> vane_dataset_entry;
+  void *vane_dataset = nullptr;
+#endif
+
   idx_t MaxThreads() const override { return 1; }
   bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
 };
+
+#ifdef LANCE_VANE_DISTRIBUTED
+static void
+LanceSearchPushdownComplexFilter(ClientContext &, LogicalGet &get,
+                                 FunctionData *bind_data,
+                                 vector<unique_ptr<Expression>> &filters) {
+  if (!bind_data || filters.empty()) {
+    return;
+  }
+  auto &scan_bind = bind_data->Cast<LanceSearchBindData>();
+  if (scan_bind.namespace_backed) {
+    return;
+  }
+  for (auto &expr : filters) {
+    if (expr &&
+        ClassifyVaneSearchColumnReferences(get, scan_bind.names, *expr) ==
+            LanceVaneSearchColumnReferenceClass::COMPUTED_ONLY) {
+      continue;
+    }
+    if (!expr || expr->HasParameter() || expr->IsVolatile()) {
+      scan_bind.complex_filter_pushdown_failed = true;
+      continue;
+    }
+    string filter_ir;
+    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, true,
+                                   *expr, filter_ir)) {
+      scan_bind.complex_filter_pushdown_failed = true;
+      continue;
+    }
+    scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
+  }
+}
+#endif
 
 struct LanceSearchLocalState : public ArrowScanLocalState {
   explicit LanceSearchLocalState(unique_ptr<ArrowArrayWrapper> current_chunk,
@@ -1130,7 +1616,62 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                                      const LanceSearchBindData &bind_data,
                                      LanceSearchGlobalState &global) {
   if (!local_state.stream) {
-    if (bind_data.namespace_backed) {
+#ifdef LANCE_VANE_DISTRIBUTED
+    if (bind_data.vane_state.worker_bind) {
+      auto &search = bind_data.vane_state;
+      const uint8_t *filter_ir = search.final_filter_ir.empty()
+                                     ? nullptr
+                                     : reinterpret_cast<const uint8_t *>(
+                                           search.final_filter_ir.data());
+      auto *namespace_filter_plan =
+          search.namespace_filter_plan.empty()
+              ? nullptr
+              : reinterpret_cast<const uint8_t *>(
+                    search.namespace_filter_plan.data());
+      auto *index_plan =
+          reinterpret_cast<const uint8_t *>(search.index_plan.data());
+      auto create_stream = [&](const uint8_t *ir, size_t ir_len) -> void * {
+        if (search.arguments.kind == LanceVaneSearchKind::FTS) {
+          return lance_vane_create_fts_stream_ir(
+              global.vane_dataset, search.dataset_generation_id.c_str(),
+              search.arguments.text_column.c_str(),
+              search.arguments.text_query.c_str(), search.arguments.k, ir,
+              ir_len, namespace_filter_plan,
+              search.namespace_filter_plan.size(),
+              search.arguments.prefilter ? 1 : 0, index_plan,
+              search.index_plan.size());
+        }
+        return lance_vane_create_hybrid_stream_ir(
+            global.vane_dataset, search.dataset_generation_id.c_str(),
+            search.arguments.vector_column.c_str(),
+            search.arguments.vector_query.data(),
+            search.arguments.vector_query.size(),
+            search.arguments.text_column.c_str(),
+            search.arguments.text_query.c_str(), search.arguments.k,
+            search.arguments.nprobes, search.arguments.refine_factor, ir,
+            ir_len, namespace_filter_plan, search.namespace_filter_plan.size(),
+            search.arguments.prefilter ? 1 : 0,
+            search.arguments.use_index ? 1 : 0, search.arguments.alpha,
+            search.arguments.oversample_factor, index_plan,
+            search.index_plan.size());
+      };
+      local_state.stream =
+          create_stream(filter_ir, search.final_filter_ir.size());
+      if (!local_state.stream && filter_ir && !search.arguments.prefilter) {
+        global.filter_pushdown_fallbacks.fetch_add(1);
+        global.filter_pushed_down = false;
+        local_state.filter_pushed_down = false;
+        local_state.stream = create_stream(nullptr, 0);
+      }
+      if (!local_state.stream) {
+        throw IOException(
+            "Failed to create exact distributed Lance search stream" +
+            LanceVaneFormatErrorSuffix(search.physical_uri,
+                                       search.private_uri_diagnostics));
+      }
+    } else
+#endif
+        if (bind_data.namespace_backed) {
       vector<const char *> option_key_ptrs;
       vector<const char *> option_value_ptrs;
       vector<const char *> column_ptrs;
@@ -1282,6 +1823,7 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
 #ifdef LANCE_VANE_DISTRIBUTED
   result->private_uri_diagnostics = LanceVanePathRequiresRedaction(
       context, input.inputs[0].GetValue<string>());
+  result->vane_overload = LanceVaneSearchOverload::FTS;
 #endif
   result->text_column = input.inputs[1].GetValue<string>();
   result->query = input.inputs[2].GetValue<string>();
@@ -1343,6 +1885,12 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
     PopulateNamespaceSearchSchema(
         context, *table, "_score", result->schema_root, result->arrow_table,
         result->names, result->types, names, return_types);
+#ifdef LANCE_VANE_DISTRIBUTED
+    PrepareVaneSearchCandidate(
+        context, input.inputs[0], result->dataset_entry, result->file_path,
+        result->private_uri_diagnostics, result->vane_candidate);
+    LancePrepareSharedVaneState(*result);
+#endif
     return std::move(result);
   }
 
@@ -1421,6 +1969,12 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+#ifdef LANCE_VANE_DISTRIBUTED
+  PrepareVaneSearchCandidate(context, input.inputs[0], result->dataset_entry,
+                             result->file_path, result->private_uri_diagnostics,
+                             result->vane_candidate);
+  LancePrepareSharedVaneState(*result);
+#endif
   names = result->names;
   return_types = result->types;
   return std::move(result);
@@ -1459,6 +2013,7 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
 #ifdef LANCE_VANE_DISTRIBUTED
   result->private_uri_diagnostics = LanceVanePathRequiresRedaction(
       context, input.inputs[0].GetValue<string>());
+  result->vane_overload = VaneVectorOverload(input.inputs[2].type(), true);
 #endif
   result->file_path.clear();
   result->dataset_entry =
@@ -1605,13 +2160,19 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+#ifdef LANCE_VANE_DISTRIBUTED
+  PrepareVaneSearchCandidate(context, input.inputs[0], result->dataset_entry,
+                             result->file_path, result->private_uri_diagnostics,
+                             result->vane_candidate);
+  LancePrepareSharedVaneState(*result);
+#endif
   names = result->names;
   return_types = result->types;
   return std::move(result);
 }
 
 static unique_ptr<GlobalTableFunctionState>
-LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+LanceSearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
   auto state =
       make_uniq_base<GlobalTableFunctionState, LanceSearchGlobalState>();
@@ -1627,6 +2188,18 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
       global.scanned_types.push_back(bind_data.types[col_id]);
     }
   }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+  if (bind_data.vane_state.worker_bind) {
+    LanceVaneValidateExecutionInput(input, bind_data.vane_state);
+    global.vane_dataset_entry =
+        LanceVaneOpenSearchSnapshot(context, bind_data.vane_state);
+    global.vane_dataset = global.vane_dataset_entry->Handle();
+    global.lance_filter_ir = bind_data.vane_state.final_filter_ir;
+    global.filter_pushed_down = bind_data.vane_state.filter_pushed_down;
+    return state;
+  }
+#endif
 
   if (bind_data.namespace_backed) {
     return state;
@@ -1801,6 +2374,173 @@ LanceSearchDynamicToString(TableFunctionDynamicToStringInput &input) {
   return result;
 }
 
+#ifdef LANCE_VANE_DISTRIBUTED
+static LanceVaneSearchArguments
+LanceSharedVaneArguments(const LanceSearchBindData &bind_data) {
+  LanceVaneSearchArguments result;
+  result.kind = bind_data.mode == LanceSearchMode::Fts
+                    ? LanceVaneSearchKind::FTS
+                    : LanceVaneSearchKind::HYBRID;
+  result.overload = bind_data.vane_overload;
+  result.vector_column = bind_data.vector_column;
+  result.vector_query = bind_data.vector_query;
+  result.text_column = bind_data.text_column;
+  result.text_query = bind_data.mode == LanceSearchMode::Fts
+                          ? bind_data.query
+                          : bind_data.text_query;
+  result.k = bind_data.k;
+  result.nprobes = bind_data.nprobes;
+  result.refine_factor = bind_data.refine_factor;
+  result.prefilter = bind_data.prefilter;
+  result.use_index = bind_data.use_index;
+  result.namespace_backed = bind_data.namespace_backed;
+  result.alpha = bind_data.alpha;
+  result.oversample_factor = bind_data.oversample_factor;
+  result.namespace_filter = bind_data.namespace_filter;
+  return result;
+}
+
+static void LancePrepareSharedVaneState(LanceSearchBindData &bind_data) {
+  bind_data.vane_state = LanceVanePrepareGlobalSearchState(
+      bind_data.vane_candidate, LanceSharedVaneArguments(bind_data),
+      bind_data.names, bind_data.types);
+}
+
+static LanceVaneGlobalSearchState
+LanceBuildSharedVaneState(const TableFunctionDistributedScanInput &input,
+                          const LanceSearchBindData &bind_data) {
+  if (bind_data.vane_state.worker_bind) {
+    LanceVaneValidateDistributedInput(input, bind_data.vane_state);
+    return bind_data.vane_state;
+  }
+  return LanceVaneFinalizeGlobalSearchState(
+      input, bind_data.vane_state, bind_data.lance_pushed_filter_ir_parts,
+      bind_data.complex_filter_pushdown_failed);
+}
+
+static vector<DistributedScanSplit> LancePlanDistributedSharedSearch(
+    const TableFunctionDistributedScanPlanningInput &input) {
+  auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
+  auto state = LanceBuildSharedVaneState(input, bind_data);
+  auto split = LanceVaneCreateGlobalSearchSplit(state);
+  if (state.authorization_restricted) {
+    if (state.empty_assignment) {
+      return {};
+    }
+    if (state.authorized_split_ids != vector<string>{split.split_id} ||
+        state.authorized_split_payloads != vector<string>{split.payload}) {
+      throw InvalidInputException(
+          "Distributed Lance search clone changed authorization");
+    }
+  }
+  return {std::move(split)};
+}
+
+static unique_ptr<FunctionData> LanceCreateDistributedSharedWorkerBind(
+    const TableFunctionDistributedScanInput &input) {
+  auto &source = input.bind_data->Cast<LanceSearchBindData>();
+  auto state = LanceBuildSharedVaneState(input, source);
+  state.worker_bind = true;
+
+  auto result = make_uniq<LanceSearchBindData>();
+  result->column_ids = source.column_ids;
+  result->mode = state.arguments.kind == LanceVaneSearchKind::FTS
+                     ? LanceSearchMode::Fts
+                     : LanceSearchMode::Hybrid;
+  result->file_path = state.physical_uri;
+  result->private_uri_diagnostics = state.private_uri_diagnostics;
+  result->prefilter = state.arguments.prefilter;
+  result->namespace_backed = false;
+  result->namespace_filter = state.arguments.namespace_filter;
+  result->text_column = state.arguments.text_column;
+  result->query = state.arguments.text_query;
+  result->vector_column = state.arguments.vector_column;
+  result->vector_query = state.arguments.vector_query;
+  result->text_query = state.arguments.text_query;
+  result->nprobes = state.arguments.nprobes;
+  result->refine_factor = state.arguments.refine_factor;
+  result->use_index = state.arguments.use_index;
+  result->alpha = state.arguments.alpha;
+  result->oversample_factor = state.arguments.oversample_factor;
+  result->k = state.arguments.k;
+  result->names = state.output_names;
+  result->types = state.output_types;
+  result->vane_overload = state.arguments.overload;
+  result->vane_state = std::move(state);
+  return result;
+}
+
+static void
+LanceApplyDistributedSharedSearch(optional_ptr<FunctionData> worker_bind,
+                                  const vector<DistributedScanSplit> &splits) {
+  auto &bind_data = worker_bind->Cast<LanceSearchBindData>();
+  LanceVaneApplyGlobalSearchSplits(bind_data.vane_state, splits);
+}
+
+static void LanceSearchSerialize(Serializer &serializer,
+                                 const optional_ptr<FunctionData> bind_data,
+                                 const TableFunction &) {
+  auto &data = bind_data->Cast<LanceSearchBindData>();
+  auto state = data.vane_state;
+  if (!state.finalized) {
+    LanceVaneAccumulatePendingGlobalSearchFilters(
+        state, data.lance_pushed_filter_ir_parts,
+        data.complex_filter_pushdown_failed);
+  }
+  LanceVaneSerializeGlobalSearchState(serializer, state);
+}
+
+static unique_ptr<FunctionData>
+LanceSearchDeserialize(Deserializer &deserializer, TableFunction &) {
+  auto state = LanceVaneDeserializeGlobalSearchState(deserializer);
+  if (state.arguments.kind == LanceVaneSearchKind::VECTOR ||
+      state.arguments.overload == LanceVaneSearchOverload::VECTOR_FLOAT ||
+      state.arguments.overload == LanceVaneSearchOverload::VECTOR_DOUBLE ||
+      (state.arguments.kind == LanceVaneSearchKind::FTS &&
+       state.arguments.overload != LanceVaneSearchOverload::FTS) ||
+      (state.arguments.kind == LanceVaneSearchKind::HYBRID &&
+       state.arguments.overload != LanceVaneSearchOverload::HYBRID_FLOAT &&
+       state.arguments.overload != LanceVaneSearchOverload::HYBRID_DOUBLE)) {
+    throw SerializationException(
+        "Distributed Lance search overload identity mismatch");
+  }
+  auto result = make_uniq<LanceSearchBindData>();
+  result->mode = state.arguments.kind == LanceVaneSearchKind::FTS
+                     ? LanceSearchMode::Fts
+                     : LanceSearchMode::Hybrid;
+  result->file_path = state.physical_uri;
+  result->private_uri_diagnostics = state.private_uri_diagnostics;
+  result->prefilter = state.arguments.prefilter;
+  result->namespace_filter = state.arguments.namespace_filter;
+  result->text_column = state.arguments.text_column;
+  result->query = state.arguments.text_query;
+  result->vector_column = state.arguments.vector_column;
+  result->vector_query = state.arguments.vector_query;
+  result->text_query = state.arguments.text_query;
+  result->nprobes = state.arguments.nprobes;
+  result->refine_factor = state.arguments.refine_factor;
+  result->use_index = state.arguments.use_index;
+  result->alpha = state.arguments.alpha;
+  result->oversample_factor = state.arguments.oversample_factor;
+  result->k = state.arguments.k;
+  result->names = state.output_names;
+  result->types = state.output_types;
+  result->vane_overload = state.arguments.overload;
+  result->vane_state = std::move(state);
+  auto &context = deserializer.Get<ClientContext &>();
+  LanceVanePopulateSearchSchema(context, result->names, result->types,
+                                result->schema_root, result->arrow_table);
+  return result;
+}
+
+static TableFunctionDistributedScanCallbacks
+LanceSharedDistributedSearchCallbacks() {
+  return LanceVaneGlobalSearchCallbacks(LancePlanDistributedSharedSearch,
+                                        LanceCreateDistributedSharedWorkerBind,
+                                        LanceApplyDistributedSharedSearch);
+}
+#endif
+
 static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   TableFunction fts(
       "lance_fts",
@@ -1814,6 +2554,12 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   fts.filter_pushdown = true;
   fts.filter_prune = true;
   fts.pushdown_expression = LancePushdownExpression;
+#ifdef LANCE_VANE_DISTRIBUTED
+  fts.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
+  fts.serialize = LanceSearchSerialize;
+  fts.deserialize = LanceSearchDeserialize;
+  fts.SetDistributedScanCallbacks(LanceSharedDistributedSearchCallbacks());
+#endif
   fts.to_string = LanceSearchToString;
   fts.dynamic_to_string = LanceSearchDynamicToString;
   loader.RegisterFunction(fts);
@@ -1832,6 +2578,12 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
     fun.filter_pushdown = true;
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
+#ifdef LANCE_VANE_DISTRIBUTED
+    fun.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
+    fun.serialize = LanceSearchSerialize;
+    fun.deserialize = LanceSearchDeserialize;
+    fun.SetDistributedScanCallbacks(LanceSharedDistributedSearchCallbacks());
+#endif
     fun.to_string = LanceSearchToString;
     fun.dynamic_to_string = LanceSearchDynamicToString;
   };
