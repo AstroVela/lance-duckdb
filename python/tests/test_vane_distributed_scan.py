@@ -1250,14 +1250,6 @@ try:
         ) == execution_node_ids
         if mode == "connection":
             namespace_root = path.rsplit("/", 1)[0]
-            search_path = f"{namespace_root}/search_items.lance"
-            connection.execute(
-                "COPY (SELECT i::BIGINT AS id, i::INTEGER AS label, "
-                "CASE WHEN i % 2 = 0 THEN 'puppy' ELSE 'kitten' END::VARCHAR "
-                "AS text, [i::FLOAT, 0.0, 0.0, 0.0]::FLOAT[4] AS vec "
-                "FROM range(5) AS source(i)) "
-                f"TO {sql_literal(search_path)} (FORMAT LANCE, MODE 'create')"
-            )
             connection.execute(
                 f"ATTACH {sql_literal(namespace_root)} AS credential_ns (TYPE LANCE)"
             )
@@ -1342,7 +1334,10 @@ try:
                         search_relation,
                         f"lance-s3-namespace-search-session-drift-{name}",
                     )
-                    search_logical.to_physical_plan(connection)
+                    search_physical = search_logical.to_physical_plan(connection)
+                    # Global-search split planning is lazy. Materialize the split
+                    # map so the namespace-session admission check runs here.
+                    search_physical.scan_split_batch_map()
                 except Exception as error:
                     message = str(error)
                     assert "query session storage settings to match" in message
@@ -3993,6 +3988,18 @@ def test_s3_connection_credentials_override_process_environment(
     seed = _connect()
     try:
         _write_dataset(seed, path)
+        namespace_root = path.rsplit("/", 1)[0]
+        search_path = f"{namespace_root}/search_items.lance"
+        # Seed every remote dataset before the isolated subprocess replaces its
+        # ambient credentials. This test exercises distributed read credential
+        # precedence, not native COPY credential resolution.
+        seed.execute(
+            "COPY (SELECT i::BIGINT AS id, i::INTEGER AS label, "
+            "CASE WHEN i % 2 = 0 THEN 'puppy' ELSE 'kitten' END::VARCHAR "
+            "AS text, [i::FLOAT, 0.0, 0.0, 0.0]::FLOAT[4] AS vec "
+            "FROM range(5) AS source(i)) "
+            f"TO {_sql_literal(search_path)} (FORMAT LANCE, MODE 'create')"
+        )
     finally:
         seed.close()
 
