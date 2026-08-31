@@ -39,11 +39,12 @@ deleted or replaced before it can be reopened.
 Within one worker DuckDB database, ordinary scans and `lance_vector_search`,
 `lance_fts`, and `lance_hybrid_search` share the same Lance `Session`. Lance's
 native index and metadata caches are therefore reused instead of being
-reimplemented by the Vane adapter. The worker also keeps one connection-local
+reimplemented by the Vane adapter. The worker also keeps one query-lifetime
 fixed-snapshot handle cache keyed by resolved storage identity, version, and
-generation. Both ordinary scans and all three search functions use that cache.
-The frozen search index plan still selects the exact index segments for each
-query; a cache hit never changes index selection or snapshot validation.
+generation. Both ordinary scans and all three search functions use that cache
+within a query, and query completion releases every cached dataset handle. The
+frozen search index plan still selects the exact index segments for each query;
+a cache hit never changes index selection or snapshot validation.
 
 The in-memory caches are process-local, so each Ray worker warms independently.
 They are most effective when the runner keeps worker actors and their DuckDB

@@ -43,6 +43,11 @@ public:
     query_misses = 0;
   }
 
+  void QueryEnd() override {
+    lock_guard<mutex> guard(lock);
+    entries.clear();
+  }
+
   void WriteProfilingInformation(std::ostream &ss) override {
     lock_guard<mutex> guard(lock);
     ss << "Lance Vane Snapshot Cache: entries=" << entries.size()

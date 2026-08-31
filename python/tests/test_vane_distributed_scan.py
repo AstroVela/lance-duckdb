@@ -1822,6 +1822,25 @@ def test_vane_session_cache_configuration_and_profile() -> None:
             worker_plan = None
             cursor.close()
             worker.close()
+
+        cursor = connection.cursor()
+        worker_plan = None
+        result = None
+        try:
+            worker_plan = physical.clone(cursor)
+            result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                cursor,
+                worker_plan,
+                scan_split_batch={str(node_id): bytes(batches[0])},
+            )
+            assert result.completion_status == "ok"
+            rows = cursor.execute("EXPLAIN ANALYZE SELECT 1").fetchall()
+            profile = "\n".join(str(value) for row in rows for value in row)
+            assert "Lance Vane Snapshot Cache: entries=0 hits=0 misses=0" in profile
+        finally:
+            result = None
+            worker_plan = None
+            cursor.close()
         physical = None
 
         with pytest.raises(Exception, match="before the first Lance access"):
