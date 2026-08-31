@@ -18,6 +18,9 @@ void *LanceOpenDataset(ClientContext &context, const string &path);
 #ifdef LANCE_VANE_DISTRIBUTED
 void *LanceOpenDatasetForDistributedScan(ClientContext &context,
                                          const string &path);
+void *LanceOpenDatasetVersionForDistributedScan(ClientContext &context,
+                                                const string &path,
+                                                uint64_t version);
 #endif
 
 string LanceNormalizeS3Scheme(const string &path);

@@ -1760,6 +1760,157 @@ def ray_retry_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
         vane.teardown_runner()
 
 
+def test_vane_session_cache_configuration_and_profile() -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    index_capacity = 64 * 1024 * 1024
+    metadata_capacity = 16 * 1024 * 1024
+    connection = _connect()
+    try:
+        connection.execute(
+            f"SET GLOBAL lance_vane_index_cache_size_bytes = {index_capacity}"
+        )
+        connection.execute(
+            f"SET GLOBAL lance_vane_metadata_cache_size_bytes = {metadata_capacity}"
+        )
+        rows = connection.execute(
+            f"EXPLAIN ANALYZE SELECT count(*) FROM {_sql_literal(path)}"
+        ).fetchall()
+        profile = "\n".join(str(value) for row in rows for value in row)
+        assert f"index_capacity_bytes={index_capacity}" in profile
+        assert f"metadata_capacity_bytes={metadata_capacity}" in profile
+        assert "index_hits=" in profile
+        assert "index_misses=" in profile
+        assert "metadata_hits=" in profile
+        assert "metadata_misses=" in profile
+
+        relation = connection.sql(f"SELECT id FROM {_sql_literal(path)}")
+        logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation, "lance-vane-cache-settings"
+        )
+        settings = {
+            entry["name"]: entry["value"]
+            for entry in logical.__getstate__()[3]["settings"]
+        }
+        assert settings["lance_vane_index_cache_size_bytes"] == str(index_capacity)
+        assert settings["lance_vane_metadata_cache_size_bytes"] == str(
+            metadata_capacity
+        )
+
+        physical = logical.to_physical_plan(connection)
+        node_id, batches = next(iter(physical.scan_split_batch_map().items()))
+        worker = _connect()
+        cursor = worker.cursor()
+        worker_plan = None
+        result = None
+        try:
+            worker_plan = physical.clone(worker)
+            result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                cursor,
+                worker_plan,
+                scan_split_batch={str(node_id): bytes(batches[0])},
+            )
+            assert result.completion_status == "ok"
+            assert cursor.execute(
+                "SELECT "
+                "current_setting('lance_vane_index_cache_size_bytes'), "
+                "current_setting('lance_vane_metadata_cache_size_bytes')"
+            ).fetchone() == (index_capacity, metadata_capacity)
+        finally:
+            result = None
+            worker_plan = None
+            cursor.close()
+            worker.close()
+
+        cursor = connection.cursor()
+        worker_plan = None
+        result = None
+        try:
+            worker_plan = physical.clone(cursor)
+            result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                cursor,
+                worker_plan,
+                scan_split_batch={str(node_id): bytes(batches[0])},
+            )
+            assert result.completion_status == "ok"
+            rows = cursor.execute("EXPLAIN ANALYZE SELECT 1").fetchall()
+            profile = "\n".join(str(value) for row in rows for value in row)
+            assert "Lance Vane Snapshot Cache: entries=0 hits=0 misses=0" in profile
+        finally:
+            result = None
+            worker_plan = None
+            cursor.close()
+        physical = None
+
+        with pytest.raises(Exception, match="before the first Lance access"):
+            connection.execute(
+                "SET GLOBAL lance_vane_index_cache_size_bytes = "
+                f"{index_capacity * 2}"
+            )
+    finally:
+        connection.close()
+
+
+def test_vane_scan_and_search_share_database_session_cache() -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    queries = (
+        f"SELECT count(*) FROM {path_sql}",
+        "SELECT count(*) FROM lance_vector_search("
+        f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+        "k = 3, use_index = false)",
+        f"SELECT count(*) FROM lance_fts({path_sql}, 'text', 'puppy', k = 10)",
+        "SELECT count(*) FROM lance_hybrid_search("
+        f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+        "'text', 'puppy', k = 3, use_index = false)",
+    )
+
+    connection = _connect()
+    cursors = [connection, *(connection.cursor() for _ in range(3))]
+    try:
+        session_ids: list[str] = []
+        cache_stats: list[dict[str, int]] = []
+        for cursor, sql in zip(cursors, queries, strict=True):
+            rows = cursor.execute(f"EXPLAIN ANALYZE {sql}").fetchall()
+            profile = "\n".join(str(value) for row in rows for value in row)
+            marker = "shared_session_id="
+            assert marker in profile
+            session_ids.append(profile.split(marker, 1)[1].split()[0])
+            assert "index_hits=" in profile
+            assert "metadata_hits=" in profile
+            cache_stats.append(
+                {
+                    name: int(value)
+                    for name, value in (
+                        token.split("=", 1)
+                        for token in profile.split(marker, 1)[1].split()
+                        if "=" in token
+                    )
+                    if name
+                    in {
+                        "index_hits",
+                        "index_misses",
+                        "metadata_hits",
+                        "metadata_misses",
+                    }
+                }
+            )
+        assert len(set(session_ids)) == 1
+        assert all(
+            current["metadata_hits"] > previous["metadata_hits"]
+            for previous, current in zip(cache_stats, cache_stats[1:])
+        )
+        assert cache_stats[2]["index_misses"] > 0
+        assert cache_stats[3]["index_hits"] > cache_stats[2]["index_hits"]
+    finally:
+        for cursor in cursors[1:]:
+            cursor.close()
+        connection.close()
+
+
 def test_global_search_overloads_match_native_and_emit_one_task(ray_runner) -> None:
     path = (
         Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
@@ -2410,7 +2561,7 @@ def test_global_search_fails_when_the_frozen_snapshot_is_vacuumed(
 
         with pytest.raises(
             Exception,
-            match="Failed to reopen the frozen distributed Lance search version",
+            match="Failed to reopen fixed Lance dataset version",
         ):
             _run_serialized_logical(ray_runner, serialized)
     finally:
@@ -4162,6 +4313,9 @@ def test_worker_fails_if_the_coordinator_snapshot_was_vacuumed(
 def test_worker_rejects_a_same_version_dataset_replacement(tmp_path: Path) -> None:
     connection = _connect()
     path = tmp_path / "replaced.lance"
+    worker = None
+    cursor = None
+    worker_plan = None
     try:
         _write_dataset(connection, path)
         physical = _physical_plan(
@@ -4172,6 +4326,12 @@ def test_worker_rejects_a_same_version_dataset_replacement(tmp_path: Path) -> No
         node_id, batches = next(iter(split_map.items()))
         split_batch = bytes(batches[0])
 
+        worker = _connect()
+        cursor = worker.cursor()
+        assert cursor.execute(
+            f"SELECT count(*) FROM {_sql_literal(path)}"
+        ).fetchone() == (12,)
+
         shutil.rmtree(path)
         replacement = _connect()
         try:
@@ -4179,22 +4339,19 @@ def test_worker_rejects_a_same_version_dataset_replacement(tmp_path: Path) -> No
         finally:
             replacement.close()
 
-        worker = _connect()
-        cursor = worker.cursor()
-        worker_plan = None
-        try:
-            worker_plan = physical.clone(worker)
-            with pytest.raises(Exception, match="generation does not match"):
-                vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-                    cursor,
-                    worker_plan,
-                    scan_split_batch={str(node_id): split_batch},
-                )
-        finally:
-            worker_plan = None
-            cursor.close()
-            worker.close()
+        worker_plan = physical.clone(worker)
+        with pytest.raises(Exception, match="generation does not match"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                cursor,
+                worker_plan,
+                scan_split_batch={str(node_id): split_batch},
+            )
     finally:
+        worker_plan = None
+        if cursor is not None:
+            cursor.close()
+        if worker is not None:
+            worker.close()
         connection.close()
 
 

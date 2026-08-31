@@ -11,6 +11,7 @@
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
+#include "lance_vane_snapshot.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -893,50 +894,20 @@ LanceVaneOpenSearchSnapshot(ClientContext &context,
         "Distributed Lance search physical identity changed before execution");
   }
 
-  auto *latest =
-      LanceOpenDatasetForDistributedScan(context, state.physical_uri);
-  if (!latest) {
-    throw IOException("Failed to open the distributed Lance search dataset" +
-                      LanceVaneFormatErrorSuffix(
-                          state.physical_uri, state.private_uri_diagnostics));
-  }
-  void *fixed = latest;
-  if (lance_dataset_version(latest) != state.dataset_version) {
-    fixed = lance_dataset_checkout_version(latest, state.dataset_version);
-    lance_close_dataset(latest);
-    if (!fixed) {
-      throw IOException(
-          "Failed to reopen the frozen distributed Lance search version" +
-          LanceVaneFormatErrorSuffix(state.physical_uri,
-                                     state.private_uri_diagnostics));
-    }
-  }
-  auto *generation_ptr = lance_dataset_generation_id(fixed);
-  if (!generation_ptr) {
-    lance_close_dataset(fixed);
-    throw IOException(
-        "Failed to validate the distributed Lance search snapshot" +
-        LanceVaneFormatErrorSuffix(state.physical_uri,
-                                   state.private_uri_diagnostics));
-  }
-  string generation = generation_ptr;
-  lance_free_string(generation_ptr);
-  if (generation != state.dataset_generation_id) {
-    lance_close_dataset(fixed);
-    throw IOException("Distributed Lance search snapshot generation changed");
-  }
+  auto snapshot = LanceVaneGetOrOpenSnapshot(
+      context, state.physical_uri, state.dataset_version,
+      state.dataset_generation_id, state.private_uri_diagnostics);
+  auto *fixed = snapshot->Handle();
   string schema_fingerprint(LANCE_VANE_SHA256_SIZE, '\0');
   if (lance_vane_dataset_schema_fingerprint(
           fixed, reinterpret_cast<uint8_t *>(&schema_fingerprint[0])) != 0) {
-    lance_close_dataset(fixed);
     throw IOException("Failed to validate the distributed Lance search schema" +
                       LanceFormatErrorSuffix());
   }
   if (schema_fingerprint != state.schema_fingerprint) {
-    lance_close_dataset(fixed);
     throw IOException("Distributed Lance search schema changed");
   }
-  return make_shared_ptr<LanceDatasetCacheEntry>(fixed, state.physical_uri);
+  return snapshot;
 }
 
 void LanceVanePopulateSearchSchema(ClientContext &context,

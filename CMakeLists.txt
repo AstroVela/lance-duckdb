@@ -61,6 +61,7 @@ set(EXTENSION_SOURCES
 if(LANCE_VANE_DISTRIBUTED)
   list(APPEND EXTENSION_SOURCES src/lance_distributed_write.cpp
        src/lance_vane_search.cpp
+       src/lance_vane_snapshot.cpp
        src/lance_vane_rest_resolution.cpp)
 endif()
 

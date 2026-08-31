@@ -8,7 +8,12 @@ namespace duckdb {
 
 class LanceSharedSessionEntry final : public ObjectCacheEntry {
 public:
+#ifdef LANCE_VANE_DISTRIBUTED
+  LanceSharedSessionEntry(uint64_t index_cache_size_bytes,
+                          uint64_t metadata_cache_size_bytes);
+#else
   LanceSharedSessionEntry();
+#endif
   ~LanceSharedSessionEntry() override;
 
   static string ObjectType();
@@ -17,10 +22,18 @@ public:
 
   void *Handle() const { return session; }
   uint64_t Id() const { return session_id; }
+#ifdef LANCE_VANE_DISTRIBUTED
+  uint64_t IndexCacheSizeBytes() const { return index_cache_size_bytes; }
+  uint64_t MetadataCacheSizeBytes() const { return metadata_cache_size_bytes; }
+#endif
 
 private:
   void *session = nullptr;
   uint64_t session_id = 0;
+#ifdef LANCE_VANE_DISTRIBUTED
+  uint64_t index_cache_size_bytes = 0;
+  uint64_t metadata_cache_size_bytes = 0;
+#endif
 };
 
 class LanceSessionState final : public ClientContextState {
@@ -42,5 +55,8 @@ GetOrCreateLanceSharedSessionEntry(ClientContext &context,
 shared_ptr<LanceSessionState>
 GetOrCreateLanceSessionState(ClientContext &context);
 void *LanceGetSessionHandle(ClientContext &context);
+#ifdef LANCE_VANE_DISTRIBUTED
+void RegisterLanceVaneSessionOptions(DBConfig &config);
+#endif
 
 } // namespace duckdb
