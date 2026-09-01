@@ -11,6 +11,17 @@ include_directories(src/include)
 
 option(LANCE_VANE_DISTRIBUTED
        "Build the Vane distributed Lance scan and write adapters" OFF)
+option(LANCE_VANE_DYNAMIC_PROVIDER
+       "Build a self-contained Vane dynamic-provider artifact" OFF)
+
+if(LANCE_VANE_DYNAMIC_PROVIDER AND NOT LANCE_VANE_DISTRIBUTED)
+  message(FATAL_ERROR
+          "LANCE_VANE_DYNAMIC_PROVIDER requires LANCE_VANE_DISTRIBUTED")
+endif()
+if(LANCE_VANE_DYNAMIC_PROVIDER AND NOT "${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
+  message(FATAL_ERROR
+          "LANCE_VANE_DYNAMIC_PROVIDER currently requires Linux")
+endif()
 
 if(LANCE_VANE_DISTRIBUTED)
   if(NOT DEFINED DUCKDB_SOURCE_PATH OR "${DUCKDB_SOURCE_PATH}" STREQUAL "")
@@ -217,6 +228,10 @@ set(RUST_CARGO_FEATURE_ARGS)
 if(LANCE_VANE_DISTRIBUTED)
   list(APPEND RUST_CARGO_FEATURE_ARGS --features vane-distributed)
 endif()
+set(RUST_CARGO_REPRODUCIBILITY_ARGS)
+if(LANCE_VANE_DYNAMIC_PROVIDER)
+  list(APPEND RUST_CARGO_REPRODUCIBILITY_ARGS --locked)
+endif()
 if(DEFINED VCPKG_ROOT)
   list(APPEND RUST_CARGO_ENV VCPKG_ROOT=${VCPKG_ROOT})
 endif()
@@ -264,12 +279,12 @@ if(CMAKE_CONFIGURATION_TYPES)
     OUTPUT "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}"
     COMMAND
       ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
-      ${RUST_CARGO_FEATURE_ARGS}
+      ${RUST_CARGO_FEATURE_ARGS} ${RUST_CARGO_REPRODUCIBILITY_ARGS}
       --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
       --target=${RUST_PLATFORM_TARGET}
     COMMAND
       ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
-      ${RUST_CARGO_FEATURE_ARGS}
+      ${RUST_CARGO_FEATURE_ARGS} ${RUST_CARGO_REPRODUCIBILITY_ARGS}
       --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release
       --target=${RUST_PLATFORM_TARGET}
     WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
@@ -288,7 +303,7 @@ else()
       OUTPUT "${RUST_DEBUG_LIB}"
       COMMAND
         ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
-        ${RUST_CARGO_FEATURE_ARGS}
+        ${RUST_CARGO_FEATURE_ARGS} ${RUST_CARGO_REPRODUCIBILITY_ARGS}
         --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
         --target=${RUST_PLATFORM_TARGET}
       WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
@@ -301,7 +316,7 @@ else()
       OUTPUT "${RUST_RELEASE_LIB}"
       COMMAND
         ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
-        ${RUST_CARGO_FEATURE_ARGS}
+        ${RUST_CARGO_FEATURE_ARGS} ${RUST_CARGO_REPRODUCIBILITY_ARGS}
         --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release
         --target=${RUST_PLATFORM_TARGET}
       WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
@@ -319,6 +334,27 @@ add_dependencies(${EXTENSION_NAME} lance_duckdb_ffi_build)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} debug "${RUST_DEBUG_LIB}"
                       optimized "${RUST_RELEASE_LIB}" ${PLATFORM_LIBS})
 add_dependencies(${LOADABLE_EXTENSION_NAME} lance_duckdb_ffi_build)
+
+if(LANCE_VANE_DYNAMIC_PROVIDER)
+  # The provider carries the Rust closure and its matching DuckDB engine in one
+  # artifact. Hide private definitions and strip at link time, before DuckDB's
+  # signature footer is replaced by the release signer.
+  set(LANCE_VANE_VERSION_SCRIPT
+      "${CMAKE_CURRENT_BINARY_DIR}/vane-lance-exports.map")
+  file(WRITE "${LANCE_VANE_VERSION_SCRIPT}"
+       "{\n  global: lance_duckdb_cpp_init;\n  local: *;\n};\n")
+  set_property(TARGET ${LOADABLE_EXTENSION_NAME}
+               APPEND PROPERTY LINK_DEPENDS "${LANCE_VANE_VERSION_SCRIPT}")
+  target_link_options(
+    ${LOADABLE_EXTENSION_NAME}
+    PRIVATE
+      "-Wl,--version-script=${LANCE_VANE_VERSION_SCRIPT}"
+      -Wl,--exclude-libs,ALL
+      -Wl,-Bsymbolic
+      -Wl,--gc-sections
+      -Wl,--strip-all
+      -Wl,-z,defs)
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME}

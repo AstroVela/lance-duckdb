@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import vane
+
+from packaged_dynamic_extension import load_packaged_dynamic_lance
 
 
 def _sql_literal(value: str | Path) -> str:
@@ -20,7 +23,10 @@ def _connect():
             "autoload_known_extensions": "false",
         }
     )
-    connection.execute("LOAD lance")
+    if os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"):
+        load_packaged_dynamic_lance(connection)
+    else:
+        connection.execute("LOAD lance")
     return connection
 
 

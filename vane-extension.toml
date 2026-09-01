@@ -7,4 +7,4 @@ vcpkg_commit = "84bab45d415d22042bd0b9081aea57f362da3f35"
 
 [vane]
 repository = "AstroVela/vane"
-revision = "64ed91c7e7ea7791b93e81e98fac0e8dce5da4de"
+revision = "472df75ab51fd3eac2642f6646545075549e5921"

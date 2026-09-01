@@ -25,6 +25,8 @@ import vane
 from vane import runners
 from vane.runners.ray import set_runner_ray
 
+from packaged_dynamic_extension import load_packaged_dynamic_lance
+
 WORKER_COUNT = 2
 STABLE_ROW_ID_FIXTURE = (
     Path(__file__).resolve().parents[2] / "test/data/stable_row_ids.lance"
@@ -402,6 +404,8 @@ def _connect():
     extension_path = os.environ.get("LANCE_TEST_EXTENSION_PATH")
     if extension_path:
         connection.execute(f"LOAD {_sql_literal(extension_path)}")
+    elif os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"):
+        load_packaged_dynamic_lance(connection)
     else:
         connection.execute("LOAD lance")
     return connection
