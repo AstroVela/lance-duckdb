@@ -44,6 +44,14 @@ struct LanceVaneSearchBytesDeleter {
   }
 };
 
+struct LanceVanePlanningDatasetDeleter {
+  void operator()(void *value) const {
+    if (value) {
+      lance_close_dataset(value);
+    }
+  }
+};
+
 class LanceVaneCanonicalWriter {
 public:
   void U8(uint8_t value) { bytes.push_back(static_cast<char>(value)); }
@@ -484,11 +492,28 @@ void LanceVaneCapturePhysicalCandidate(
   out_candidate.search_node_uuid = UUID::ToString(UUID::GenerateRandomUUID());
   out_candidate.dataset_entry = dataset_entry;
   out_candidate.dataset = dataset;
-  out_candidate.session = LanceGetSessionHandle(context);
+  out_candidate.context = &context;
 }
 
 static string BuildIndexPlan(const LanceVanePhysicalCandidate &candidate,
-                             const LanceVaneSearchArguments &arguments) {
+                             const LanceVaneSearchArguments &arguments,
+                             const LanceVaneFrozenSearchSnapshot &snapshot) {
+  if (!candidate.context) {
+    throw InternalException(
+        "Distributed Lance search lost its coordinator context");
+  }
+  unique_ptr<void, LanceVanePlanningDatasetDeleter> planning_dataset(
+      LanceOpenDatasetVersionFromManifestAndIndexSectionForDistributedSearch(
+          *candidate.context, candidate.physical_uri, candidate.dataset_version,
+          snapshot.dataset.serialized_manifest,
+          snapshot.serialized_index_section, candidate.dataset_generation_id));
+  if (!planning_dataset) {
+    LanceConsumeLastError();
+    throw IOException(
+        "Failed to open the isolated distributed Lance planning snapshot" +
+        LanceVaneFormatErrorSuffix(candidate.physical_uri,
+                                   candidate.private_uri_diagnostics));
+  }
   uint8_t *bytes = nullptr;
   size_t len = 0;
   auto *vector_column = arguments.vector_column.empty()
@@ -497,7 +522,7 @@ static string BuildIndexPlan(const LanceVanePhysicalCandidate &candidate,
   auto *text_column =
       arguments.text_column.empty() ? nullptr : arguments.text_column.c_str();
   auto rc = lance_vane_build_search_index_plan(
-      candidate.dataset, candidate.dataset_generation_id.c_str(),
+      planning_dataset.get(), candidate.dataset_generation_id.c_str(),
       static_cast<uint8_t>(arguments.kind), vector_column, text_column,
       arguments.use_index ? 1 : 0, &bytes, &len);
   if (rc != 0 || !bytes || len == 0) {
@@ -515,8 +540,7 @@ static string BuildIndexPlan(const LanceVanePhysicalCandidate &candidate,
 }
 
 static shared_ptr<const LanceVaneFrozenSearchSnapshot>
-FreezeSearchSnapshot(const LanceVanePhysicalCandidate &candidate,
-                     shared_ptr<void> &index_metadata_lease_owner) {
+FreezeSearchSnapshot(const LanceVanePhysicalCandidate &candidate) {
   auto result = make_shared_ptr<LanceVaneFrozenSearchSnapshot>();
   result->dataset =
       LanceVaneFreezeSnapshot(candidate.dataset, candidate.physical_uri,
@@ -528,18 +552,11 @@ FreezeSearchSnapshot(const LanceVanePhysicalCandidate &candidate,
 
   uint8_t *index_section = nullptr;
   size_t index_section_len = 0;
-  void *index_metadata_lease = nullptr;
   auto rc = lance_vane_serialize_dataset_index_section(
-      candidate.dataset, candidate.session, &index_section, &index_section_len,
-      &index_metadata_lease);
+      candidate.dataset, &index_section, &index_section_len);
   unique_ptr<uint8_t, LanceVaneSearchBytesDeleter> index_section_owner(
       index_section, LanceVaneSearchBytesDeleter{index_section_len});
-  index_metadata_lease_owner =
-      shared_ptr<void>(index_metadata_lease, [](void *lease) {
-        lance_vane_free_index_metadata_lease(lease);
-      });
-  if (rc != 0 || !index_metadata_lease ||
-      (index_section_len > 0 && !index_section) ||
+  if (rc != 0 || (index_section_len > 0 && !index_section) ||
       index_section_len > LANCE_VANE_MAX_SERIALIZED_INDEX_SECTION_BYTES) {
     throw IOException(
         "Failed to freeze the distributed Lance search index metadata" +
@@ -615,23 +632,19 @@ LanceVanePrepareGlobalSearchState(const LanceVanePhysicalCandidate &candidate,
   }
 
   try {
-    // Keep the canonical raw IndexSection pinned only while the coordinator
-    // builds LSI1. The returned portable state owns bytes, not a connection-
-    // scoped cache lease; this local owner releases at the end of the bind.
-    shared_ptr<void> coordinator_index_metadata_lease;
     state.valid = true;
     state.physical_uri = candidate.physical_uri;
     state.dataset_version = candidate.dataset_version;
     state.dataset_generation_id = candidate.dataset_generation_id;
     state.schema_fingerprint = candidate.schema_fingerprint;
-    state.frozen_snapshot =
-        FreezeSearchSnapshot(candidate, coordinator_index_metadata_lease);
+    state.frozen_snapshot = FreezeSearchSnapshot(candidate);
     ValidateAndMarkFrozenSearchSnapshot(state);
     state.namespace_filter_plan =
         BuildNamespaceFilterPlan(candidate, arguments.namespace_filter);
     state.filter_fingerprint =
         BuildFilterFingerprint(output_names, vector<ColumnIndex>(), nullptr);
-    state.index_plan = BuildIndexPlan(candidate, arguments);
+    state.index_plan =
+        BuildIndexPlan(candidate, arguments, *state.frozen_snapshot);
   } catch (Exception &) {
     state = {};
     state.arguments = arguments;

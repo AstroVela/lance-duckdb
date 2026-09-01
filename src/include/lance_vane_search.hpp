@@ -48,7 +48,7 @@ struct LanceVanePhysicalCandidate {
   bool private_uri_diagnostics = false;
   shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
-  void *session = nullptr;
+  ClientContext *context = nullptr;
 };
 
 struct LanceVaneSearchArguments {

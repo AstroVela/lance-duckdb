@@ -41,6 +41,15 @@ impl VaneIndexCacheBackend {
         }
     }
 
+    /// Create a snapshot-local overlay whose ordinary entries still delegate
+    /// to this session cache. Pins live only in the returned backend, so a
+    /// dataset opened for one frozen generation cannot affect another dataset
+    /// that happens to reuse the same URI and version.
+    pub(crate) fn snapshot_scope(self: &Arc<Self>) -> Arc<Self> {
+        let shared: Arc<dyn CacheBackend> = self.clone();
+        Arc::new(Self::new(shared))
+    }
+
     fn lock_pinned(&self) -> MutexGuard<'_, HashMap<InternalCacheKey, PinnedEntry>> {
         self.pinned
             .lock()
@@ -106,22 +115,6 @@ impl VaneIndexCacheBackend {
             cache: Arc::downgrade(self),
             key,
         }
-    }
-
-    pub(crate) async fn replace_bounded_with_key<K>(
-        &self,
-        prefix: &str,
-        key: &K,
-        value: Arc<K::ValueType>,
-    ) where
-        K: CacheKey,
-        K::ValueType: DeepSizeOf + Send + Sync + 'static,
-    {
-        let key = Self::internal_key(prefix, key);
-        let size_bytes = Self::entry_size(value.as_ref());
-        self.bounded
-            .insert(&key, value, size_bytes, K::codec())
-            .await;
     }
 
     fn unpin(&self, key: &InternalCacheKey) {
@@ -290,24 +283,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_refresh_never_reveals_the_previous_bounded_value() {
+    async fn snapshot_pin_is_invisible_to_the_shared_session() {
         let bounded: Arc<dyn CacheBackend> = Arc::new(MokaCacheBackend::with_capacity(256));
-        let backend = Arc::new(VaneIndexCacheBackend::new(bounded));
-        let cache = LanceCache::with_backend_and_prefix(backend.clone(), "dataset/".to_string());
-        let stale = Arc::new(vec![9_u8]);
-        cache.insert_with_key(&TestKey, stale.clone()).await;
-        assert_eq!(cache.get_with_key(&TestKey).await, Some(stale));
-
+        let shared = Arc::new(VaneIndexCacheBackend::new(bounded));
+        let scope = shared.snapshot_scope();
+        let shared_cache =
+            LanceCache::with_backend_and_prefix(shared.clone(), "dataset/".to_string());
+        let scoped_cache =
+            LanceCache::with_backend_and_prefix(scope.clone(), "dataset/".to_string());
         let expected = Arc::new(vec![1_u8; 1024]);
-        let lease = backend.pin_with_key("dataset/", &TestKey, expected.clone());
-        backend
-            .replace_bounded_with_key("dataset/", &TestKey, expected.clone())
-            .await;
-        drop(lease);
+        let lease = scope.pin_with_key("dataset/", &TestKey, expected.clone());
 
-        assert!(cache
-            .get_with_key(&TestKey)
-            .await
-            .is_none_or(|value| value == expected));
+        assert_eq!(scoped_cache.get_with_key(&TestKey).await, Some(expected));
+        assert!(shared_cache.get_with_key(&TestKey).await.is_none());
+        assert_eq!(shared.pinned_entry_count(), 0);
+        assert_eq!(scope.pinned_entry_count(), 1);
+
+        drop(lease);
+        assert_eq!(scope.pinned_entry_count(), 0);
     }
 }
