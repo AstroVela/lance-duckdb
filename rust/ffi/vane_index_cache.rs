@@ -141,6 +141,11 @@ impl VaneIndexCacheBackend {
     fn contains_pinned(&self, key: &InternalCacheKey) -> bool {
         self.lock_pinned().contains_key(key)
     }
+
+    #[cfg(test)]
+    pub(crate) fn pinned_entry_count(&self) -> usize {
+        self.lock_pinned().len()
+    }
 }
 
 #[derive(Debug)]

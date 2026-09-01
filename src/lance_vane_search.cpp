@@ -515,7 +515,8 @@ static string BuildIndexPlan(const LanceVanePhysicalCandidate &candidate,
 }
 
 static shared_ptr<const LanceVaneFrozenSearchSnapshot>
-FreezeSearchSnapshot(const LanceVanePhysicalCandidate &candidate) {
+FreezeSearchSnapshot(const LanceVanePhysicalCandidate &candidate,
+                     shared_ptr<void> &index_metadata_lease_owner) {
   auto result = make_shared_ptr<LanceVaneFrozenSearchSnapshot>();
   result->dataset =
       LanceVaneFreezeSnapshot(candidate.dataset, candidate.physical_uri,
@@ -527,11 +528,18 @@ FreezeSearchSnapshot(const LanceVanePhysicalCandidate &candidate) {
 
   uint8_t *index_section = nullptr;
   size_t index_section_len = 0;
+  void *index_metadata_lease = nullptr;
   auto rc = lance_vane_serialize_dataset_index_section(
-      candidate.dataset, candidate.session, &index_section, &index_section_len);
+      candidate.dataset, candidate.session, &index_section, &index_section_len,
+      &index_metadata_lease);
   unique_ptr<uint8_t, LanceVaneSearchBytesDeleter> index_section_owner(
       index_section, LanceVaneSearchBytesDeleter{index_section_len});
-  if (rc != 0 || (index_section_len > 0 && !index_section) ||
+  index_metadata_lease_owner =
+      shared_ptr<void>(index_metadata_lease, [](void *lease) {
+        lance_vane_free_index_metadata_lease(lease);
+      });
+  if (rc != 0 || !index_metadata_lease ||
+      (index_section_len > 0 && !index_section) ||
       index_section_len > LANCE_VANE_MAX_SERIALIZED_INDEX_SECTION_BYTES) {
     throw IOException(
         "Failed to freeze the distributed Lance search index metadata" +
@@ -607,12 +615,17 @@ LanceVanePrepareGlobalSearchState(const LanceVanePhysicalCandidate &candidate,
   }
 
   try {
+    // Keep the canonical raw IndexSection pinned only while the coordinator
+    // builds LSI1. The returned portable state owns bytes, not a connection-
+    // scoped cache lease; this local owner releases at the end of the bind.
+    shared_ptr<void> coordinator_index_metadata_lease;
     state.valid = true;
     state.physical_uri = candidate.physical_uri;
     state.dataset_version = candidate.dataset_version;
     state.dataset_generation_id = candidate.dataset_generation_id;
     state.schema_fingerprint = candidate.schema_fingerprint;
-    state.frozen_snapshot = FreezeSearchSnapshot(candidate);
+    state.frozen_snapshot =
+        FreezeSearchSnapshot(candidate, coordinator_index_metadata_lease);
     ValidateAndMarkFrozenSearchSnapshot(state);
     state.namespace_filter_plan =
         BuildNamespaceFilterPlan(candidate, arguments.namespace_filter);

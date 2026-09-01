@@ -100,9 +100,11 @@ worker. On a backend without reliable immutable object identity, the worker
 also compares the current `IndexSection` with the coordinator-frozen catalog
 before seeding it.
 
-The fixed-snapshot dataset handle owns a lease that pins this one catalog in a
-Vane-only layer in front of Lance's configured bounded index cache. Dropping
-the handle releases the pin. Consequently, a catalog larger than
+The coordinator holds a lease only while it freezes the catalog and builds the
+query's index plan. Each worker's fixed-snapshot dataset handle owns its lease
+for the rest of execution. These leases pin the catalog in a Vane-only layer in
+front of Lance's configured bounded index cache and are released before or at
+query cleanup. Consequently, a catalog larger than
 `lance_vane_index_cache_size_bytes` remains valid for the active query without
 making ordinary reusable index entries unbounded or changing the configured
 cache capacity.

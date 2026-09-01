@@ -2256,6 +2256,7 @@ mod tests {
             Box::into_raw(Box::new(DatasetHandle::new(dataset.clone()))) as *mut c_void;
         let mut index_section_ptr = ptr::null_mut();
         let mut index_section_len = 0;
+        let mut index_metadata_lease = ptr::null_mut();
         assert_eq!(
             unsafe {
                 super::super::vane_distributed_search::lance_vane_serialize_dataset_index_section(
@@ -2263,12 +2264,15 @@ mod tests {
                     (&mut coordinator_session as *mut SessionHandle).cast::<c_void>(),
                     &mut index_section_ptr,
                     &mut index_section_len,
+                    &mut index_metadata_lease,
                 )
             },
             0
         );
         assert!(!index_section_ptr.is_null());
         assert!(index_section_len > 0);
+        assert!(!index_metadata_lease.is_null());
+        assert_eq!(coordinator_session.vane_index_cache.pinned_entry_count(), 1);
         let index_section =
             unsafe { std::slice::from_raw_parts(index_section_ptr, index_section_len) }.to_vec();
         let expected_frozen_indices = decode_frozen_index_section(&index_section).unwrap();
@@ -2285,6 +2289,14 @@ mod tests {
             super::super::vane_distributed_search::lance_vane_free_bytes(
                 index_section_ptr,
                 index_section_len,
+            );
+            super::super::vane_distributed_search::lance_vane_free_index_metadata_lease(
+                index_metadata_lease,
+            );
+            assert_eq!(
+                coordinator_session.vane_index_cache.pinned_entry_count(),
+                0,
+                "coordinator DatasetHandle retained a query planning lease"
             );
             lance_close_dataset(dataset_handle);
         }
@@ -2318,6 +2330,9 @@ mod tests {
             worker_io.read_iops, 1,
             "worker reopened the manifest IndexSection instead of using frozen metadata: {worker_io}"
         );
+        assert_eq!(worker_session.vane_index_cache.pinned_entry_count(), 1);
+        drop(opened);
+        assert_eq!(worker_session.vane_index_cache.pinned_entry_count(), 0);
     }
 
     #[test]

@@ -32,6 +32,7 @@ use super::util::{
     cstr_to_str, dataset_handle, nonzero_u64_to_usize, optional_vane_session_handle,
     parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult,
 };
+use super::vane_index_cache::VaneIndexCacheLease;
 use super::vane_search_plan::{build_search_index_plan, SearchIndexPlan, SearchKind};
 
 const NAMESPACE_FILTER_MAGIC: &[u8; 4] = b"LNF1";
@@ -276,6 +277,7 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
     session: *mut c_void,
     out_data: *mut *mut u8,
     out_len: *mut usize,
+    out_lease: *mut *mut c_void,
 ) -> i32 {
     if !out_data.is_null() {
         unsafe { ptr::write_unaligned(out_data, ptr::null_mut()) };
@@ -283,11 +285,14 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
     if !out_len.is_null() {
         unsafe { ptr::write_unaligned(out_len, 0) };
     }
-    let result = (|| -> FfiResult<Vec<u8>> {
-        if out_data.is_null() || out_len.is_null() {
+    if !out_lease.is_null() {
+        unsafe { ptr::write_unaligned(out_lease, ptr::null_mut()) };
+    }
+    let result = (|| -> FfiResult<_> {
+        if out_data.is_null() || out_len.is_null() || out_lease.is_null() {
             return Err(FfiError::new(
                 ErrorCode::InvalidArgument,
-                "index section output pointers are null",
+                "index section output pointers or lease output pointer are null",
             ));
         }
         let handle = unsafe { dataset_handle(dataset)? };
@@ -317,7 +322,6 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
                 ));
             }
         };
-        handle.retain_frozen_index_metadata(lease);
         let bytes = pb::IndexSection {
             indices: indices.iter().map(pb::IndexMetadata::from).collect(),
         }
@@ -331,18 +335,20 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
                 ),
             ));
         }
-        Ok(bytes)
+        Ok((bytes, lease))
     })();
 
     match result {
-        Ok(bytes) => {
+        Ok((bytes, lease)) => {
             let mut bytes = bytes.into_boxed_slice();
             let len = bytes.len();
             let data = bytes.as_mut_ptr();
+            let lease = Box::into_raw(Box::new(lease)).cast::<c_void>();
             std::mem::forget(bytes);
             unsafe {
                 ptr::write_unaligned(out_data, data);
                 ptr::write_unaligned(out_len, len);
+                ptr::write_unaligned(out_lease, lease);
             }
             clear_last_error();
             0
@@ -351,6 +357,13 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
             set_last_error(err.code, err.message);
             -1
         }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_free_index_metadata_lease(lease: *mut c_void) {
+    if !lease.is_null() {
+        unsafe { drop(Box::from_raw(lease.cast::<VaneIndexCacheLease>())) };
     }
 }
 
