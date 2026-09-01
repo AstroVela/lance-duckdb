@@ -56,7 +56,7 @@ const MAX_SERIALIZED_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(feature = "vane-distributed")]
 // Keep this limit in sync with LANCE_VANE_MAX_SERIALIZED_INDEX_SECTION_BYTES in
 // src/include/lance_vane_search.hpp.
-const MAX_SERIALIZED_INDEX_SECTION_BYTES: usize = 256 * 1024 * 1024;
+pub(super) const MAX_SERIALIZED_INDEX_SECTION_BYTES: usize = 256 * 1024 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

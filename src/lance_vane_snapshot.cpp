@@ -284,6 +284,8 @@ shared_ptr<LanceDatasetCacheEntry> LanceVaneGetOrOpenFrozenSearchSnapshot(
     const string &index_section_sha256, const string &schema_fingerprint,
     bool private_diagnostics) {
   if (version == 0 || generation_id.empty() ||
+      manifest_sha256.size() != LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE ||
+      schema_fingerprint.size() != LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE ||
       index_section_sha256.size() != LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE) {
     throw InvalidInputException(
         "Distributed Lance search snapshot identity is incomplete");

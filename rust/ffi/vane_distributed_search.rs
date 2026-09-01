@@ -25,7 +25,10 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use crate::scanner::LanceStream;
 
-use super::dataset::{load_supported_raw_index_metadata, seed_frozen_index_metadata};
+use super::dataset::{
+    load_supported_raw_index_metadata, seed_frozen_index_metadata,
+    MAX_SERIALIZED_INDEX_SECTION_BYTES,
+};
 use super::projection;
 use super::types::{DatasetHandle, StreamHandle};
 use super::util::{
@@ -37,7 +40,6 @@ use super::vane_search_plan::{build_search_index_plan, SearchIndexPlan, SearchKi
 
 const NAMESPACE_FILTER_MAGIC: &[u8; 4] = b"LNF1";
 const NAMESPACE_FILTER_VERSION: u16 = 1;
-const MAX_SERIALIZED_INDEX_SECTION_BYTES: usize = 256 * 1024 * 1024;
 
 unsafe fn optional_cstr<'a>(
     value: *const c_char,
