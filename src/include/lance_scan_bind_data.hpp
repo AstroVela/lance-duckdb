@@ -15,6 +15,9 @@
 namespace duckdb {
 class TableCatalogEntry;
 struct LanceNamespaceTableConfig;
+#ifdef LANCE_VANE_DISTRIBUTED
+struct LanceVaneFrozenSnapshot;
+#endif
 
 struct LanceScanBindData : public TableFunctionData {
   string file_path;
@@ -36,6 +39,8 @@ struct LanceScanBindData : public TableFunctionData {
 #ifdef LANCE_VANE_DISTRIBUTED
   uint64_t dataset_version = 0;
   string dataset_generation_id;
+  shared_ptr<const LanceVaneFrozenSnapshot> distributed_frozen_snapshot;
+  bool distributed_snapshot_payload_validated = false;
   string distributed_scan_token;
   bool distributed_replayable = false;
   bool distributed_replay_path_restricted = false;

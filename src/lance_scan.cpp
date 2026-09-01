@@ -341,7 +341,7 @@ static constexpr const char *LANCE_FRAGMENT_SPLIT_MAGIC = "LFS1";
 static constexpr const char *LANCE_TAKE_SPLIT_MAGIC = "LTS1";
 static constexpr idx_t LANCE_SPLIT_MAGIC_SIZE = 4;
 static constexpr idx_t LANCE_SCAN_TOKEN_SIZE = BaseUUID::STRING_SIZE;
-static constexpr idx_t LANCE_SCAN_PROTOCOL_VERSION = 1;
+static constexpr idx_t LANCE_SCAN_PROTOCOL_VERSION = 2;
 static constexpr const char *LANCE_SCAN_SPLIT_CODEC = "lance.scan-split";
 static constexpr idx_t LANCE_SCAN_SPLIT_CODEC_VERSION = 1;
 
@@ -640,13 +640,62 @@ static void CaptureLanceDistributedSnapshot(
 #endif
 }
 
-static shared_ptr<LanceDatasetCacheEntry>
-OpenLanceDistributedSnapshot(ClientContext &context, const string &path,
-                             uint64_t version, const string &generation_id) {
+static shared_ptr<const LanceVaneFrozenSnapshot>
+GetLanceDistributedSnapshotPayload(const LanceScanBindData &bind_data) {
+  if (bind_data.distributed_frozen_snapshot) {
+    if (bind_data.distributed_snapshot_payload_validated) {
+      return bind_data.distributed_frozen_snapshot;
+    }
+    string validation_error;
+    auto &snapshot = *bind_data.distributed_frozen_snapshot;
+    if (!LanceVaneValidateFrozenSnapshot(
+            snapshot.serialized_manifest, snapshot.manifest_sha256,
+            snapshot.schema_fingerprint, validation_error)) {
+      throw InvalidInputException("Invalid frozen Lance scan snapshot: " +
+                                  validation_error);
+    }
+    return bind_data.distributed_frozen_snapshot;
+  }
+
+  const bool resolved_rest = bind_data.UsesNamespaceQuery() &&
+                             bind_data.distributed_rest_candidate.attempted &&
+                             bind_data.distributed_rest_candidate.qualified;
+  auto *dataset = resolved_rest ? bind_data.distributed_rest_candidate.dataset
+                                : bind_data.dataset;
+  const auto &path = resolved_rest
+                         ? bind_data.distributed_rest_candidate.physical_uri
+                         : bind_data.file_path;
+  const auto version =
+      resolved_rest ? bind_data.distributed_rest_candidate.dataset_version
+                    : bind_data.dataset_version;
+  const bool private_diagnostics =
+      resolved_rest
+          ? bind_data.distributed_rest_candidate.private_uri_diagnostics
+          : LanceScanHasPrivateDiagnostics(bind_data);
+  if (!dataset || version == 0 || lance_dataset_version(dataset) != version) {
+    throw InvalidInputException(
+        "Cannot freeze a missing or mismatched Lance scan snapshot");
+  }
+
+  auto snapshot = LanceVaneFreezeSnapshot(dataset, path, private_diagnostics);
+  if (resolved_rest &&
+      snapshot.schema_fingerprint !=
+          bind_data.distributed_rest_candidate.schema_fingerprint) {
+    throw IOException("Resolved Lance REST schema changed while freezing the "
+                      "distributed scan snapshot");
+  }
+  return make_shared_ptr<LanceVaneFrozenSnapshot>(std::move(snapshot));
+}
+
+static shared_ptr<LanceDatasetCacheEntry> OpenLanceDistributedSnapshot(
+    ClientContext &context, const string &path, uint64_t version,
+    const string &generation_id, const string &serialized_manifest,
+    const string &manifest_sha256, const string &schema_fingerprint) {
   const bool private_diagnostics =
       LanceVanePathRequiresRedaction(context, path);
-  return LanceVaneGetOrOpenSnapshot(context, path, version, generation_id,
-                                    private_diagnostics);
+  return LanceVaneGetOrOpenFrozenSnapshot(
+      context, path, version, generation_id, serialized_manifest,
+      manifest_sha256, schema_fingerprint, private_diagnostics);
 }
 
 unique_ptr<FunctionData> LanceScanBindData::Copy() const {
@@ -680,6 +729,9 @@ unique_ptr<FunctionData> LanceScanBindData::Copy() const {
   result->pushed_offset = pushed_offset;
   result->dataset_version = dataset_version;
   result->dataset_generation_id = dataset_generation_id;
+  result->distributed_frozen_snapshot = distributed_frozen_snapshot;
+  result->distributed_snapshot_payload_validated =
+      distributed_snapshot_payload_validated;
   result->distributed_scan_token = distributed_scan_token;
   result->distributed_replayable = distributed_replayable;
   result->distributed_replay_path_restricted =
@@ -826,6 +878,7 @@ static unique_ptr<FunctionData> LanceCreateDistributedScanWorkerBind(
     throw NotImplementedException(
         "Lance scan cannot create a replayable fixed-snapshot worker bind");
   }
+  auto frozen_snapshot = GetLanceDistributedSnapshotPayload(source);
   auto result = make_uniq<LanceScanBindData>();
   result->file_path = resolved_rest
                           ? source.distributed_rest_candidate.physical_uri
@@ -841,6 +894,8 @@ static unique_ptr<FunctionData> LanceCreateDistributedScanWorkerBind(
   result->dataset_generation_id =
       resolved_rest ? source.distributed_rest_candidate.dataset_generation_id
                     : source.dataset_generation_id;
+  result->distributed_frozen_snapshot = std::move(frozen_snapshot);
+  result->distributed_snapshot_payload_validated = true;
   result->distributed_scan_token = source.distributed_scan_token;
   result->distributed_replayable = true;
   result->distributed_replay_path_restricted =
@@ -1754,6 +1809,7 @@ static void LanceScanSerialize(Serializer &serializer,
     throw SerializationException(
         "Lance scan does not have a replayable fixed dataset snapshot");
   }
+  auto frozen_snapshot = GetLanceDistributedSnapshotPayload(bind_data);
   auto fragment_ids = bind_data.distributed_fragment_ids;
   auto fragment_row_counts = bind_data.distributed_fragment_row_counts;
   auto fragment_bytes_on_disk = bind_data.distributed_fragment_bytes_on_disk;
@@ -1797,6 +1853,15 @@ static void LanceScanSerialize(Serializer &serializer,
   serializer.WriteProperty(113, "fragment_row_counts", fragment_row_counts);
   serializer.WriteProperty(114, "fragment_bytes_on_disk",
                            fragment_bytes_on_disk);
+  serializer.WriteProperty(
+      115, "frozen_snapshot_version",
+      static_cast<uint64_t>(LANCE_VANE_FROZEN_SNAPSHOT_VERSION));
+  serializer.WriteProperty(116, "serialized_manifest",
+                           frozen_snapshot->serialized_manifest);
+  serializer.WriteProperty(117, "manifest_sha256",
+                           frozen_snapshot->manifest_sha256);
+  serializer.WriteProperty(118, "schema_fingerprint",
+                           frozen_snapshot->schema_fingerprint);
 }
 
 static unique_ptr<FunctionData> LanceScanDeserialize(Deserializer &deserializer,
@@ -1831,6 +1896,22 @@ static unique_ptr<FunctionData> LanceScanDeserialize(Deserializer &deserializer,
   result->distributed_fragment_bytes_on_disk =
       deserializer.ReadProperty<vector<uint64_t>>(114,
                                                   "fragment_bytes_on_disk");
+  const auto frozen_snapshot_version =
+      deserializer.ReadProperty<uint64_t>(115, "frozen_snapshot_version");
+  auto frozen_snapshot = make_shared_ptr<LanceVaneFrozenSnapshot>();
+  frozen_snapshot->serialized_manifest =
+      deserializer.ReadProperty<string>(116, "serialized_manifest");
+  frozen_snapshot->manifest_sha256 =
+      deserializer.ReadProperty<string>(117, "manifest_sha256");
+  frozen_snapshot->schema_fingerprint =
+      deserializer.ReadProperty<string>(118, "schema_fingerprint");
+  string frozen_snapshot_error;
+  const bool frozen_snapshot_valid =
+      frozen_snapshot_version == LANCE_VANE_FROZEN_SNAPSHOT_VERSION &&
+      LanceVaneValidateFrozenSnapshot(frozen_snapshot->serialized_manifest,
+                                      frozen_snapshot->manifest_sha256,
+                                      frozen_snapshot->schema_fingerprint,
+                                      frozen_snapshot_error);
   if (result->file_path.empty() ||
       result->file_path.find('\0') != string::npos ||
       result->dataset_version == 0 || result->dataset_generation_id.empty() ||
@@ -1844,12 +1925,17 @@ static unique_ptr<FunctionData> LanceScanDeserialize(Deserializer &deserializer,
       result->distributed_authorized_split_ids.size() !=
           result->distributed_authorized_split_payloads.size() ||
       (!result->distributed_authorization_restricted &&
-       !result->distributed_authorized_split_ids.empty())) {
+       !result->distributed_authorized_split_ids.empty()) ||
+      !frozen_snapshot_valid) {
     throw SerializationException(
-        "Serialized Lance scan has an invalid fixed snapshot identity");
+        "Serialized Lance scan has an invalid fixed snapshot identity" +
+        (frozen_snapshot_error.empty() ? string()
+                                       : ": " + frozen_snapshot_error));
   }
 
   result->distributed_replayable = true;
+  result->distributed_frozen_snapshot = std::move(frozen_snapshot);
+  result->distributed_snapshot_payload_validated = true;
   result->distributed_worker = true;
   return result;
 }
@@ -2143,9 +2229,15 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     runtime_bind->file_path = bind_data.file_path;
     runtime_bind->private_uri_diagnostics =
         LanceVanePathRequiresRedaction(context, bind_data.file_path);
+    if (!bind_data.distributed_frozen_snapshot) {
+      throw InvalidInputException(
+          "Detached Lance worker scan has no frozen snapshot payload");
+    }
+    auto &frozen_snapshot = *bind_data.distributed_frozen_snapshot;
     runtime_bind->dataset_entry = OpenLanceDistributedSnapshot(
         context, bind_data.file_path, bind_data.dataset_version,
-        bind_data.dataset_generation_id);
+        bind_data.dataset_generation_id, frozen_snapshot.serialized_manifest,
+        frozen_snapshot.manifest_sha256, frozen_snapshot.schema_fingerprint);
     runtime_bind->dataset = runtime_bind->dataset_entry->Handle();
     PopulateLanceDistributedScanSchemas(context, *runtime_bind);
     if (runtime_bind->names != bind_data.names ||
