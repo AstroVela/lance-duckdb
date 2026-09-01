@@ -8,8 +8,18 @@
 #include "duckdb/function/table_function.hpp"
 
 #include "lance_dataset_cache.hpp"
+#include "lance_vane_snapshot.hpp"
 
 namespace duckdb {
+
+static constexpr idx_t LANCE_VANE_MAX_SERIALIZED_INDEX_SECTION_BYTES =
+    256ULL * 1024ULL * 1024ULL;
+
+struct LanceVaneFrozenSearchSnapshot {
+  LanceVaneFrozenSnapshot dataset;
+  string serialized_index_section;
+  string index_section_sha256;
+};
 
 enum class LanceVaneSearchKind : uint8_t { VECTOR = 0, FTS = 1, HYBRID = 2 };
 enum class LanceVaneSearchOverload : uint8_t {
@@ -38,6 +48,7 @@ struct LanceVanePhysicalCandidate {
   bool private_uri_diagnostics = false;
   shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
+  void *session = nullptr;
 };
 
 struct LanceVaneSearchArguments {
@@ -84,6 +95,8 @@ struct LanceVaneGlobalSearchState {
   vector<string> pending_filter_ir_parts;
   bool pending_complex_filter_pushdown_failed = false;
   string index_plan;
+  shared_ptr<const LanceVaneFrozenSearchSnapshot> frozen_snapshot;
+  bool frozen_snapshot_payload_validated = false;
   string state_sha256;
 
   bool worker_bind = false;

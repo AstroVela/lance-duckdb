@@ -406,6 +406,17 @@ pub(crate) unsafe fn optional_session_handle(
     Ok(Some(handle.session.clone()))
 }
 
+#[cfg(feature = "vane-distributed")]
+pub(crate) unsafe fn optional_vane_session_handle<'a>(
+    session: *mut c_void,
+) -> FfiResult<Option<&'a SessionHandle>> {
+    if session.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: Caller guarantees session points to a SessionHandle owned by this library.
+    Ok(Some(unsafe { &*(session as *const SessionHandle) }))
+}
+
 pub(crate) unsafe fn stream_handle_mut<'a>(stream: *mut c_void) -> FfiResult<&'a mut StreamHandle> {
     if stream.is_null() {
         return Err(FfiError::new(ErrorCode::InvalidArgument, "stream is null"));

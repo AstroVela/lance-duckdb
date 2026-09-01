@@ -17,6 +17,8 @@ pub(crate) struct SessionHandle {
     pub(crate) session: Arc<Session>,
     // Lance does not expose clearing its index cache through Session.
     pub(crate) index_cache: Arc<dyn CacheBackend>,
+    #[cfg(feature = "vane-distributed")]
+    pub(crate) index_metadata_seed_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(crate) struct DatasetHandle {

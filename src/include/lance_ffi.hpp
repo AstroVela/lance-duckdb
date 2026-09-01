@@ -130,6 +130,17 @@ lance_vane_open_dataset_version_from_manifest_with_storage_options_and_session(
     size_t manifest_len, const char *expected_generation,
     const char **option_keys, const char **option_values, size_t options_len,
     void *session);
+void *
+lance_vane_open_dataset_version_from_manifest_and_index_section_with_session(
+    const char *path, uint64_t version, const uint8_t *manifest,
+    size_t manifest_len, const uint8_t *index_section, size_t index_section_len,
+    const char *expected_generation, void *session);
+void *
+lance_vane_open_dataset_version_from_manifest_and_index_section_with_storage_options_and_session(
+    const char *path, uint64_t version, const uint8_t *manifest,
+    size_t manifest_len, const uint8_t *index_section, size_t index_section_len,
+    const char *expected_generation, const char **option_keys,
+    const char **option_values, size_t options_len, void *session);
 
 int32_t lance_vane_sha256(const uint8_t *input, size_t input_len,
                           uint8_t *output);
@@ -139,6 +150,9 @@ int32_t lance_vane_arrow_schema_fingerprint(const ArrowSchema *schema,
                                             uint8_t *output);
 int32_t lance_vane_plan_namespace_filter(void *dataset, const char *sql,
                                          uint8_t **out_data, size_t *out_len);
+int32_t lance_vane_serialize_dataset_index_section(void *dataset, void *session,
+                                                   uint8_t **out_data,
+                                                   size_t *out_len);
 int32_t lance_vane_build_search_index_plan(
     void *dataset, const char *generation, uint8_t search_kind,
     const char *vector_column, const char *text_column,

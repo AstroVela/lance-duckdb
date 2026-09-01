@@ -11,6 +11,7 @@
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
+#include "lance_session_state.hpp"
 #include "lance_vane_snapshot.hpp"
 
 #include <algorithm>
@@ -21,6 +22,8 @@
 namespace duckdb {
 
 static constexpr idx_t LANCE_VANE_SEARCH_PROTOCOL_VERSION = 1;
+static constexpr uint64_t LANCE_VANE_SEARCH_CONTRACT_VERSION = 1;
+static constexpr uint64_t LANCE_VANE_FROZEN_SEARCH_SNAPSHOT_VERSION = 1;
 static constexpr idx_t LANCE_VANE_SEARCH_SPLIT_CODEC_VERSION = 1;
 static constexpr const char *LANCE_VANE_SEARCH_SPLIT_CODEC =
     "lance.global-search-split";
@@ -30,6 +33,16 @@ static constexpr idx_t LANCE_VANE_GLOBAL_SEARCH_MAGIC_SIZE = 4;
 static constexpr idx_t LANCE_VANE_SEARCH_UUID_SIZE = BaseUUID::STRING_SIZE;
 static constexpr idx_t LANCE_VANE_SHA256_SIZE = 32;
 static constexpr uint16_t LANCE_VANE_GLOBAL_SEARCH_FORMAT_VERSION = 1;
+
+struct LanceVaneSearchBytesDeleter {
+  size_t len;
+
+  void operator()(uint8_t *value) const {
+    if (value) {
+      lance_vane_free_bytes(value, len);
+    }
+  }
+};
 
 class LanceVaneCanonicalWriter {
 public:
@@ -91,6 +104,41 @@ static string LanceVaneSha256(const string &value) {
                       LanceFormatErrorSuffix());
   }
   return result;
+}
+
+static void
+ValidateAndMarkFrozenSearchSnapshot(LanceVaneGlobalSearchState &state) {
+  if (!state.frozen_snapshot) {
+    throw SerializationException(
+        "Distributed Lance search has no frozen snapshot payload");
+  }
+  auto &snapshot = *state.frozen_snapshot;
+  string validation_error;
+  if (!LanceVaneValidateFrozenSnapshot(snapshot.dataset.serialized_manifest,
+                                       snapshot.dataset.manifest_sha256,
+                                       snapshot.dataset.schema_fingerprint,
+                                       validation_error)) {
+    throw SerializationException(
+        "Distributed Lance search has an invalid frozen manifest: " +
+        validation_error);
+  }
+  if (snapshot.dataset.schema_fingerprint != state.schema_fingerprint) {
+    throw SerializationException(
+        "Distributed Lance search frozen schema identity does not match");
+  }
+  if (snapshot.serialized_index_section.size() >
+      LANCE_VANE_MAX_SERIALIZED_INDEX_SECTION_BYTES) {
+    throw SerializationException(
+        "Distributed Lance search index section exceeds the transport limit");
+  }
+  if (snapshot.index_section_sha256.size() != LANCE_VANE_SHA256_SIZE ||
+      LanceVaneSha256(snapshot.serialized_index_section) !=
+          snapshot.index_section_sha256) {
+    throw SerializationException(
+        "Distributed Lance search index section digest does not match its "
+        "payload");
+  }
+  state.frozen_snapshot_payload_validated = true;
 }
 
 static void AppendColumnIndex(LanceVaneCanonicalWriter &writer,
@@ -192,6 +240,12 @@ CanonicalSearchStateBytes(const LanceVaneGlobalSearchState &state) {
                 [&](const string &part) { writer.String(part); });
   writer.Bool(state.pending_complex_filter_pushdown_failed);
   writer.String(state.index_plan);
+  writer.Bool(static_cast<bool>(state.frozen_snapshot));
+  if (state.frozen_snapshot) {
+    writer.String(state.frozen_snapshot->dataset.manifest_sha256);
+    writer.String(state.frozen_snapshot->dataset.schema_fingerprint);
+    writer.String(state.frozen_snapshot->index_section_sha256);
+  }
   return writer.Bytes();
 }
 
@@ -262,7 +316,7 @@ ExpectedGlobalSearchSplitPayload(const LanceVaneGlobalSearchState &state) {
 
 static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
                                       bool verify_digest) {
-  if (state.contract_version != 1 ||
+  if (state.contract_version != LANCE_VANE_SEARCH_CONTRACT_VERSION ||
       static_cast<uint8_t>(state.source_class) >
           static_cast<uint8_t>(LanceVaneSearchSourceClass::STANDARD_REST) ||
       !IsValidSearchUUID(state.search_node_uuid) ||
@@ -303,7 +357,8 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
         !state.final_filter_ir.empty() || !state.filter_fingerprint.empty() ||
         state.filter_pushed_down || state.worker_bind || state.splits_applied ||
         state.empty_assignment || state.authorization_restricted ||
-        !state.authorized_split_ids.empty()) {
+        !state.authorized_split_ids.empty() || state.frozen_snapshot ||
+        state.frozen_snapshot_payload_validated) {
       throw SerializationException(
           "Distributed Lance search qualification failure is malformed");
     }
@@ -320,6 +375,9 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
       state.dataset_generation_id.find('\0') != string::npos ||
       state.schema_fingerprint.size() != LANCE_VANE_SHA256_SIZE ||
       state.filter_fingerprint.size() != LANCE_VANE_SHA256_SIZE ||
+      !state.frozen_snapshot || !state.frozen_snapshot_payload_validated ||
+      state.frozen_snapshot->dataset.schema_fingerprint !=
+          state.schema_fingerprint ||
       state.index_plan.size() < 6 ||
       state.index_plan.compare(0, 4, "LSI1", 4) != 0 ||
       (!state.namespace_filter_plan.empty() &&
@@ -426,6 +484,7 @@ void LanceVaneCapturePhysicalCandidate(
   out_candidate.search_node_uuid = UUID::ToString(UUID::GenerateRandomUUID());
   out_candidate.dataset_entry = dataset_entry;
   out_candidate.dataset = dataset;
+  out_candidate.session = LanceGetSessionHandle(context);
 }
 
 static string BuildIndexPlan(const LanceVanePhysicalCandidate &candidate,
@@ -452,6 +511,40 @@ static string BuildIndexPlan(const LanceVanePhysicalCandidate &candidate,
   }
   string result(reinterpret_cast<const char *>(bytes), len);
   lance_vane_free_bytes(bytes, len);
+  return result;
+}
+
+static shared_ptr<const LanceVaneFrozenSearchSnapshot>
+FreezeSearchSnapshot(const LanceVanePhysicalCandidate &candidate) {
+  auto result = make_shared_ptr<LanceVaneFrozenSearchSnapshot>();
+  result->dataset =
+      LanceVaneFreezeSnapshot(candidate.dataset, candidate.physical_uri,
+                              candidate.private_uri_diagnostics);
+  if (result->dataset.schema_fingerprint != candidate.schema_fingerprint) {
+    throw IOException(
+        "Distributed Lance search schema changed while freezing its snapshot");
+  }
+
+  uint8_t *index_section = nullptr;
+  size_t index_section_len = 0;
+  auto rc = lance_vane_serialize_dataset_index_section(
+      candidate.dataset, candidate.session, &index_section, &index_section_len);
+  unique_ptr<uint8_t, LanceVaneSearchBytesDeleter> index_section_owner(
+      index_section, LanceVaneSearchBytesDeleter{index_section_len});
+  if (rc != 0 || (index_section_len > 0 && !index_section) ||
+      index_section_len > LANCE_VANE_MAX_SERIALIZED_INDEX_SECTION_BYTES) {
+    throw IOException(
+        "Failed to freeze the distributed Lance search index metadata" +
+        LanceVaneFormatErrorSuffix(candidate.physical_uri,
+                                   candidate.private_uri_diagnostics));
+  }
+  if (index_section_len > 0) {
+    result->serialized_index_section.assign(
+        reinterpret_cast<const char *>(index_section_owner.get()),
+        index_section_len);
+  }
+  result->index_section_sha256 =
+      LanceVaneSha256(result->serialized_index_section);
   return result;
 }
 
@@ -519,6 +612,8 @@ LanceVanePrepareGlobalSearchState(const LanceVanePhysicalCandidate &candidate,
     state.dataset_version = candidate.dataset_version;
     state.dataset_generation_id = candidate.dataset_generation_id;
     state.schema_fingerprint = candidate.schema_fingerprint;
+    state.frozen_snapshot = FreezeSearchSnapshot(candidate);
+    ValidateAndMarkFrozenSearchSnapshot(state);
     state.namespace_filter_plan =
         BuildNamespaceFilterPlan(candidate, arguments.namespace_filter);
     state.filter_fingerprint =
@@ -782,6 +877,26 @@ void LanceVaneSerializeGlobalSearchState(
                            state.pending_complex_filter_pushdown_failed);
   serializer.WriteProperty(243, "namespace_backed",
                            state.arguments.namespace_backed);
+  auto has_frozen_snapshot = static_cast<bool>(state.frozen_snapshot);
+  serializer.WriteProperty(244, "has_frozen_snapshot", has_frozen_snapshot);
+  serializer.WriteProperty(245, "frozen_snapshot_version",
+                           LANCE_VANE_FROZEN_SEARCH_SNAPSHOT_VERSION);
+  serializer.WriteProperty(
+      246, "serialized_manifest",
+      has_frozen_snapshot ? state.frozen_snapshot->dataset.serialized_manifest
+                          : string());
+  serializer.WriteProperty(247, "manifest_sha256",
+                           has_frozen_snapshot
+                               ? state.frozen_snapshot->dataset.manifest_sha256
+                               : string());
+  serializer.WriteProperty(248, "serialized_index_section",
+                           has_frozen_snapshot
+                               ? state.frozen_snapshot->serialized_index_section
+                               : string());
+  serializer.WriteProperty(249, "index_section_sha256",
+                           has_frozen_snapshot
+                               ? state.frozen_snapshot->index_section_sha256
+                               : string());
 }
 
 LanceVaneGlobalSearchState
@@ -875,6 +990,39 @@ LanceVaneDeserializeGlobalSearchState(Deserializer &deserializer) {
                                       "pending_complex_filter_pushdown_failed");
   state.arguments.namespace_backed =
       deserializer.ReadProperty<bool>(243, "namespace_backed");
+  auto has_frozen_snapshot =
+      deserializer.ReadProperty<bool>(244, "has_frozen_snapshot");
+  auto frozen_snapshot_version =
+      deserializer.ReadProperty<uint64_t>(245, "frozen_snapshot_version");
+  auto serialized_manifest =
+      deserializer.ReadProperty<string>(246, "serialized_manifest");
+  auto manifest_sha256 =
+      deserializer.ReadProperty<string>(247, "manifest_sha256");
+  auto serialized_index_section =
+      deserializer.ReadProperty<string>(248, "serialized_index_section");
+  auto index_section_sha256 =
+      deserializer.ReadProperty<string>(249, "index_section_sha256");
+  if (frozen_snapshot_version != LANCE_VANE_FROZEN_SEARCH_SNAPSHOT_VERSION) {
+    throw SerializationException(
+        "Distributed Lance search has an unsupported frozen snapshot format");
+  }
+  if (has_frozen_snapshot) {
+    auto frozen_snapshot = make_shared_ptr<LanceVaneFrozenSearchSnapshot>();
+    frozen_snapshot->dataset.serialized_manifest =
+        std::move(serialized_manifest);
+    frozen_snapshot->dataset.manifest_sha256 = std::move(manifest_sha256);
+    frozen_snapshot->dataset.schema_fingerprint = state.schema_fingerprint;
+    frozen_snapshot->serialized_index_section =
+        std::move(serialized_index_section);
+    frozen_snapshot->index_section_sha256 = std::move(index_section_sha256);
+    state.frozen_snapshot = std::move(frozen_snapshot);
+    ValidateAndMarkFrozenSearchSnapshot(state);
+  } else if (!serialized_manifest.empty() || !manifest_sha256.empty() ||
+             !serialized_index_section.empty() ||
+             !index_section_sha256.empty()) {
+    throw SerializationException(
+        "Distributed Lance search has an unclaimed frozen snapshot payload");
+  }
   ValidateGlobalSearchState(state, true);
   return state;
 }
@@ -894,20 +1042,13 @@ LanceVaneOpenSearchSnapshot(ClientContext &context,
         "Distributed Lance search physical identity changed before execution");
   }
 
-  auto snapshot = LanceVaneGetOrOpenSnapshot(
+  auto &frozen = *state.frozen_snapshot;
+  return LanceVaneGetOrOpenFrozenSearchSnapshot(
       context, state.physical_uri, state.dataset_version,
-      state.dataset_generation_id, state.private_uri_diagnostics);
-  auto *fixed = snapshot->Handle();
-  string schema_fingerprint(LANCE_VANE_SHA256_SIZE, '\0');
-  if (lance_vane_dataset_schema_fingerprint(
-          fixed, reinterpret_cast<uint8_t *>(&schema_fingerprint[0])) != 0) {
-    throw IOException("Failed to validate the distributed Lance search schema" +
-                      LanceFormatErrorSuffix());
-  }
-  if (schema_fingerprint != state.schema_fingerprint) {
-    throw IOException("Distributed Lance search schema changed");
-  }
-  return snapshot;
+      state.dataset_generation_id, frozen.dataset.serialized_manifest,
+      frozen.dataset.manifest_sha256, frozen.serialized_index_section,
+      frozen.index_section_sha256, state.schema_fingerprint,
+      state.private_uri_diagnostics);
 }
 
 void LanceVanePopulateSearchSchema(ClientContext &context,

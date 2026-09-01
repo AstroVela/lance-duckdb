@@ -29,12 +29,14 @@ The worker plan contains only portable scan state:
 - projection and filter state; and
 - the worker's assigned opaque fragment or take splits.
 
-Each worker opens the coordinator's exact dataset version directly with its
-replayed DuckDB session credential state and validates the snapshot identity.
-There is no fallback to the latest version and no extension-specific lease or
-cross-worker cache. Appends made after planning therefore do not change the
-query snapshot. Worker-backed scans fail explicitly if the required snapshot is
-deleted or replaced before it can be reopened.
+The coordinator serializes the bound snapshot's core Lance manifest once into
+physical-plan bind state. Each worker constructs the exact dataset version from
+that frozen manifest and its replayed DuckDB session credential state. Fragment
+and take splits contain only the plan identity and their assignment; manifest
+size is therefore independent of split count. There is no fallback to the
+latest version and no extension-specific lease or cross-worker cache. Appends
+made after planning do not change the query snapshot. Worker-backed scans fail
+explicitly if the required snapshot is deleted or replaced before execution.
 
 Within one worker DuckDB database, ordinary scans and `lance_vector_search`,
 `lance_fts`, and `lance_hybrid_search` share the same Lance `Session`. Lance's
@@ -46,11 +48,15 @@ within a query, and query completion releases every cached dataset handle. The
 frozen search index plan still selects the exact index segments for each query;
 a cache hit never changes index selection or snapshot validation.
 
-Before a worker accepts a fixed snapshot, it reads that version's current
-manifest through a cache-free Lance validation Session. It then installs the
-validated manifest on the worker's shared Session, preserving index and file
-metadata reuse without trusting a possibly stale manifest cached for a dataset
-that previously occupied the same URI and version.
+Before a worker accepts a fixed snapshot, Lance resolves the manifest object
+and checks its current metadata. A backend with a reliable immutable ETag needs
+one metadata request and does not download the manifest contents. A backend
+without such an identity loads the current manifest through a cache-free Lance
+validation Session and compares its decoded value with the frozen manifest.
+The validated frozen manifest is installed on the worker's shared Session,
+preserving index and file metadata reuse without trusting a possibly stale
+manifest cached for a dataset that previously occupied the same URI and
+version.
 
 The in-memory caches are process-local, so each Ray worker warms independently.
 They are most effective when the runner keeps worker actors and their DuckDB
@@ -81,6 +87,18 @@ when an index has partial coverage. A worker validates the complete state and
 its assigned split before execution. Retries must reuse the same assignment,
 and execution fails closed if the snapshot, dataset generation, schema, or
 selected index segments no longer match.
+
+The core manifest does not contain Lance's separately stored `IndexSection`.
+The coordinator therefore serializes the complete supported index metadata
+catalog once alongside the core manifest. After validating the snapshot, the
+worker seeds that catalog into Lance's native dataset-scoped index metadata
+cache in the shared `Session`. The existing frozen search plan then validates
+its selected segment identities and fragment coverage against the seeded
+catalog before Lance creates the native scanner. Physical index segment files
+are not embedded in the plan and continue to be read normally by the executing
+worker. On a backend without reliable immutable object identity, the worker
+also compares the current `IndexSection` with the coordinator-frozen catalog
+before seeding it.
 
 For a standard REST namespace, the coordinator obtains a stable physical table
 URI and detailed metadata for the already-bound version. Credentials, vended
@@ -222,3 +240,6 @@ full-text, and hybrid results with native execution; verifies singleton search
 splits, partial index coverage, frozen selected-index segments, retry identity,
 and stale-state rejection; and proves standard REST scans and searches continue
 from their physical snapshot after the namespace service is unavailable.
+The [frozen snapshot benchmark](../benches/vane_frozen_snapshot/README.md)
+reports cold and warm planning and execution latency, serialized plan and split
+sizes, and observed manifest `HEAD`/`GET` requests for 1, 8, and 32 workers.

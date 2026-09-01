@@ -2561,7 +2561,7 @@ def test_global_search_fails_when_the_frozen_snapshot_is_vacuumed(
 
         with pytest.raises(
             Exception,
-            match="Failed to reopen fixed Lance dataset version",
+            match="Failed to open coordinator-frozen Lance search snapshot",
         ):
             _run_serialized_logical(ray_runner, serialized)
     finally:
