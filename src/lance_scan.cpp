@@ -2229,9 +2229,10 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     runtime_bind->file_path = bind_data.file_path;
     runtime_bind->private_uri_diagnostics =
         LanceVanePathRequiresRedaction(context, bind_data.file_path);
-    if (!bind_data.distributed_frozen_snapshot) {
-      throw InvalidInputException(
-          "Detached Lance worker scan has no frozen snapshot payload");
+    if (!bind_data.distributed_frozen_snapshot ||
+        !bind_data.distributed_snapshot_payload_validated) {
+      throw InvalidInputException("Detached Lance worker scan has no validated "
+                                  "frozen snapshot payload");
     }
     auto &frozen_snapshot = *bind_data.distributed_frozen_snapshot;
     runtime_bind->dataset_entry = OpenLanceDistributedSnapshot(

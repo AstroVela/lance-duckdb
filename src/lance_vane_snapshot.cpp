@@ -236,12 +236,9 @@ shared_ptr<LanceDatasetCacheEntry> LanceVaneGetOrOpenFrozenSnapshot(
     throw InvalidInputException(
         "Distributed Lance snapshot identity is incomplete");
   }
-  string validation_error;
-  if (!LanceVaneValidateFrozenSnapshot(serialized_manifest, manifest_sha256,
-                                       schema_fingerprint, validation_error)) {
-    throw InvalidInputException("Invalid frozen Lance snapshot: " +
-                                validation_error);
-  }
+  // Worker-bind construction or deserialization already validates the
+  // envelope digest and bounded fields. Do not hash a large manifest again at
+  // scan initialization.
 
   auto cache_key =
       LanceVaneSnapshotCacheKey(context, path, version, generation_id);

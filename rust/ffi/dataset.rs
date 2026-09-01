@@ -530,24 +530,10 @@ async fn vane_load_dataset_version_from_manifest(
     serialized_manifest: &[u8],
     expected_generation: &str,
 ) -> FfiResult<lance::Dataset> {
-    let supplied_manifest = pb::Manifest::decode(serialized_manifest).map_err(|err| {
-        FfiError::new(
-            ErrorCode::InvalidArgument,
-            format!("decode coordinator-frozen dataset manifest: {err}"),
-        )
-    })?;
-    if supplied_manifest.version != version {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            format!(
-                "coordinator-frozen manifest version {} does not match requested version {version}",
-                supplied_manifest.version
-            ),
-        ));
-    }
-
     // This is Lance's native IPC fast path. It resolves the immutable manifest
     // location (and object metadata) but does not download manifest contents.
+    // DatasetBuilder also validates and decodes the protobuf, so avoid decoding
+    // the same potentially large payload once before handing it to Lance.
     let mut frozen_builder = vane_versioned_dataset_builder(path, version, storage_options)
         .with_serialized_manifest(serialized_manifest)
         .map_err(|err| {
@@ -598,6 +584,7 @@ async fn vane_load_dataset_version_from_manifest(
                 format!("validate current dataset version {version} at '{path}': {err}"),
             )
         })?;
+        let supplied_manifest = pb::Manifest::from(frozen.manifest());
         let current_manifest = pb::Manifest::from(current.manifest());
         if current_manifest != supplied_manifest {
             return Err(FfiError::new(
