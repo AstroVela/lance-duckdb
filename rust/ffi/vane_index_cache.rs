@@ -58,6 +58,13 @@ impl VaneIndexCacheBackend {
         )
     }
 
+    fn entry_size<T>(value: &T) -> usize
+    where
+        T: DeepSizeOf + ?Sized,
+    {
+        value.deep_size_of() + std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2
+    }
+
     pub(crate) fn get_pinned_with_key<K>(&self, prefix: &str, key: &K) -> Option<Arc<K::ValueType>>
     where
         K: CacheKey,
@@ -80,8 +87,7 @@ impl VaneIndexCacheBackend {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let key = Self::internal_key(prefix, key);
-        let size_bytes =
-            value.deep_size_of() + std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2;
+        let size_bytes = Self::entry_size(value.as_ref());
         let value: CacheEntry = value;
         let mut pinned = self.lock_pinned();
         pinned
@@ -100,6 +106,22 @@ impl VaneIndexCacheBackend {
             cache: Arc::downgrade(self),
             key,
         }
+    }
+
+    pub(crate) async fn replace_bounded_with_key<K>(
+        &self,
+        prefix: &str,
+        key: &K,
+        value: Arc<K::ValueType>,
+    ) where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key = Self::internal_key(prefix, key);
+        let size_bytes = Self::entry_size(value.as_ref());
+        self.bounded
+            .insert(&key, value, size_bytes, K::codec())
+            .await;
     }
 
     fn unpin(&self, key: &InternalCacheKey) {
@@ -260,5 +282,27 @@ mod tests {
 
         drop(lease);
         assert!(cache.get_with_key(&TestKey).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_refresh_never_reveals_the_previous_bounded_value() {
+        let bounded: Arc<dyn CacheBackend> = Arc::new(MokaCacheBackend::with_capacity(256));
+        let backend = Arc::new(VaneIndexCacheBackend::new(bounded));
+        let cache = LanceCache::with_backend_and_prefix(backend.clone(), "dataset/".to_string());
+        let stale = Arc::new(vec![9_u8]);
+        cache.insert_with_key(&TestKey, stale.clone()).await;
+        assert_eq!(cache.get_with_key(&TestKey).await, Some(stale));
+
+        let expected = Arc::new(vec![1_u8; 1024]);
+        let lease = backend.pin_with_key("dataset/", &TestKey, expected.clone());
+        backend
+            .replace_bounded_with_key("dataset/", &TestKey, expected.clone())
+            .await;
+        drop(lease);
+
+        assert!(cache
+            .get_with_key(&TestKey)
+            .await
+            .is_none_or(|value| value == expected));
     }
 }

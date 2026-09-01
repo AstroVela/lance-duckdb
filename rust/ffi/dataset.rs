@@ -726,9 +726,18 @@ pub(super) async fn seed_frozen_index_metadata(
             "conflicting coordinator-frozen index metadata is already active for this snapshot",
         ));
     }
-    Ok(session
+    let frozen_indices = Arc::new(indices.to_vec());
+    let lease = session
         .vane_index_cache
-        .pin_with_key(&cache_prefix, &key, Arc::new(indices.to_vec())))
+        .pin_with_key(&cache_prefix, &key, frozen_indices.clone());
+    // Replace the exact bounded entry while the pin hides it. If the frozen
+    // catalog exceeds the configured capacity, Moka evicts the replacement;
+    // either outcome removes any stale same-key value before the lease drops.
+    session
+        .vane_index_cache
+        .replace_bounded_with_key(&cache_prefix, &key, frozen_indices)
+        .await;
+    Ok(lease)
 }
 
 #[cfg(feature = "vane-distributed")]
