@@ -7,6 +7,8 @@ use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
 #[cfg(feature = "vane-distributed")]
 use lance::dataset::builder::DatasetBuilder;
+#[cfg(feature = "vane-distributed")]
+use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::session::Session;
 use lance_core::datatypes::Schema as LanceSchema;
 #[cfg(feature = "vane-distributed")]
@@ -213,6 +215,25 @@ pub(crate) fn with_explicit_aws_credentials(
 }
 
 #[cfg(feature = "vane-distributed")]
+pub(crate) fn vane_object_store_params(
+    storage_options: Option<&std::collections::HashMap<String, String>>,
+) -> ObjectStoreParams {
+    let Some(storage_options) = storage_options else {
+        return ObjectStoreParams::default();
+    };
+    let mut params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            storage_options.clone(),
+        ))),
+        ..ObjectStoreParams::default()
+    };
+    if let Some(credentials) = explicit_aws_credentials(storage_options) {
+        params.aws_credentials = Some(Arc::new(StaticCredentialProvider::new(credentials)));
+    }
+    params
+}
+
+#[cfg(feature = "vane-distributed")]
 pub(crate) fn vane_external_location_error(
     code: ErrorCode,
     operation: &'static str,
@@ -404,6 +425,17 @@ pub(crate) unsafe fn optional_session_handle(
     }
     let handle = unsafe { &*(session as *const SessionHandle) };
     Ok(Some(handle.session.clone()))
+}
+
+#[cfg(feature = "vane-distributed")]
+pub(crate) unsafe fn optional_vane_session_handle<'a>(
+    session: *mut c_void,
+) -> FfiResult<Option<&'a SessionHandle>> {
+    if session.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: Caller guarantees session points to a SessionHandle owned by this library.
+    Ok(Some(unsafe { &*(session as *const SessionHandle) }))
 }
 
 pub(crate) unsafe fn stream_handle_mut<'a>(stream: *mut c_void) -> FfiResult<&'a mut StreamHandle> {

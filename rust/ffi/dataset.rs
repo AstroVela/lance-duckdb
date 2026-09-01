@@ -17,12 +17,20 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
 #[cfg(feature = "vane-distributed")]
+use lance::index::scalar::IndexDetails;
+#[cfg(feature = "vane-distributed")]
+use lance::session::index_caches::IndexMetadataKey;
+#[cfg(feature = "vane-distributed")]
 use lance::session::Session;
 #[cfg(feature = "vane-distributed")]
-use lance_table::format::pb;
+use lance_table::format::{pb, IndexMetadata};
+#[cfg(feature = "vane-distributed")]
+use lance_table::io::manifest::read_manifest_indexes;
 #[cfg(feature = "vane-distributed")]
 use prost::Message;
 use roaring::RoaringTreemap;
+#[cfg(feature = "vane-distributed")]
+use sha2::{Digest, Sha256};
 
 use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -30,18 +38,29 @@ use crate::runtime;
 
 use super::session::record_dataset_open;
 use super::types::DatasetHandle;
-use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
 #[cfg(feature = "vane-distributed")]
-use super::util::with_explicit_aws_credentials;
+use super::types::SessionHandle;
+use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
 use super::util::{
     cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
     FfiResult,
 };
+#[cfg(feature = "vane-distributed")]
+use super::util::{
+    optional_vane_session_handle, vane_object_store_params, with_explicit_aws_credentials,
+};
+#[cfg(feature = "vane-distributed")]
+use super::vane_index_cache::VaneIndexCacheLease;
 
 #[cfg(feature = "vane-distributed")]
 // Keep this limit in sync with LANCE_VANE_MAX_SERIALIZED_MANIFEST_BYTES in
 // src/include/lance_vane_snapshot.hpp.
 const MAX_SERIALIZED_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
+
+#[cfg(feature = "vane-distributed")]
+// Keep this limit in sync with LANCE_VANE_MAX_SERIALIZED_INDEX_SECTION_BYTES in
+// src/include/lance_vane_search.hpp.
+pub(super) const MAX_SERIALIZED_INDEX_SECTION_BYTES: usize = 256 * 1024 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +372,13 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_manifest(
 }
 
 #[cfg(feature = "vane-distributed")]
+struct VaneFrozenDatasetPayload {
+    manifest: *const u8,
+    manifest_len: usize,
+    index_section: Option<(*const u8, usize)>,
+}
+
+#[cfg(feature = "vane-distributed")]
 #[no_mangle]
 pub unsafe extern "C" fn lance_vane_open_dataset_version_from_manifest_with_session(
     path: *const c_char,
@@ -366,8 +392,11 @@ pub unsafe extern "C" fn lance_vane_open_dataset_version_from_manifest_with_sess
         vane_open_dataset_version_from_manifest_inner(
             path,
             version,
-            manifest,
-            manifest_len,
+            VaneFrozenDatasetPayload {
+                manifest,
+                manifest_len,
+                index_section: None,
+            },
             expected_generation,
             None,
             session,
@@ -411,8 +440,98 @@ pub unsafe extern "C" fn lance_vane_open_dataset_version_from_manifest_with_stor
         vane_open_dataset_version_from_manifest_inner(
             path,
             version,
-            manifest,
-            manifest_len,
+            VaneFrozenDatasetPayload {
+                manifest,
+                manifest_len,
+                index_section: None,
+            },
+            expected_generation,
+            Some(storage_options),
+            session,
+        )
+    } {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_open_dataset_version_from_manifest_and_index_section_with_session(
+    path: *const c_char,
+    version: u64,
+    manifest: *const u8,
+    manifest_len: usize,
+    index_section: *const u8,
+    index_section_len: usize,
+    expected_generation: *const c_char,
+    session: *mut c_void,
+) -> *mut c_void {
+    match unsafe {
+        vane_open_dataset_version_from_manifest_inner(
+            path,
+            version,
+            VaneFrozenDatasetPayload {
+                manifest,
+                manifest_len,
+                index_section: Some((index_section, index_section_len)),
+            },
+            expected_generation,
+            None,
+            session,
+        )
+    } {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_open_dataset_version_from_manifest_and_index_section_with_storage_options_and_session(
+    path: *const c_char,
+    version: u64,
+    manifest: *const u8,
+    manifest_len: usize,
+    index_section: *const u8,
+    index_section_len: usize,
+    expected_generation: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    session: *mut c_void,
+) -> *mut c_void {
+    let storage_options = match unsafe {
+        // SAFETY: The caller supplies arrays containing `options_len` C string pointers.
+        vane_storage_options_from_ffi(option_keys, option_values, options_len)
+    } {
+        Ok(storage_options) => storage_options,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return ptr::null_mut();
+        }
+    };
+    match unsafe {
+        vane_open_dataset_version_from_manifest_inner(
+            path,
+            version,
+            VaneFrozenDatasetPayload {
+                manifest,
+                manifest_len,
+                index_section: Some((index_section, index_section_len)),
+            },
             expected_generation,
             Some(storage_options),
             session,
@@ -487,6 +606,137 @@ fn vane_versioned_dataset_builder(
 }
 
 #[cfg(feature = "vane-distributed")]
+fn decode_frozen_index_section(bytes: &[u8]) -> FfiResult<Vec<IndexMetadata>> {
+    if bytes.len() > MAX_SERIALIZED_INDEX_SECTION_BYTES {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "serialized index section length must not exceed {} bytes",
+                MAX_SERIALIZED_INDEX_SECTION_BYTES
+            ),
+        ));
+    }
+    let section = pb::IndexSection::decode(bytes).map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("decode coordinator-frozen index section: {err}"),
+        )
+    })?;
+    section
+        .indices
+        .into_iter()
+        .map(|metadata| {
+            if let Some(created_at) = metadata.created_at {
+                let created_at = i64::try_from(created_at).map_err(|_| {
+                    FfiError::new(
+                        ErrorCode::InvalidArgument,
+                        "coordinator-frozen index timestamp is out of range",
+                    )
+                })?;
+                if chrono::DateTime::from_timestamp_millis(created_at).is_none() {
+                    return Err(FfiError::new(
+                        ErrorCode::InvalidArgument,
+                        "coordinator-frozen index timestamp is invalid",
+                    ));
+                }
+            }
+            IndexMetadata::try_from(metadata).map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("decode coordinator-frozen index metadata: {err}"),
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "vane-distributed")]
+fn retain_supported_frozen_indices(indices: &mut Vec<IndexMetadata>) {
+    // Lance applies this compatibility filter inside Dataset::load_indices,
+    // after reading the physical IndexSection. The helper is crate-private
+    // upstream, so mirror the pinned Lance rule before seeding that native
+    // cache with coordinator-frozen raw metadata.
+    indices.retain(|index| {
+        let max_supported_version = index
+            .index_details
+            .as_ref()
+            .map(|details| {
+                IndexDetails(details.clone())
+                    .index_version()
+                    .unwrap_or(i32::MAX as u32)
+            })
+            .unwrap_or_default();
+        index.index_version <= max_supported_version as i32
+    });
+}
+
+#[cfg(feature = "vane-distributed")]
+pub(super) async fn load_supported_raw_index_metadata(
+    dataset: &lance::Dataset,
+) -> FfiResult<Vec<IndexMetadata>> {
+    let object_store = dataset.object_store(None).await.map_err(|err| {
+        FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("resolve coordinator-frozen index object store: {err}"),
+        )
+    })?;
+    let mut indices = read_manifest_indexes(
+        object_store.as_ref(),
+        dataset.manifest_location(),
+        dataset.manifest(),
+    )
+    .await
+    .map_err(|err| {
+        FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("read coordinator-frozen index section: {err}"),
+        )
+    })?;
+    retain_supported_frozen_indices(&mut indices);
+    Ok(indices)
+}
+
+#[cfg(feature = "vane-distributed")]
+pub(super) async fn seed_frozen_index_metadata(
+    dataset: &lance::Dataset,
+    session: &SessionHandle,
+    indices: &[IndexMetadata],
+) -> FfiResult<VaneIndexCacheLease> {
+    let store_identity = dataset
+        .object_store(None)
+        .await
+        .map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("resolve frozen index metadata object store: {err}"),
+            )
+        })?
+        .store_prefix
+        .clone();
+    let cache_prefix = format!("{}/", dataset.uri());
+    let key = IndexMetadataKey {
+        version: dataset.version_id(),
+        store_identity: &store_identity,
+    };
+
+    let _guard = session.index_metadata_seed_lock.lock().await;
+    if session
+        .vane_index_cache
+        .get_pinned_with_key(&cache_prefix, &key)
+        .is_some_and(|current| current.as_ref() != indices)
+    {
+        return Err(FfiError::new(
+            ErrorCode::DatasetOpen,
+            "conflicting coordinator-frozen index metadata is already active for this snapshot",
+        ));
+    }
+    let frozen_indices = Arc::new(indices.to_vec());
+    Ok(session
+        .vane_index_cache
+        .pin_with_key(&cache_prefix, &key, frozen_indices))
+}
+
+#[cfg(feature = "vane-distributed")]
 async fn vane_load_dataset_version(
     path: &str,
     version: u64,
@@ -529,34 +779,94 @@ async fn vane_load_dataset_version_from_manifest(
     shared_session: Option<Arc<Session>>,
     serialized_manifest: &[u8],
     expected_generation: &str,
+    frozen_indices: Option<&[IndexMetadata]>,
 ) -> FfiResult<lance::Dataset> {
     // This is Lance's native IPC fast path. It resolves the immutable manifest
     // location (and object metadata) but does not download manifest contents.
     // DatasetBuilder also validates and decodes the protobuf, so avoid decoding
     // the same potentially large payload once before handing it to Lance.
-    let mut frozen_builder = vane_versioned_dataset_builder(path, version, storage_options)
-        .with_serialized_manifest(serialized_manifest)
-        .map_err(|err| {
+    let frozen = if frozen_indices.is_some() {
+        let shared_session = shared_session.as_ref().ok_or_else(|| {
             FfiError::new(
                 ErrorCode::InvalidArgument,
-                format!("load coordinator-frozen dataset manifest: {err}"),
+                "coordinator-frozen index metadata requires a shared Lance session",
             )
         })?;
-    if let Some(shared_session) = shared_session.as_ref() {
-        frozen_builder = frozen_builder.with_session(shared_session.clone());
-    }
-    let frozen = frozen_builder.load().await.map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetOpen,
-            format!("open coordinator-frozen dataset version {version} at '{path}': {err}"),
+        let object_store_builder = vane_versioned_dataset_builder(path, version, storage_options)
+            .with_session(shared_session.clone());
+        let (object_store, base_path, commit_handler) = object_store_builder
+            .build_object_store()
+            .await
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::DatasetOpen,
+                    format!("resolve coordinator-frozen dataset object store: {err}"),
+                )
+            })?;
+        let mut generation_store = object_store.as_ref().clone();
+        let generation_digest = Sha256::digest(expected_generation.as_bytes());
+        generation_store.store_prefix = format!(
+            "{}|vane-frozen:{generation_digest:x}",
+            generation_store.store_prefix
+        );
+        let manifest = pb::Manifest::decode(serialized_manifest)
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("decode coordinator-frozen dataset manifest: {err}"),
+                )
+            })?
+            .try_into()
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("load coordinator-frozen dataset manifest: {err}"),
+                )
+            })?;
+        DatasetBuilder::load_by_uri(
+            shared_session.clone(),
+            Some(manifest),
+            None,
+            path.to_string(),
+            Some(version),
+            Arc::new(generation_store),
+            base_path,
+            commit_handler,
+            Some(vane_object_store_params(storage_options)),
+            None,
         )
-    })?;
+        .await
+        .map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("open coordinator-frozen dataset version {version} at '{path}': {err}"),
+            )
+        })?
+    } else {
+        let mut frozen_builder = vane_versioned_dataset_builder(path, version, storage_options)
+            .with_serialized_manifest(serialized_manifest)
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("load coordinator-frozen dataset manifest: {err}"),
+                )
+            })?;
+        if let Some(shared_session) = shared_session.as_ref() {
+            frozen_builder = frozen_builder.with_session(shared_session.clone());
+        }
+        frozen_builder.load().await.map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("open coordinator-frozen dataset version {version} at '{path}': {err}"),
+            )
+        })?
+    };
 
     let frozen_generation = format!("snapshot|{}", dataset_snapshot_identity(&frozen).await?);
     if frozen_generation != expected_generation {
         return Err(FfiError::new(
             ErrorCode::DatasetOpen,
-            "coordinator-frozen dataset generation does not match current object metadata",
+            "coordinator-frozen dataset snapshot generation changed; generation does not match current object metadata",
         ));
     }
 
@@ -598,6 +908,15 @@ async fn vane_load_dataset_version_from_manifest(
                 ErrorCode::DatasetOpen,
                 "validated dataset generation does not match the coordinator snapshot",
             ));
+        }
+        if let Some(frozen_indices) = frozen_indices {
+            let current_indices = load_supported_raw_index_metadata(&current).await?;
+            if current_indices != frozen_indices {
+                return Err(FfiError::new(
+                    ErrorCode::DatasetOpen,
+                    "dataset index section changed on a backend without reliable immutable object identity",
+                ));
+            }
         }
     }
     Ok(frozen)
@@ -645,8 +964,7 @@ fn vane_open_dataset_version_inner(
 unsafe fn vane_open_dataset_version_from_manifest_inner(
     path: *const c_char,
     version: u64,
-    manifest: *const u8,
-    manifest_len: usize,
+    payload: VaneFrozenDatasetPayload,
     expected_generation: *const c_char,
     storage_options: Option<HashMap<String, String>>,
     session: *mut c_void,
@@ -657,7 +975,7 @@ unsafe fn vane_open_dataset_version_from_manifest_inner(
             "dataset version must be greater than zero",
         ));
     }
-    if manifest_len == 0 || manifest_len > MAX_SERIALIZED_MANIFEST_BYTES {
+    if payload.manifest_len == 0 || payload.manifest_len > MAX_SERIALIZED_MANIFEST_BYTES {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
             format!(
@@ -677,16 +995,54 @@ unsafe fn vane_open_dataset_version_from_manifest_inner(
         ));
     }
     // SAFETY: The caller guarantees `manifest` references `manifest_len` bytes.
-    let manifest = unsafe { slice_from_ptr(manifest, manifest_len, "serialized_manifest")? };
+    let manifest = unsafe {
+        slice_from_ptr(
+            payload.manifest,
+            payload.manifest_len,
+            "serialized_manifest",
+        )?
+    };
+    let frozen_indices = match payload.index_section {
+        Some((data, len)) => {
+            if len > MAX_SERIALIZED_INDEX_SECTION_BYTES {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "serialized index section length must not exceed {} bytes",
+                        MAX_SERIALIZED_INDEX_SECTION_BYTES
+                    ),
+                ));
+            }
+            let bytes = if len == 0 {
+                &[][..]
+            } else {
+                // SAFETY: The caller guarantees `data` references `len` bytes.
+                unsafe { slice_from_ptr(data, len, "serialized_index_section")? }
+            };
+            Some(decode_frozen_index_section(bytes)?)
+        }
+        None => None,
+    };
     // SAFETY: A non-null pointer is owned by this library and points to a SessionHandle.
-    let session = unsafe { optional_session_handle(session)? };
+    let session_handle = unsafe { optional_vane_session_handle(session)? };
+    if frozen_indices.is_some() && session_handle.is_none() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "coordinator-frozen index metadata requires a shared Lance session",
+        ));
+    }
+    // Keep Lance's database-wide metadata cache while isolating frozen index
+    // keys through the generation-scoped object-store identity constructed by
+    // `vane_load_dataset_version_from_manifest`.
+    let dataset_session = session_handle.map(|handle| handle.session.clone());
     let dataset = match runtime::block_on(vane_load_dataset_version_from_manifest(
         path_str,
         version,
         storage_options.as_ref(),
-        session,
+        dataset_session,
         manifest,
         expected_generation,
+        frozen_indices.as_deref(),
     )) {
         Ok(Ok(dataset)) => Arc::new(dataset),
         Ok(Err(err)) => return Err(err),
@@ -697,8 +1053,36 @@ unsafe fn vane_open_dataset_version_from_manifest_inner(
             ));
         }
     };
+    let frozen_index_metadata_lease = if let Some(frozen_indices) = frozen_indices.as_deref() {
+        let Some(session_handle) = session_handle else {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "coordinator-frozen index metadata requires a shared Lance session",
+            ));
+        };
+        match runtime::block_on(seed_frozen_index_metadata(
+            dataset.as_ref(),
+            session_handle,
+            frozen_indices,
+        )) {
+            Ok(Ok(lease)) => Some(lease),
+            Ok(Err(err)) => return Err(err),
+            Err(err) => {
+                return Err(FfiError::new(
+                    ErrorCode::Runtime,
+                    format!("frozen index metadata seed runtime: {err}"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     record_dataset_open();
-    Ok(DatasetHandle::new(dataset))
+    let handle = DatasetHandle::new(dataset);
+    if let Some(lease) = frozen_index_metadata_lease {
+        handle.retain_frozen_index_metadata(lease);
+    }
+    Ok(handle)
 }
 
 #[no_mangle]
@@ -1600,8 +1984,12 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance::dataset::WriteParams;
+    use lance::index::DatasetIndexExt;
     use lance::session::Session;
     use lance::Dataset;
+    use lance_core::cache::{CacheBackend, MokaCacheBackend};
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::IndexType;
     use lance_io::object_store::providers::memory::MemoryStoreProvider;
     use lance_io::object_store::{
         ObjectStore as LanceObjectStore, ObjectStoreParams, ObjectStoreProvider,
@@ -1637,6 +2025,14 @@ mod tests {
         fn extract_path(&self, url: &Url) -> lance_core::Result<Path> {
             Ok(Path::from(url.path().trim_start_matches('/')))
         }
+
+        fn calculate_object_store_prefix(
+            &self,
+            _url: &Url,
+            _storage_options: Option<&std::collections::HashMap<String, String>>,
+        ) -> lance_core::Result<String> {
+            Ok("memory".to_string())
+        }
     }
 
     fn tracked_memory_session(backend: Arc<InMemory>, tracker: IOTracker) -> Arc<Session> {
@@ -1646,6 +2042,33 @@ mod tests {
             Arc::new(TrackingMemoryStoreProvider { backend, tracker }),
         );
         Arc::new(Session::new(0, 0, registry))
+    }
+
+    fn tracked_memory_session_handle(backend: Arc<InMemory>, tracker: IOTracker) -> SessionHandle {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        registry.insert(
+            "tracked-memory",
+            Arc::new(TrackingMemoryStoreProvider { backend, tracker }),
+        );
+        // The frozen index catalog is deliberately larger than this cache.
+        // Its snapshot-owned pin must keep the query valid without changing
+        // the user's bounded-cache configuration.
+        let bounded_index_cache: Arc<dyn CacheBackend> =
+            Arc::new(MokaCacheBackend::with_capacity(1));
+        let vane_index_cache = Arc::new(
+            super::super::vane_index_cache::VaneIndexCacheBackend::new(bounded_index_cache),
+        );
+        let index_cache: Arc<dyn CacheBackend> = vane_index_cache.clone();
+        SessionHandle {
+            session: Arc::new(Session::with_index_cache_backend(
+                index_cache.clone(),
+                0,
+                registry,
+            )),
+            index_cache,
+            index_metadata_seed_lock: Arc::new(tokio::sync::Mutex::new(())),
+            vane_index_cache,
+        }
     }
 
     fn write_test_dataset(uri: &str, values: Vec<i32>) -> Dataset {
@@ -1718,6 +2141,7 @@ mod tests {
             Some(session.clone()),
             &manifest,
             &generation,
+            None,
         ))
         .unwrap()
         .unwrap();
@@ -1761,6 +2185,7 @@ mod tests {
             Some(Arc::new(Session::default())),
             &manifest,
             &generation,
+            None,
         ))
         .unwrap()
         .unwrap_err();
@@ -1816,6 +2241,7 @@ mod tests {
             Some(worker_session),
             &manifest,
             &generation,
+            None,
         ))
         .unwrap()
         .unwrap();
@@ -1835,6 +2261,273 @@ mod tests {
     }
 
     #[test]
+    fn frozen_index_section_uses_generation_scoped_pin_above_cache_capacity() {
+        let _counter_guard = super::super::session::DEBUG_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let backend = Arc::new(InMemory::new());
+        let tracker = IOTracker::default();
+        let coordinator_session = tracked_memory_session_handle(backend.clone(), tracker.clone());
+        let mut worker_session = tracked_memory_session_handle(backend, tracker.clone());
+        let uri = format!(
+            "tracked-memory://search-snapshot-{}/dataset.lance",
+            rand::random::<u64>()
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let write_params = WriteParams {
+            session: Some(coordinator_session.session.clone()),
+            ..WriteParams::default()
+        };
+        let mut dataset = runtime::block_on(Dataset::write(reader, &uri, Some(write_params)))
+            .unwrap()
+            .unwrap();
+        runtime::block_on(dataset.create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        ))
+        .unwrap()
+        .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let version = dataset.version_id();
+        let manifest = pb::Manifest::from(dataset.manifest()).encode_to_vec();
+        let generation = format!(
+            "snapshot|{}",
+            runtime::block_on(dataset_snapshot_identity(dataset.as_ref()))
+                .unwrap()
+                .unwrap()
+        );
+        assert!(dataset.manifest_location().e_tag.is_some());
+
+        let dataset_handle =
+            Box::into_raw(Box::new(DatasetHandle::new(dataset.clone()))) as *mut c_void;
+        let mut index_section_ptr = ptr::null_mut();
+        let mut index_section_len = 0;
+        assert_eq!(
+            unsafe {
+                super::super::vane_distributed_search::lance_vane_serialize_dataset_index_section(
+                    dataset_handle,
+                    &mut index_section_ptr,
+                    &mut index_section_len,
+                )
+            },
+            0
+        );
+        assert!(!index_section_ptr.is_null());
+        assert!(index_section_len > 0);
+        assert_eq!(coordinator_session.vane_index_cache.pinned_entry_count(), 0);
+        let index_section =
+            unsafe { std::slice::from_raw_parts(index_section_ptr, index_section_len) }.to_vec();
+        let expected_frozen_indices = decode_frozen_index_section(&index_section).unwrap();
+        assert_eq!(expected_frozen_indices.len(), 1);
+        unsafe {
+            super::super::vane_distributed_search::lance_vane_free_bytes(
+                index_section_ptr,
+                index_section_len,
+            );
+            lance_close_dataset(dataset_handle);
+        }
+        let _ = tracker.incremental_stats();
+
+        let path = CString::new(uri).unwrap();
+        let expected_generation = CString::new(generation).unwrap();
+        let session_ptr = (&mut worker_session as *mut SessionHandle).cast::<c_void>();
+        let opened = unsafe {
+            vane_open_dataset_version_from_manifest_inner(
+                path.as_ptr(),
+                version,
+                VaneFrozenDatasetPayload {
+                    manifest: manifest.as_ptr(),
+                    manifest_len: manifest.len(),
+                    index_section: Some((index_section.as_ptr(), index_section.len())),
+                },
+                expected_generation.as_ptr(),
+                None,
+                session_ptr,
+            )
+        }
+        .unwrap();
+        let actual_indices = runtime::block_on(opened.dataset.load_indices())
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual_indices.as_ref(), &expected_frozen_indices);
+        assert!(Arc::ptr_eq(
+            &opened.dataset.session(),
+            &worker_session.session
+        ));
+
+        let worker_io = tracker.incremental_stats();
+        assert_eq!(
+            worker_io.read_iops, 1,
+            "worker reopened the manifest IndexSection instead of using frozen metadata: {worker_io}"
+        );
+        assert_eq!(worker_session.vane_index_cache.pinned_entry_count(), 1);
+        drop(opened);
+        assert_eq!(worker_session.vane_index_cache.pinned_entry_count(), 0);
+    }
+
+    #[test]
+    fn frozen_index_pin_isolated_from_replacement_at_same_uri_and_version() {
+        let _counter_guard = super::super::session::DEBUG_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dataset_dir = std::env::temp_dir().join(format!(
+            "ffi-frozen-index-generation-isolation-{}",
+            rand::random::<u64>()
+        ));
+        let uri = dataset_dir.to_string_lossy().to_string();
+        let mut first = write_test_dataset(&uri, vec![1, 2, 3]);
+        runtime::block_on(first.create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("first_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        ))
+        .unwrap()
+        .unwrap();
+        let version = first.version_id();
+        let manifest = pb::Manifest::from(first.manifest()).encode_to_vec();
+        let generation = format!(
+            "snapshot|{}",
+            runtime::block_on(dataset_snapshot_identity(&first))
+                .unwrap()
+                .unwrap()
+        );
+        let first_indices = runtime::block_on(load_supported_raw_index_metadata(&first))
+            .unwrap()
+            .unwrap();
+        let index_section = pb::IndexSection {
+            indices: first_indices.iter().map(pb::IndexMetadata::from).collect(),
+        }
+        .encode_to_vec();
+        drop(first);
+
+        let mut shared_session =
+            tracked_memory_session_handle(Arc::new(InMemory::new()), IOTracker::default());
+        let session_ptr = (&mut shared_session as *mut SessionHandle).cast::<c_void>();
+        let path = CString::new(uri.clone()).unwrap();
+        let expected_generation = CString::new(generation).unwrap();
+        let frozen = unsafe {
+            vane_open_dataset_version_from_manifest_inner(
+                path.as_ptr(),
+                version,
+                VaneFrozenDatasetPayload {
+                    manifest: manifest.as_ptr(),
+                    manifest_len: manifest.len(),
+                    index_section: Some((index_section.as_ptr(), index_section.len())),
+                },
+                expected_generation.as_ptr(),
+                None,
+                session_ptr,
+            )
+        }
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &frozen.dataset.session(),
+            &shared_session.session
+        ));
+        assert_eq!(shared_session.vane_index_cache.pinned_entry_count(), 1);
+
+        fs::remove_dir_all(&dataset_dir).unwrap();
+        let mut replacement = write_test_dataset(&uri, vec![4, 5, 6]);
+        runtime::block_on(replacement.create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("replacement_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(replacement.version_id(), version);
+        drop(replacement);
+
+        let current =
+            vane_open_dataset_version_inner(path.as_ptr(), version, None, session_ptr).unwrap();
+        assert!(Arc::ptr_eq(
+            &current.dataset.session(),
+            &shared_session.session
+        ));
+        let frozen_store_identity = runtime::block_on(frozen.dataset.object_store(None))
+            .unwrap()
+            .unwrap()
+            .store_prefix
+            .clone();
+        let current_store_identity = runtime::block_on(current.dataset.object_store(None))
+            .unwrap()
+            .unwrap()
+            .store_prefix
+            .clone();
+        assert_ne!(frozen_store_identity, current_store_identity);
+        let current_indices = runtime::block_on(current.dataset.load_indices())
+            .unwrap()
+            .unwrap();
+        assert!(current_indices
+            .iter()
+            .any(|index| index.name == "replacement_idx"));
+        assert!(current_indices
+            .iter()
+            .all(|index| index.name != "first_idx"));
+
+        let still_frozen = runtime::block_on(frozen.dataset.load_indices())
+            .unwrap()
+            .unwrap();
+        assert!(still_frozen.iter().any(|index| index.name == "first_idx"));
+        assert!(still_frozen
+            .iter()
+            .all(|index| index.name != "replacement_idx"));
+        assert_eq!(shared_session.vane_index_cache.pinned_entry_count(), 1);
+
+        drop(current);
+        drop(frozen);
+        assert_eq!(shared_session.vane_index_cache.pinned_entry_count(), 0);
+        let _ = fs::remove_dir_all(dataset_dir);
+    }
+
+    #[test]
+    fn frozen_index_section_rejects_malformed_and_oversized_payloads() {
+        let malformed = decode_frozen_index_section(&[0xff]).unwrap_err();
+        assert!(malformed
+            .message
+            .contains("decode coordinator-frozen index section"));
+
+        let path = CString::new("unused.lance").unwrap();
+        let generation = CString::new("snapshot|unused").unwrap();
+        let manifest = [0_u8];
+        let oversized = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let result = unsafe {
+            vane_open_dataset_version_from_manifest_inner(
+                path.as_ptr(),
+                1,
+                VaneFrozenDatasetPayload {
+                    manifest: manifest.as_ptr(),
+                    manifest_len: manifest.len(),
+                    index_section: Some((oversized, MAX_SERIALIZED_INDEX_SECTION_BYTES + 1)),
+                },
+                generation.as_ptr(),
+                None,
+                ptr::null_mut(),
+            )
+        };
+        let error = match result {
+            Ok(_) => panic!("oversized frozen index section was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("serialized index section length"));
+    }
+
+    #[test]
     fn frozen_manifest_ffi_rejects_oversized_payload_before_reading_it() {
         let path = CString::new("unused.lance").unwrap();
         let generation = CString::new("snapshot|unused").unwrap();
@@ -1843,8 +2536,11 @@ mod tests {
             vane_open_dataset_version_from_manifest_inner(
                 path.as_ptr(),
                 1,
-                manifest,
-                MAX_SERIALIZED_MANIFEST_BYTES + 1,
+                VaneFrozenDatasetPayload {
+                    manifest,
+                    manifest_len: MAX_SERIALIZED_MANIFEST_BYTES + 1,
+                    index_section: None,
+                },
                 generation.as_ptr(),
                 None,
                 ptr::null_mut(),

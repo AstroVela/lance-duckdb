@@ -44,6 +44,13 @@ shared_ptr<LanceDatasetCacheEntry> LanceVaneGetOrOpenFrozenSnapshot(
     const string &manifest_sha256, const string &schema_fingerprint,
     bool private_diagnostics);
 
+shared_ptr<LanceDatasetCacheEntry> LanceVaneGetOrOpenFrozenSearchSnapshot(
+    ClientContext &context, const string &path, uint64_t version,
+    const string &generation_id, const string &serialized_manifest,
+    const string &manifest_sha256, const string &serialized_index_section,
+    const string &index_section_sha256, const string &schema_fingerprint,
+    bool private_diagnostics);
+
 } // namespace duckdb
 
 #endif

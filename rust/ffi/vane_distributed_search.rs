@@ -15,6 +15,8 @@ use lance::io::exec::fts::{FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryEx
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::planner::Planner;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_table::format::pb;
+use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::constants::{DISTANCE_COLUMN, HYBRID_SCORE_COLUMN, ROW_ID_COLUMN, SCORE_COLUMN};
@@ -23,6 +25,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use crate::scanner::LanceStream;
 
+use super::dataset::{load_supported_raw_index_metadata, MAX_SERIALIZED_INDEX_SECTION_BYTES};
 use super::projection;
 use super::types::{DatasetHandle, StreamHandle};
 use super::util::{
@@ -246,6 +249,72 @@ pub unsafe extern "C" fn lance_vane_plan_namespace_filter(
         }
         encode_namespace_filter_plan(handle.arrow_schema.clone(), sql)
     })();
+    match result {
+        Ok(bytes) => {
+            let mut bytes = bytes.into_boxed_slice();
+            let len = bytes.len();
+            let data = bytes.as_mut_ptr();
+            std::mem::forget(bytes);
+            unsafe {
+                ptr::write_unaligned(out_data, data);
+                ptr::write_unaligned(out_len, len);
+            }
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
+    dataset: *mut c_void,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if !out_data.is_null() {
+        unsafe { ptr::write_unaligned(out_data, ptr::null_mut()) };
+    }
+    if !out_len.is_null() {
+        unsafe { ptr::write_unaligned(out_len, 0) };
+    }
+    let result = (|| -> FfiResult<_> {
+        if out_data.is_null() || out_len.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "index section output pointers are null",
+            ));
+        }
+        let handle = unsafe { dataset_handle(dataset)? };
+        let indices =
+            match runtime::block_on(load_supported_raw_index_metadata(handle.dataset.as_ref())) {
+                Ok(result) => result?,
+                Err(err) => {
+                    return Err(FfiError::new(
+                        ErrorCode::Runtime,
+                        format!("freeze coordinator index section runtime: {err}"),
+                    ));
+                }
+            };
+        let bytes = pb::IndexSection {
+            indices: indices.iter().map(pb::IndexMetadata::from).collect(),
+        }
+        .encode_to_vec();
+        if bytes.len() > MAX_SERIALIZED_INDEX_SECTION_BYTES {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "serialized index section exceeds {} bytes",
+                    MAX_SERIALIZED_INDEX_SECTION_BYTES
+                ),
+            ));
+        }
+        Ok(bytes)
+    })();
+
     match result {
         Ok(bytes) => {
             let mut bytes = bytes.into_boxed_slice();

@@ -277,6 +277,63 @@ shared_ptr<LanceDatasetCacheEntry> LanceVaneGetOrOpenFrozenSnapshot(
   return cache->PutOrGetExisting(cache_key, entry);
 }
 
+shared_ptr<LanceDatasetCacheEntry> LanceVaneGetOrOpenFrozenSearchSnapshot(
+    ClientContext &context, const string &path, uint64_t version,
+    const string &generation_id, const string &serialized_manifest,
+    const string &manifest_sha256, const string &serialized_index_section,
+    const string &index_section_sha256, const string &schema_fingerprint,
+    bool private_diagnostics) {
+  if (version == 0 || generation_id.empty() ||
+      manifest_sha256.size() != LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE ||
+      schema_fingerprint.size() != LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE ||
+      index_section_sha256.size() != LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE) {
+    throw InvalidInputException(
+        "Distributed Lance search snapshot identity is incomplete");
+  }
+
+  auto cache_key =
+      LanceVaneSnapshotCacheKey(context, path, version, generation_id);
+  cache_key += "|manifest-sha256|" + to_string(manifest_sha256.size()) + ":" +
+               manifest_sha256;
+  cache_key += "|schema-fingerprint|" + to_string(schema_fingerprint.size()) +
+               ":" + schema_fingerprint;
+  cache_key += "|index-section-sha256|" +
+               to_string(index_section_sha256.size()) + ":" +
+               index_section_sha256;
+  auto cache =
+      context.registered_state->GetOrCreate<LanceVaneSnapshotCacheState>(
+          LANCE_VANE_SNAPSHOT_CACHE_STATE_KEY);
+  if (auto cached = cache->Get(cache_key)) {
+    return cached;
+  }
+
+  auto *dataset =
+      LanceOpenDatasetVersionFromManifestAndIndexSectionForDistributedSearch(
+          context, path, version, serialized_manifest, serialized_index_section,
+          generation_id);
+  if (!dataset) {
+    throw IOException(
+        "Failed to open coordinator-frozen Lance search snapshot" +
+        LanceVaneFormatErrorSuffix(path, private_diagnostics));
+  }
+  auto entry = make_shared_ptr<LanceDatasetCacheEntry>(dataset, path);
+  if (lance_dataset_version(dataset) != version) {
+    throw IOException("Frozen Lance search dataset version does not match the "
+                      "coordinator snapshot");
+  }
+  if (LanceVaneDatasetGenerationId(dataset, path, private_diagnostics) !=
+      generation_id) {
+    throw IOException("Distributed Lance search snapshot generation changed; "
+                      "generation does not match the coordinator snapshot");
+  }
+  if (LanceVaneDatasetSchemaFingerprint(dataset, path, private_diagnostics) !=
+      schema_fingerprint) {
+    throw IOException("Frozen Lance search dataset schema does not match the "
+                      "coordinator snapshot");
+  }
+  return cache->PutOrGetExisting(cache_key, entry);
+}
+
 } // namespace duckdb
 
 #endif

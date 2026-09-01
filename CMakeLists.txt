@@ -206,6 +206,7 @@ if(LANCE_VANE_DISTRIBUTED)
        ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_write.rs
        ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_mutation.rs
        ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_distributed_search.rs
+       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_index_cache.rs
        ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_rest_resolution.rs
        ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_search_plan.rs)
 endif()

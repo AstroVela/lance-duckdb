@@ -2,6 +2,8 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session;
@@ -13,10 +15,14 @@ use crate::runtime;
 
 use super::types::SessionHandle;
 use super::util::{optional_session_handle, u64_to_usize, FfiError, FfiResult};
+#[cfg(feature = "vane-distributed")]
+use super::vane_index_cache::VaneIndexCacheBackend;
 
 static DATASET_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static NAMESPACE_DESCRIBE_COUNT: AtomicU64 = AtomicU64::new(0);
 static COMMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static DEBUG_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -101,8 +107,15 @@ fn create_session_inner(
                 u64_to_usize(metadata_cache_size_bytes, "metadata_cache_size_bytes")?,
             )
         };
-    let index_cache: Arc<dyn CacheBackend> =
+    let bounded_index_cache: Arc<dyn CacheBackend> =
         Arc::new(MokaCacheBackend::with_capacity(index_cache_size_bytes));
+    #[cfg(feature = "vane-distributed")]
+    let (index_cache, vane_index_cache): (Arc<dyn CacheBackend>, Arc<VaneIndexCacheBackend>) = {
+        let vane_index_cache = Arc::new(VaneIndexCacheBackend::new(bounded_index_cache));
+        (vane_index_cache.clone(), vane_index_cache)
+    };
+    #[cfg(not(feature = "vane-distributed"))]
+    let index_cache = bounded_index_cache;
     let session = Arc::new(Session::with_index_cache_backend(
         index_cache.clone(),
         metadata_cache_size_bytes,
@@ -111,6 +124,10 @@ fn create_session_inner(
     Ok(SessionHandle {
         session,
         index_cache,
+        #[cfg(feature = "vane-distributed")]
+        index_metadata_seed_lock: Arc::new(tokio::sync::Mutex::new(())),
+        #[cfg(feature = "vane-distributed")]
+        vane_index_cache,
     })
 }
 
@@ -259,7 +276,7 @@ mod tests {
     use std::ffi::CStr;
     use std::ffi::CString;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
@@ -270,8 +287,6 @@ mod tests {
 
     use super::super::dataset::{lance_close_dataset, lance_open_dataset_with_session};
     use super::*;
-
-    static DEBUG_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_create_session_and_get_stats() {

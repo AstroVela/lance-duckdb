@@ -2244,6 +2244,9 @@ def test_indexed_partial_coverage_global_search_matches_native(
 
     connection = _connect()
     try:
+        # Frozen metadata is query-owned and must not require enough capacity
+        # in Lance's reusable bounded index cache.
+        connection.execute("SET GLOBAL lance_vane_index_cache_size_bytes = 1")
         connection.execute(
             f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
             "(FORMAT LANCE, MODE 'create')"
@@ -2561,7 +2564,7 @@ def test_global_search_fails_when_the_frozen_snapshot_is_vacuumed(
 
         with pytest.raises(
             Exception,
-            match="Failed to reopen fixed Lance dataset version",
+            match="Failed to open coordinator-frozen Lance search snapshot",
         ):
             _run_serialized_logical(ray_runner, serialized)
     finally:
