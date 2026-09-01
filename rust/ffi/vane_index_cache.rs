@@ -272,5 +272,4 @@ mod tests {
         drop(lease);
         assert!(cache.get_with_key(&TestKey).await.is_none());
     }
-
 }

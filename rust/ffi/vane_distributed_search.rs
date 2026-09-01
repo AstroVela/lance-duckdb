@@ -29,8 +29,8 @@ use super::dataset::{load_supported_raw_index_metadata, MAX_SERIALIZED_INDEX_SEC
 use super::projection;
 use super::types::{DatasetHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, dataset_handle, nonzero_u64_to_usize, parse_optional_filter_ir,
-    slice_from_ptr, FfiError, FfiResult,
+    cstr_to_str, dataset_handle, nonzero_u64_to_usize, parse_optional_filter_ir, slice_from_ptr,
+    FfiError, FfiResult,
 };
 use super::vane_search_plan::{build_search_index_plan, SearchIndexPlan, SearchKind};
 
@@ -289,17 +289,16 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
             ));
         }
         let handle = unsafe { dataset_handle(dataset)? };
-        let indices = match runtime::block_on(load_supported_raw_index_metadata(
-            handle.dataset.as_ref(),
-        )) {
-            Ok(result) => result?,
-            Err(err) => {
-                return Err(FfiError::new(
-                    ErrorCode::Runtime,
-                    format!("freeze coordinator index section runtime: {err}"),
-                ));
-            }
-        };
+        let indices =
+            match runtime::block_on(load_supported_raw_index_metadata(handle.dataset.as_ref())) {
+                Ok(result) => result?,
+                Err(err) => {
+                    return Err(FfiError::new(
+                        ErrorCode::Runtime,
+                        format!("freeze coordinator index section runtime: {err}"),
+                    ));
+                }
+            };
         let bytes = pb::IndexSection {
             indices: indices.iter().map(pb::IndexMetadata::from).collect(),
         }

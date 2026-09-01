@@ -2267,8 +2267,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let backend = Arc::new(InMemory::new());
         let tracker = IOTracker::default();
-        let coordinator_session =
-            tracked_memory_session_handle(backend.clone(), tracker.clone());
+        let coordinator_session = tracked_memory_session_handle(backend.clone(), tracker.clone());
         let mut worker_session = tracked_memory_session_handle(backend, tracker.clone());
         let uri = format!(
             "tracked-memory://search-snapshot-{}/dataset.lance",
@@ -2414,10 +2413,8 @@ mod tests {
         .encode_to_vec();
         drop(first);
 
-        let mut shared_session = tracked_memory_session_handle(
-            Arc::new(InMemory::new()),
-            IOTracker::default(),
-        );
+        let mut shared_session =
+            tracked_memory_session_handle(Arc::new(InMemory::new()), IOTracker::default());
         let session_ptr = (&mut shared_session as *mut SessionHandle).cast::<c_void>();
         let path = CString::new(uri.clone()).unwrap();
         let expected_generation = CString::new(generation).unwrap();
@@ -2456,8 +2453,8 @@ mod tests {
         assert_eq!(replacement.version_id(), version);
         drop(replacement);
 
-        let current = vane_open_dataset_version_inner(path.as_ptr(), version, None, session_ptr)
-            .unwrap();
+        let current =
+            vane_open_dataset_version_inner(path.as_ptr(), version, None, session_ptr).unwrap();
         assert!(Arc::ptr_eq(
             &current.dataset.session(),
             &shared_session.session
@@ -2476,8 +2473,12 @@ mod tests {
         let current_indices = runtime::block_on(current.dataset.load_indices())
             .unwrap()
             .unwrap();
-        assert!(current_indices.iter().any(|index| index.name == "replacement_idx"));
-        assert!(current_indices.iter().all(|index| index.name != "first_idx"));
+        assert!(current_indices
+            .iter()
+            .any(|index| index.name == "replacement_idx"));
+        assert!(current_indices
+            .iter()
+            .all(|index| index.name != "first_idx"));
 
         let still_frozen = runtime::block_on(frozen.dataset.load_indices())
             .unwrap()
