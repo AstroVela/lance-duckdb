@@ -119,6 +119,17 @@ void *lance_vane_open_dataset_version_with_session(const char *path,
 void *lance_vane_open_dataset_version_with_storage_options_and_session(
     const char *path, uint64_t version, const char **option_keys,
     const char **option_values, size_t options_len, void *session);
+int32_t lance_vane_serialize_dataset_manifest(void *dataset, uint8_t **out_data,
+                                              size_t *out_len);
+void *lance_vane_open_dataset_version_from_manifest_with_session(
+    const char *path, uint64_t version, const uint8_t *manifest,
+    size_t manifest_len, const char *expected_generation, void *session);
+void *
+lance_vane_open_dataset_version_from_manifest_with_storage_options_and_session(
+    const char *path, uint64_t version, const uint8_t *manifest,
+    size_t manifest_len, const char *expected_generation,
+    const char **option_keys, const char **option_values, size_t options_len,
+    void *session);
 
 int32_t lance_vane_sha256(const uint8_t *input, size_t input_len,
                           uint8_t *output);

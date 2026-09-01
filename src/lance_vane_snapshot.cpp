@@ -69,6 +69,102 @@ struct LanceVaneCStringDeleter {
   }
 };
 
+struct LanceVaneBytesDeleter {
+  size_t len;
+
+  void operator()(uint8_t *value) const {
+    if (value) {
+      lance_vane_free_bytes(value, len);
+    }
+  }
+};
+
+static string LanceVaneSha256(const string &payload) {
+  string digest(LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE, '\0');
+  auto *input = reinterpret_cast<const uint8_t *>(payload.data()); // NOLINT
+  if (lance_vane_sha256(input, payload.size(),
+                        reinterpret_cast<uint8_t *>(&digest[0])) !=
+      0) { // NOLINT
+    LanceConsumeLastError();
+    return string();
+  }
+  return digest;
+}
+
+string LanceVaneDatasetSchemaFingerprint(void *dataset, const string &path,
+                                         bool private_diagnostics) {
+  string fingerprint(LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE, '\0');
+  if (lance_vane_dataset_schema_fingerprint(
+          dataset,
+          reinterpret_cast<uint8_t *>(&fingerprint[0])) != 0) { // NOLINT
+    throw IOException("Failed to fingerprint Lance dataset schema" +
+                      LanceVaneFormatErrorSuffix(path, private_diagnostics));
+  }
+  return fingerprint;
+}
+
+LanceVaneFrozenSnapshot LanceVaneFreezeSnapshot(void *dataset,
+                                                const string &path,
+                                                bool private_diagnostics) {
+  uint8_t *manifest = nullptr;
+  size_t manifest_len = 0;
+  auto rc =
+      lance_vane_serialize_dataset_manifest(dataset, &manifest, &manifest_len);
+  unique_ptr<uint8_t, LanceVaneBytesDeleter> manifest_owner(
+      manifest, LanceVaneBytesDeleter{manifest_len});
+  if (rc != 0 || !manifest || manifest_len == 0 ||
+      manifest_len > LANCE_VANE_MAX_SERIALIZED_MANIFEST_BYTES) {
+    throw IOException("Failed to freeze Lance dataset manifest" +
+                      LanceVaneFormatErrorSuffix(path, private_diagnostics));
+  }
+
+  LanceVaneFrozenSnapshot result;
+  result.serialized_manifest.assign(
+      reinterpret_cast<const char *>(manifest_owner.get()),
+      manifest_len); // NOLINT
+  manifest_owner.reset();
+  result.manifest_sha256 = LanceVaneSha256(result.serialized_manifest);
+  result.schema_fingerprint =
+      LanceVaneDatasetSchemaFingerprint(dataset, path, private_diagnostics);
+  if (result.manifest_sha256.empty()) {
+    throw IOException("Failed to digest frozen Lance dataset manifest");
+  }
+  return result;
+}
+
+bool LanceVaneValidateFrozenSnapshot(const string &serialized_manifest,
+                                     const string &manifest_sha256,
+                                     const string &schema_fingerprint,
+                                     string &out_error) {
+  out_error.clear();
+  if (serialized_manifest.empty()) {
+    out_error = "serialized manifest is empty";
+    return false;
+  }
+  if (serialized_manifest.size() > LANCE_VANE_MAX_SERIALIZED_MANIFEST_BYTES) {
+    out_error = "serialized manifest exceeds the transport limit";
+    return false;
+  }
+  if (manifest_sha256.size() != LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE) {
+    out_error = "manifest digest has an invalid size";
+    return false;
+  }
+  if (schema_fingerprint.size() != LANCE_VANE_FROZEN_SNAPSHOT_DIGEST_SIZE) {
+    out_error = "schema fingerprint has an invalid size";
+    return false;
+  }
+  auto digest = LanceVaneSha256(serialized_manifest);
+  if (digest.empty()) {
+    out_error = "manifest digest could not be computed";
+    return false;
+  }
+  if (digest != manifest_sha256) {
+    out_error = "manifest digest does not match its payload";
+    return false;
+  }
+  return true;
+}
+
 static string LanceVaneDatasetGenerationId(void *dataset, const string &path,
                                            bool private_diagnostics) {
   auto *generation_ptr = lance_dataset_generation_id(dataset);
@@ -127,6 +223,56 @@ LanceVaneGetOrOpenSnapshot(ClientContext &context, const string &path,
       generation_id) {
     throw IOException("Distributed Lance snapshot generation changed; "
                       "generation does not match the coordinator snapshot");
+  }
+  return cache->PutOrGetExisting(cache_key, entry);
+}
+
+shared_ptr<LanceDatasetCacheEntry> LanceVaneGetOrOpenFrozenSnapshot(
+    ClientContext &context, const string &path, uint64_t version,
+    const string &generation_id, const string &serialized_manifest,
+    const string &manifest_sha256, const string &schema_fingerprint,
+    bool private_diagnostics) {
+  if (version == 0 || generation_id.empty()) {
+    throw InvalidInputException(
+        "Distributed Lance snapshot identity is incomplete");
+  }
+  // Worker-bind construction or deserialization already validates the
+  // envelope digest and bounded fields. Do not hash a large manifest again at
+  // scan initialization.
+
+  auto cache_key =
+      LanceVaneSnapshotCacheKey(context, path, version, generation_id);
+  cache_key += "|manifest-sha256|" + to_string(manifest_sha256.size()) + ":" +
+               manifest_sha256;
+  cache_key += "|schema-fingerprint|" + to_string(schema_fingerprint.size()) +
+               ":" + schema_fingerprint;
+  auto cache =
+      context.registered_state->GetOrCreate<LanceVaneSnapshotCacheState>(
+          LANCE_VANE_SNAPSHOT_CACHE_STATE_KEY);
+  if (auto cached = cache->Get(cache_key)) {
+    return cached;
+  }
+
+  auto *dataset = LanceOpenDatasetVersionFromManifestForDistributedScan(
+      context, path, version, serialized_manifest, generation_id);
+  if (!dataset) {
+    throw IOException("Failed to open coordinator-frozen Lance snapshot" +
+                      LanceVaneFormatErrorSuffix(path, private_diagnostics));
+  }
+  auto entry = make_shared_ptr<LanceDatasetCacheEntry>(dataset, path);
+  if (lance_dataset_version(dataset) != version) {
+    throw IOException("Frozen Lance dataset version does not match the "
+                      "coordinator snapshot");
+  }
+  if (LanceVaneDatasetGenerationId(dataset, path, private_diagnostics) !=
+      generation_id) {
+    throw IOException("Distributed Lance snapshot generation changed; "
+                      "generation does not match the coordinator snapshot");
+  }
+  if (LanceVaneDatasetSchemaFingerprint(dataset, path, private_diagnostics) !=
+      schema_fingerprint) {
+    throw IOException("Frozen Lance dataset schema does not match the "
+                      "coordinator snapshot");
   }
   return cache->PutOrGetExisting(cache_key, entry);
 }

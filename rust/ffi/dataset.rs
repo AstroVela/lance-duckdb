@@ -38,6 +38,11 @@ use super::util::{
     FfiResult,
 };
 
+#[cfg(feature = "vane-distributed")]
+// Keep this limit in sync with LANCE_VANE_MAX_SERIALIZED_MANIFEST_BYTES in
+// src/include/lance_vane_snapshot.hpp.
+const MAX_SERIALIZED_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LanceFieldStats {
@@ -286,6 +291,145 @@ pub unsafe extern "C" fn lance_vane_open_dataset_version_with_storage_options_an
 }
 
 #[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_serialize_dataset_manifest(
+    dataset: *mut c_void,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if !out_data.is_null() {
+        unsafe { ptr::write_unaligned(out_data, ptr::null_mut()) };
+    }
+    if !out_len.is_null() {
+        unsafe { ptr::write_unaligned(out_len, 0) };
+    }
+    let result = (|| -> FfiResult<Vec<u8>> {
+        if out_data.is_null() || out_len.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "serialized manifest output pointers are null",
+            ));
+        }
+        // SAFETY: dataset_handle validates the opaque pointer before dereferencing it.
+        let handle = unsafe { super::util::dataset_handle(dataset)? };
+        let manifest = pb::Manifest::from(handle.dataset.manifest()).encode_to_vec();
+        if manifest.is_empty() {
+            return Err(FfiError::new(
+                ErrorCode::DatasetOpen,
+                "serialized dataset manifest is empty",
+            ));
+        }
+        if manifest.len() > MAX_SERIALIZED_MANIFEST_BYTES {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "serialized dataset manifest is {} bytes; limit is {} bytes",
+                    manifest.len(),
+                    MAX_SERIALIZED_MANIFEST_BYTES
+                ),
+            ));
+        }
+        Ok(manifest)
+    })();
+
+    match result {
+        Ok(manifest) => {
+            let mut manifest = manifest.into_boxed_slice();
+            let len = manifest.len();
+            let data = manifest.as_mut_ptr();
+            std::mem::forget(manifest);
+            unsafe {
+                ptr::write_unaligned(out_data, data);
+                ptr::write_unaligned(out_len, len);
+            }
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_open_dataset_version_from_manifest_with_session(
+    path: *const c_char,
+    version: u64,
+    manifest: *const u8,
+    manifest_len: usize,
+    expected_generation: *const c_char,
+    session: *mut c_void,
+) -> *mut c_void {
+    match unsafe {
+        vane_open_dataset_version_from_manifest_inner(
+            path,
+            version,
+            manifest,
+            manifest_len,
+            expected_generation,
+            None,
+            session,
+        )
+    } {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_open_dataset_version_from_manifest_with_storage_options_and_session(
+    path: *const c_char,
+    version: u64,
+    manifest: *const u8,
+    manifest_len: usize,
+    expected_generation: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    session: *mut c_void,
+) -> *mut c_void {
+    let storage_options = match unsafe {
+        // SAFETY: The caller supplies arrays containing `options_len` C string pointers.
+        vane_storage_options_from_ffi(option_keys, option_values, options_len)
+    } {
+        Ok(storage_options) => storage_options,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return ptr::null_mut();
+        }
+    };
+    match unsafe {
+        vane_open_dataset_version_from_manifest_inner(
+            path,
+            version,
+            manifest,
+            manifest_len,
+            expected_generation,
+            Some(storage_options),
+            session,
+        )
+    } {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(feature = "vane-distributed")]
 unsafe fn vane_storage_options_from_ffi(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
@@ -378,6 +522,88 @@ async fn vane_load_dataset_version(
 }
 
 #[cfg(feature = "vane-distributed")]
+async fn vane_load_dataset_version_from_manifest(
+    path: &str,
+    version: u64,
+    storage_options: Option<&HashMap<String, String>>,
+    shared_session: Option<Arc<Session>>,
+    serialized_manifest: &[u8],
+    expected_generation: &str,
+) -> FfiResult<lance::Dataset> {
+    // This is Lance's native IPC fast path. It resolves the immutable manifest
+    // location (and object metadata) but does not download manifest contents.
+    // DatasetBuilder also validates and decodes the protobuf, so avoid decoding
+    // the same potentially large payload once before handing it to Lance.
+    let mut frozen_builder = vane_versioned_dataset_builder(path, version, storage_options)
+        .with_serialized_manifest(serialized_manifest)
+        .map_err(|err| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("load coordinator-frozen dataset manifest: {err}"),
+            )
+        })?;
+    if let Some(shared_session) = shared_session.as_ref() {
+        frozen_builder = frozen_builder.with_session(shared_session.clone());
+    }
+    let frozen = frozen_builder.load().await.map_err(|err| {
+        FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("open coordinator-frozen dataset version {version} at '{path}': {err}"),
+        )
+    })?;
+
+    let frozen_generation = format!("snapshot|{}", dataset_snapshot_identity(&frozen).await?);
+    if frozen_generation != expected_generation {
+        return Err(FfiError::new(
+            ErrorCode::DatasetOpen,
+            "coordinator-frozen dataset generation does not match current object metadata",
+        ));
+    }
+
+    let has_reliable_object_identity = frozen
+        .manifest_location()
+        .e_tag
+        .as_deref()
+        .is_some_and(|etag| !etag.is_empty());
+    if !has_reliable_object_identity {
+        // Filesystems and object stores without an immutable ETag cannot prove
+        // snapshot identity from metadata alone. Preserve fail-closed behavior
+        // by loading the current manifest through a cache-free Session and
+        // comparing the decoded protobuf value, not its map encoding order.
+        let mut validation_builder = vane_versioned_dataset_builder(path, version, storage_options);
+        if let Some(shared_session) = shared_session.as_ref() {
+            validation_builder = validation_builder.with_session(Arc::new(Session::new(
+                0,
+                0,
+                shared_session.store_registry(),
+            )));
+        }
+        let current = validation_builder.load().await.map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("validate current dataset version {version} at '{path}': {err}"),
+            )
+        })?;
+        let supplied_manifest = pb::Manifest::from(frozen.manifest());
+        let current_manifest = pb::Manifest::from(current.manifest());
+        if current_manifest != supplied_manifest {
+            return Err(FfiError::new(
+                ErrorCode::DatasetOpen,
+                "dataset manifest changed on a backend without reliable immutable object identity",
+            ));
+        }
+        let current_generation = format!("snapshot|{}", dataset_snapshot_identity(&current).await?);
+        if current_generation != expected_generation {
+            return Err(FfiError::new(
+                ErrorCode::DatasetOpen,
+                "validated dataset generation does not match the coordinator snapshot",
+            ));
+        }
+    }
+    Ok(frozen)
+}
+
+#[cfg(feature = "vane-distributed")]
 fn vane_open_dataset_version_inner(
     path: *const c_char,
     version: u64,
@@ -409,6 +635,66 @@ fn vane_open_dataset_version_inner(
         }
         Err(err) => {
             return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")));
+        }
+    };
+    record_dataset_open();
+    Ok(DatasetHandle::new(dataset))
+}
+
+#[cfg(feature = "vane-distributed")]
+unsafe fn vane_open_dataset_version_from_manifest_inner(
+    path: *const c_char,
+    version: u64,
+    manifest: *const u8,
+    manifest_len: usize,
+    expected_generation: *const c_char,
+    storage_options: Option<HashMap<String, String>>,
+    session: *mut c_void,
+) -> FfiResult<DatasetHandle> {
+    if version == 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "dataset version must be greater than zero",
+        ));
+    }
+    if manifest_len == 0 || manifest_len > MAX_SERIALIZED_MANIFEST_BYTES {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "serialized manifest length must be between 1 and {} bytes",
+                MAX_SERIALIZED_MANIFEST_BYTES
+            ),
+        ));
+    }
+    // SAFETY: The FFI caller supplies a NUL-terminated path string.
+    let path_str = unsafe { cstr_to_str(path, "path")? };
+    // SAFETY: The FFI caller supplies a NUL-terminated generation string.
+    let expected_generation = unsafe { cstr_to_str(expected_generation, "expected_generation")? };
+    if !expected_generation.starts_with("snapshot|") {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "expected dataset generation is invalid",
+        ));
+    }
+    // SAFETY: The caller guarantees `manifest` references `manifest_len` bytes.
+    let manifest = unsafe { slice_from_ptr(manifest, manifest_len, "serialized_manifest")? };
+    // SAFETY: A non-null pointer is owned by this library and points to a SessionHandle.
+    let session = unsafe { optional_session_handle(session)? };
+    let dataset = match runtime::block_on(vane_load_dataset_version_from_manifest(
+        path_str,
+        version,
+        storage_options.as_ref(),
+        session,
+        manifest,
+        expected_generation,
+    )) {
+        Ok(Ok(dataset)) => Arc::new(dataset),
+        Ok(Err(err)) => return Err(err),
+        Err(err) => {
+            return Err(FfiError::new(
+                ErrorCode::Runtime,
+                format!("frozen dataset open runtime: {err}"),
+            ));
         }
     };
     record_dataset_open();
@@ -1307,11 +1593,70 @@ fn dataset_delete_inner(
 
 #[cfg(all(test, feature = "vane-distributed"))]
 mod tests {
+    use std::ffi::CString;
+    use std::fs;
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::dataset::WriteParams;
+    use lance::session::Session;
+    use lance::Dataset;
+    use lance_io::object_store::providers::memory::MemoryStoreProvider;
+    use lance_io::object_store::{
+        ObjectStore as LanceObjectStore, ObjectStoreParams, ObjectStoreProvider,
+        ObjectStoreRegistry, WrappingObjectStore,
+    };
+    use lance_io::utils::tracking_store::IOTracker;
     use object_store::memory::InMemory;
     use object_store::path::Path;
+    use prost::Message;
+    use url::Url;
 
-    use super::manifest_snapshot_metadata;
+    use super::*;
     use crate::runtime;
+
+    #[derive(Debug)]
+    struct TrackingMemoryStoreProvider {
+        backend: Arc<InMemory>,
+        tracker: IOTracker,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for TrackingMemoryStoreProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> lance_core::Result<LanceObjectStore> {
+            let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
+            store.inner = self.tracker.wrap("tracked-memory", self.backend.clone());
+            Ok(store)
+        }
+
+        fn extract_path(&self, url: &Url) -> lance_core::Result<Path> {
+            Ok(Path::from(url.path().trim_start_matches('/')))
+        }
+    }
+
+    fn tracked_memory_session(backend: Arc<InMemory>, tracker: IOTracker) -> Arc<Session> {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        registry.insert(
+            "tracked-memory",
+            Arc::new(TrackingMemoryStoreProvider { backend, tracker }),
+        );
+        Arc::new(Session::new(0, 0, registry))
+    }
+
+    fn write_test_dataset(uri: &str, values: Vec<i32>) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        runtime::block_on(Dataset::write(reader, uri, Some(WriteParams::default())))
+            .unwrap()
+            .unwrap()
+    }
 
     #[test]
     fn snapshot_manifest_head_error_preserves_path_and_cause() {
@@ -1324,5 +1669,191 @@ mod tests {
 
         assert!(error.message.contains(path.as_ref()));
         assert!(error.message.to_ascii_lowercase().contains("not found"));
+    }
+
+    #[test]
+    fn coordinator_frozen_manifest_round_trips_through_ffi() {
+        let dataset_dir =
+            std::env::temp_dir().join(format!("ffi-frozen-manifest-{}", rand::random::<u64>()));
+        let uri = dataset_dir.to_string_lossy().to_string();
+        let dataset = write_test_dataset(&uri, vec![1, 2, 3]);
+        let version = dataset.version_id();
+        let generation = format!(
+            "snapshot|{}",
+            runtime::block_on(dataset_snapshot_identity(&dataset))
+                .unwrap()
+                .unwrap()
+        );
+
+        let dataset_handle =
+            Box::into_raw(Box::new(DatasetHandle::new(Arc::new(dataset)))) as *mut c_void;
+        let mut manifest_ptr = ptr::null_mut();
+        let mut manifest_len = 0;
+        assert_eq!(
+            unsafe {
+                lance_vane_serialize_dataset_manifest(
+                    dataset_handle,
+                    &mut manifest_ptr,
+                    &mut manifest_len,
+                )
+            },
+            0
+        );
+        assert!(!manifest_ptr.is_null());
+        assert!(manifest_len > 0);
+        let manifest = unsafe { std::slice::from_raw_parts(manifest_ptr, manifest_len) }.to_vec();
+        unsafe {
+            super::super::vane_distributed_search::lance_vane_free_bytes(
+                manifest_ptr,
+                manifest_len,
+            );
+            lance_close_dataset(dataset_handle);
+        }
+
+        let session = Arc::new(Session::default());
+        let opened = runtime::block_on(vane_load_dataset_version_from_manifest(
+            &uri,
+            version,
+            None,
+            Some(session.clone()),
+            &manifest,
+            &generation,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(opened.version_id(), version);
+        assert_eq!(
+            pb::Manifest::from(opened.manifest()).encode_to_vec(),
+            manifest
+        );
+        assert!(Arc::ptr_eq(&opened.session(), &session));
+
+        let _ = fs::remove_dir_all(dataset_dir);
+    }
+
+    #[test]
+    fn coordinator_frozen_manifest_fails_closed_without_reliable_etag() {
+        let dataset_dir = std::env::temp_dir().join(format!(
+            "ffi-frozen-manifest-replacement-{}",
+            rand::random::<u64>()
+        ));
+        let uri = dataset_dir.to_string_lossy().to_string();
+        let first = write_test_dataset(&uri, vec![1, 2, 3]);
+        let version = first.version_id();
+        let manifest = pb::Manifest::from(first.manifest()).encode_to_vec();
+        let generation = format!(
+            "snapshot|{}",
+            runtime::block_on(dataset_snapshot_identity(&first))
+                .unwrap()
+                .unwrap()
+        );
+        drop(first);
+
+        fs::remove_dir_all(&dataset_dir).unwrap();
+        let replacement = write_test_dataset(&uri, vec![4, 5, 6]);
+        assert_eq!(replacement.version_id(), version);
+        drop(replacement);
+
+        let error = runtime::block_on(vane_load_dataset_version_from_manifest(
+            &uri,
+            version,
+            None,
+            Some(Arc::new(Session::default())),
+            &manifest,
+            &generation,
+        ))
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            error.message.contains("generation") || error.message.contains("manifest changed"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        let _ = fs::remove_dir_all(dataset_dir);
+    }
+
+    #[test]
+    fn coordinator_frozen_manifest_uses_only_metadata_io_with_reliable_etag() {
+        let backend = Arc::new(InMemory::new());
+        let tracker = IOTracker::default();
+        let coordinator_session = tracked_memory_session(backend.clone(), tracker.clone());
+        let worker_session = tracked_memory_session(backend, tracker.clone());
+        let uri = format!(
+            "tracked-memory://snapshot-{}/dataset.lance",
+            rand::random::<u64>()
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let write_params = WriteParams {
+            session: Some(coordinator_session),
+            ..WriteParams::default()
+        };
+        let dataset = runtime::block_on(Dataset::write(reader, &uri, Some(write_params)))
+            .unwrap()
+            .unwrap();
+        let version = dataset.version_id();
+        let manifest = pb::Manifest::from(dataset.manifest()).encode_to_vec();
+        let generation = format!(
+            "snapshot|{}",
+            runtime::block_on(dataset_snapshot_identity(&dataset))
+                .unwrap()
+                .unwrap()
+        );
+        assert!(dataset.manifest_location().e_tag.is_some());
+        let _ = tracker.incremental_stats();
+
+        let opened = runtime::block_on(vane_load_dataset_version_from_manifest(
+            &uri,
+            version,
+            None,
+            Some(worker_session),
+            &manifest,
+            &generation,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(opened.version_id(), version);
+        assert!(opened.manifest_location().e_tag.is_some());
+
+        let worker_io = tracker.incremental_stats();
+        // IOTracker observes ObjectStore::head through the trait's get_opts
+        // default and attributes the object's metadata size to read_bytes. The
+        // request count is authoritative here: one request is the required
+        // version-location HEAD; a manifest content GET or fallback validation
+        // would add another request.
+        assert_eq!(
+            worker_io.read_iops, 1,
+            "worker performed manifest content I/O or repeated metadata checks: {worker_io}"
+        );
+    }
+
+    #[test]
+    fn frozen_manifest_ffi_rejects_oversized_payload_before_reading_it() {
+        let path = CString::new("unused.lance").unwrap();
+        let generation = CString::new("snapshot|unused").unwrap();
+        let manifest = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let result = unsafe {
+            vane_open_dataset_version_from_manifest_inner(
+                path.as_ptr(),
+                1,
+                manifest,
+                MAX_SERIALIZED_MANIFEST_BYTES + 1,
+                generation.as_ptr(),
+                None,
+                ptr::null_mut(),
+            )
+        };
+        let error = match result {
+            Ok(_) => panic!("oversized frozen manifest was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("serialized manifest length"));
     }
 }

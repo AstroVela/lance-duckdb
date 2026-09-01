@@ -21,6 +21,9 @@ void *LanceOpenDatasetForDistributedScan(ClientContext &context,
 void *LanceOpenDatasetVersionForDistributedScan(ClientContext &context,
                                                 const string &path,
                                                 uint64_t version);
+void *LanceOpenDatasetVersionFromManifestForDistributedScan(
+    ClientContext &context, const string &path, uint64_t version,
+    const string &serialized_manifest, const string &expected_generation);
 #endif
 
 string LanceNormalizeS3Scheme(const string &path);

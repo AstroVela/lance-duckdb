@@ -4295,7 +4295,11 @@ def test_worker_fails_if_the_coordinator_snapshot_was_vacuumed(
         try:
             worker_plan = physical.clone(worker)
             with pytest.raises(
-                Exception, match="Failed to reopen fixed Lance dataset version"
+                Exception,
+                match=(
+                    "Failed to (?:reopen fixed Lance dataset version|"
+                    "open coordinator-frozen Lance snapshot)"
+                ),
             ):
                 vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
                     cursor,

@@ -1278,6 +1278,34 @@ void *LanceOpenDatasetVersionForDistributedScan(ClientContext &context,
       open_path.c_str(), version, key_ptrs.data(), value_ptrs.data(),
       option_keys.size(), session);
 }
+
+void *LanceOpenDatasetVersionFromManifestForDistributedScan(
+    ClientContext &context, const string &path, uint64_t version,
+    const string &serialized_manifest, const string &expected_generation) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptionsForDistributedRead(context, path, open_path,
+                                               option_keys, option_values);
+  auto *session = LanceGetSessionHandle(context);
+  auto *manifest =
+      reinterpret_cast<const uint8_t *>(serialized_manifest.data()); // NOLINT
+
+  if (option_keys.empty()) {
+    return lance_vane_open_dataset_version_from_manifest_with_session(
+        open_path.c_str(), version, manifest, serialized_manifest.size(),
+        expected_generation.c_str(), session);
+  }
+
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
+  return lance_vane_open_dataset_version_from_manifest_with_storage_options_and_session(
+      open_path.c_str(), version, manifest, serialized_manifest.size(),
+      expected_generation.c_str(), key_ptrs.data(), value_ptrs.data(),
+      option_keys.size(), session);
+}
 #endif
 
 static unordered_map<string, Value>
