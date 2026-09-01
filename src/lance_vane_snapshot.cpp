@@ -244,6 +244,8 @@ shared_ptr<LanceDatasetCacheEntry> LanceVaneGetOrOpenFrozenSnapshot(
       LanceVaneSnapshotCacheKey(context, path, version, generation_id);
   cache_key += "|manifest-sha256|" + to_string(manifest_sha256.size()) + ":" +
                manifest_sha256;
+  cache_key += "|schema-fingerprint|" + to_string(schema_fingerprint.size()) +
+               ":" + schema_fingerprint;
   auto cache =
       context.registered_state->GetOrCreate<LanceVaneSnapshotCacheState>(
           LANCE_VANE_SNAPSHOT_CACHE_STATE_KEY);
