@@ -100,6 +100,13 @@ worker. On a backend without reliable immutable object identity, the worker
 also compares the current `IndexSection` with the coordinator-frozen catalog
 before seeding it.
 
+The fixed-snapshot dataset handle owns a lease that pins this one catalog in a
+Vane-only layer in front of Lance's configured bounded index cache. Dropping
+the handle releases the pin. Consequently, a catalog larger than
+`lance_vane_index_cache_size_bytes` remains valid for the active query without
+making ordinary reusable index entries unbounded or changing the configured
+cache capacity.
+
 For a standard REST namespace, the coordinator obtains a stable physical table
 URI and detailed metadata for the already-bound version. Credentials, vended
 storage options, presigned URLs, and REST endpoint details are not serialized.

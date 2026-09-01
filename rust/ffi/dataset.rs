@@ -23,8 +23,6 @@ use lance::session::index_caches::IndexMetadataKey;
 #[cfg(feature = "vane-distributed")]
 use lance::session::Session;
 #[cfg(feature = "vane-distributed")]
-use lance_core::cache::LanceCache;
-#[cfg(feature = "vane-distributed")]
 use lance_table::format::{pb, IndexMetadata};
 #[cfg(feature = "vane-distributed")]
 use lance_table::io::manifest::read_manifest_indexes;
@@ -47,6 +45,8 @@ use super::util::{
 };
 #[cfg(feature = "vane-distributed")]
 use super::util::{optional_vane_session_handle, with_explicit_aws_credentials};
+#[cfg(feature = "vane-distributed")]
+use super::vane_index_cache::VaneIndexCacheLease;
 
 #[cfg(feature = "vane-distributed")]
 // Keep this limit in sync with LANCE_VANE_MAX_SERIALIZED_MANIFEST_BYTES in
@@ -697,7 +697,7 @@ pub(super) async fn seed_frozen_index_metadata(
     dataset: &lance::Dataset,
     session: &SessionHandle,
     indices: &[IndexMetadata],
-) -> FfiResult<()> {
+) -> FfiResult<VaneIndexCacheLease> {
     let store_identity = dataset
         .object_store(None)
         .await
@@ -709,38 +709,26 @@ pub(super) async fn seed_frozen_index_metadata(
         })?
         .store_prefix
         .clone();
-    let cache = LanceCache::with_backend_and_prefix(
-        session.index_cache.clone(),
-        format!("{}/", dataset.uri()),
-    );
+    let cache_prefix = format!("{}/", dataset.uri());
     let key = IndexMetadataKey {
         version: dataset.version_id(),
         store_identity: &store_identity,
     };
 
     let _guard = session.index_metadata_seed_lock.lock().await;
-    if cache
-        .get_with_key(&key)
-        .await
-        .is_some_and(|current| current.as_ref() == indices)
+    if session
+        .vane_index_cache
+        .get_pinned_with_key(&cache_prefix, &key)
+        .is_some_and(|current| current.as_ref() != indices)
     {
-        return Ok(());
-    }
-    cache
-        .insert_with_key(&key, Arc::new(indices.to_vec()))
-        .await;
-    if cache
-        .get_with_key(&key)
-        .await
-        .is_some_and(|current| current.as_ref() == indices)
-    {
-        Ok(())
-    } else {
-        Err(FfiError::new(
+        return Err(FfiError::new(
             ErrorCode::DatasetOpen,
-            "shared Lance index cache could not retain coordinator-frozen metadata",
-        ))
+            "conflicting coordinator-frozen index metadata is already active for this snapshot",
+        ));
     }
+    Ok(session
+        .vane_index_cache
+        .pin_with_key(&cache_prefix, &key, Arc::new(indices.to_vec())))
 }
 
 #[cfg(feature = "vane-distributed")]
@@ -998,7 +986,7 @@ unsafe fn vane_open_dataset_version_from_manifest_inner(
             ));
         }
     };
-    if let Some(frozen_indices) = frozen_indices.as_deref() {
+    let frozen_index_metadata_lease = if let Some(frozen_indices) = frozen_indices.as_deref() {
         let Some(session_handle) = session_handle else {
             return Err(FfiError::new(
                 ErrorCode::InvalidArgument,
@@ -1010,7 +998,7 @@ unsafe fn vane_open_dataset_version_from_manifest_inner(
             session_handle,
             frozen_indices,
         )) {
-            Ok(Ok(())) => {}
+            Ok(Ok(lease)) => Some(lease),
             Ok(Err(err)) => return Err(err),
             Err(err) => {
                 return Err(FfiError::new(
@@ -1019,9 +1007,15 @@ unsafe fn vane_open_dataset_version_from_manifest_inner(
                 ));
             }
         }
-    }
+    } else {
+        None
+    };
     record_dataset_open();
-    Ok(DatasetHandle::new(dataset))
+    let handle = DatasetHandle::new(dataset);
+    if let Some(lease) = frozen_index_metadata_lease {
+        handle.retain_frozen_index_metadata(lease);
+    }
+    Ok(handle)
 }
 
 #[no_mangle]
@@ -1989,8 +1983,15 @@ mod tests {
             "tracked-memory",
             Arc::new(TrackingMemoryStoreProvider { backend, tracker }),
         );
-        let index_cache: Arc<dyn CacheBackend> =
-            Arc::new(MokaCacheBackend::with_capacity(16 * 1024 * 1024));
+        // The frozen index catalog is deliberately larger than this cache.
+        // Its snapshot-owned pin must keep the query valid without changing
+        // the user's bounded-cache configuration.
+        let bounded_index_cache: Arc<dyn CacheBackend> =
+            Arc::new(MokaCacheBackend::with_capacity(1));
+        let vane_index_cache = Arc::new(
+            super::super::vane_index_cache::VaneIndexCacheBackend::new(bounded_index_cache),
+        );
+        let index_cache: Arc<dyn CacheBackend> = vane_index_cache.clone();
         SessionHandle {
             session: Arc::new(Session::with_index_cache_backend(
                 index_cache.clone(),
@@ -1999,6 +2000,7 @@ mod tests {
             )),
             index_cache,
             index_metadata_seed_lock: Arc::new(tokio::sync::Mutex::new(())),
+            vane_index_cache,
         }
     }
 
@@ -2192,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_frozen_index_section_seeds_native_session_cache() {
+    fn coordinator_frozen_index_section_uses_snapshot_pin_above_cache_capacity() {
         let _counter_guard = super::super::session::DEBUG_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

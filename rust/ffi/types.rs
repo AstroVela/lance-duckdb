@@ -10,6 +10,8 @@ use crate::datafusion_stream::DataFusionStream;
 use crate::scanner::{LanceStream, LanceTakeStream};
 
 use super::projection;
+#[cfg(feature = "vane-distributed")]
+use super::vane_index_cache::{VaneIndexCacheBackend, VaneIndexCacheLease};
 
 pub(crate) type SchemaHandle = Arc<Schema>;
 
@@ -19,6 +21,8 @@ pub(crate) struct SessionHandle {
     pub(crate) index_cache: Arc<dyn CacheBackend>,
     #[cfg(feature = "vane-distributed")]
     pub(crate) index_metadata_seed_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(feature = "vane-distributed")]
+    pub(crate) vane_index_cache: Arc<VaneIndexCacheBackend>,
 }
 
 pub(crate) struct DatasetHandle {
@@ -26,6 +30,8 @@ pub(crate) struct DatasetHandle {
     pub(crate) arrow_schema: SchemaHandle,
     pub(crate) base_projection: Arc<[String]>,
     pub(crate) fts_projection: Arc<[String]>,
+    #[cfg(feature = "vane-distributed")]
+    frozen_index_metadata_lease: std::sync::Mutex<Option<VaneIndexCacheLease>>,
 }
 
 impl DatasetHandle {
@@ -39,7 +45,17 @@ impl DatasetHandle {
             arrow_schema,
             base_projection,
             fts_projection,
+            #[cfg(feature = "vane-distributed")]
+            frozen_index_metadata_lease: std::sync::Mutex::new(None),
         }
+    }
+
+    #[cfg(feature = "vane-distributed")]
+    pub(crate) fn retain_frozen_index_metadata(&self, lease: VaneIndexCacheLease) {
+        *self
+            .frozen_index_metadata_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lease);
     }
 }
 

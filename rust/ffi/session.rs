@@ -15,6 +15,8 @@ use crate::runtime;
 
 use super::types::SessionHandle;
 use super::util::{optional_session_handle, u64_to_usize, FfiError, FfiResult};
+#[cfg(feature = "vane-distributed")]
+use super::vane_index_cache::VaneIndexCacheBackend;
 
 static DATASET_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static NAMESPACE_DESCRIBE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -105,8 +107,15 @@ fn create_session_inner(
                 u64_to_usize(metadata_cache_size_bytes, "metadata_cache_size_bytes")?,
             )
         };
-    let index_cache: Arc<dyn CacheBackend> =
+    let bounded_index_cache: Arc<dyn CacheBackend> =
         Arc::new(MokaCacheBackend::with_capacity(index_cache_size_bytes));
+    #[cfg(feature = "vane-distributed")]
+    let (index_cache, vane_index_cache): (Arc<dyn CacheBackend>, Arc<VaneIndexCacheBackend>) = {
+        let vane_index_cache = Arc::new(VaneIndexCacheBackend::new(bounded_index_cache));
+        (vane_index_cache.clone(), vane_index_cache)
+    };
+    #[cfg(not(feature = "vane-distributed"))]
+    let index_cache = bounded_index_cache;
     let session = Arc::new(Session::with_index_cache_backend(
         index_cache.clone(),
         metadata_cache_size_bytes,
@@ -117,6 +126,8 @@ fn create_session_inner(
         index_cache,
         #[cfg(feature = "vane-distributed")]
         index_metadata_seed_lock: Arc::new(tokio::sync::Mutex::new(())),
+        #[cfg(feature = "vane-distributed")]
+        vane_index_cache,
     })
 }
 

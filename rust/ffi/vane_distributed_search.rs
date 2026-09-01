@@ -303,10 +303,11 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
                 "coordinator dataset does not use the supplied shared Lance session",
             ));
         }
-        let indices = match runtime::block_on(async {
+        let (indices, lease) = match runtime::block_on(async {
             let indices = load_supported_raw_index_metadata(handle.dataset.as_ref()).await?;
-            seed_frozen_index_metadata(handle.dataset.as_ref(), session, &indices).await?;
-            Ok::<_, FfiError>(indices)
+            let lease =
+                seed_frozen_index_metadata(handle.dataset.as_ref(), session, &indices).await?;
+            Ok::<_, FfiError>((indices, lease))
         }) {
             Ok(result) => result?,
             Err(err) => {
@@ -316,6 +317,7 @@ pub unsafe extern "C" fn lance_vane_serialize_dataset_index_section(
                 ));
             }
         };
+        handle.retain_frozen_index_metadata(lease);
         let bytes = pb::IndexSection {
             indices: indices.iter().map(pb::IndexMetadata::from).collect(),
         }
