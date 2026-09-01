@@ -23,14 +23,14 @@ use lance::session::index_caches::IndexMetadataKey;
 #[cfg(feature = "vane-distributed")]
 use lance::session::Session;
 #[cfg(feature = "vane-distributed")]
-use lance_core::cache::CacheBackend;
-#[cfg(feature = "vane-distributed")]
 use lance_table::format::{pb, IndexMetadata};
 #[cfg(feature = "vane-distributed")]
 use lance_table::io::manifest::read_manifest_indexes;
 #[cfg(feature = "vane-distributed")]
 use prost::Message;
 use roaring::RoaringTreemap;
+#[cfg(feature = "vane-distributed")]
+use sha2::{Digest, Sha256};
 
 use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -38,7 +38,7 @@ use crate::runtime;
 
 use super::session::record_dataset_open;
 use super::types::DatasetHandle;
-#[cfg(all(test, feature = "vane-distributed"))]
+#[cfg(feature = "vane-distributed")]
 use super::types::SessionHandle;
 use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
 use super::util::{
@@ -46,9 +46,11 @@ use super::util::{
     FfiResult,
 };
 #[cfg(feature = "vane-distributed")]
-use super::util::{optional_vane_session_handle, with_explicit_aws_credentials};
+use super::util::{
+    optional_vane_session_handle, vane_object_store_params, with_explicit_aws_credentials,
+};
 #[cfg(feature = "vane-distributed")]
-use super::vane_index_cache::{VaneIndexCacheBackend, VaneIndexCacheLease};
+use super::vane_index_cache::VaneIndexCacheLease;
 
 #[cfg(feature = "vane-distributed")]
 // Keep this limit in sync with LANCE_VANE_MAX_SERIALIZED_MANIFEST_BYTES in
@@ -697,7 +699,7 @@ pub(super) async fn load_supported_raw_index_metadata(
 #[cfg(feature = "vane-distributed")]
 pub(super) async fn seed_frozen_index_metadata(
     dataset: &lance::Dataset,
-    cache: &Arc<VaneIndexCacheBackend>,
+    session: &SessionHandle,
     indices: &[IndexMetadata],
 ) -> FfiResult<VaneIndexCacheLease> {
     let store_identity = dataset
@@ -717,7 +719,9 @@ pub(super) async fn seed_frozen_index_metadata(
         store_identity: &store_identity,
     };
 
-    if cache
+    let _guard = session.index_metadata_seed_lock.lock().await;
+    if session
+        .vane_index_cache
         .get_pinned_with_key(&cache_prefix, &key)
         .is_some_and(|current| current.as_ref() != indices)
     {
@@ -727,7 +731,9 @@ pub(super) async fn seed_frozen_index_metadata(
         ));
     }
     let frozen_indices = Arc::new(indices.to_vec());
-    Ok(cache.pin_with_key(&cache_prefix, &key, frozen_indices))
+    Ok(session
+        .vane_index_cache
+        .pin_with_key(&cache_prefix, &key, frozen_indices))
 }
 
 #[cfg(feature = "vane-distributed")]
@@ -779,23 +785,82 @@ async fn vane_load_dataset_version_from_manifest(
     // location (and object metadata) but does not download manifest contents.
     // DatasetBuilder also validates and decodes the protobuf, so avoid decoding
     // the same potentially large payload once before handing it to Lance.
-    let mut frozen_builder = vane_versioned_dataset_builder(path, version, storage_options)
-        .with_serialized_manifest(serialized_manifest)
-        .map_err(|err| {
+    let frozen = if frozen_indices.is_some() {
+        let shared_session = shared_session.as_ref().ok_or_else(|| {
             FfiError::new(
                 ErrorCode::InvalidArgument,
-                format!("load coordinator-frozen dataset manifest: {err}"),
+                "coordinator-frozen index metadata requires a shared Lance session",
             )
         })?;
-    if let Some(shared_session) = shared_session.as_ref() {
-        frozen_builder = frozen_builder.with_session(shared_session.clone());
-    }
-    let frozen = frozen_builder.load().await.map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetOpen,
-            format!("open coordinator-frozen dataset version {version} at '{path}': {err}"),
+        let object_store_builder = vane_versioned_dataset_builder(path, version, storage_options)
+            .with_session(shared_session.clone());
+        let (object_store, base_path, commit_handler) = object_store_builder
+            .build_object_store()
+            .await
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::DatasetOpen,
+                    format!("resolve coordinator-frozen dataset object store: {err}"),
+                )
+            })?;
+        let mut generation_store = object_store.as_ref().clone();
+        let generation_digest = Sha256::digest(expected_generation.as_bytes());
+        generation_store.store_prefix = format!(
+            "{}|vane-frozen:{generation_digest:x}",
+            generation_store.store_prefix
+        );
+        let manifest = pb::Manifest::decode(serialized_manifest)
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("decode coordinator-frozen dataset manifest: {err}"),
+                )
+            })?
+            .try_into()
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("load coordinator-frozen dataset manifest: {err}"),
+                )
+            })?;
+        DatasetBuilder::load_by_uri(
+            shared_session.clone(),
+            Some(manifest),
+            None,
+            path.to_string(),
+            Some(version),
+            Arc::new(generation_store),
+            base_path,
+            commit_handler,
+            Some(vane_object_store_params(storage_options)),
+            None,
         )
-    })?;
+        .await
+        .map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("open coordinator-frozen dataset version {version} at '{path}': {err}"),
+            )
+        })?
+    } else {
+        let mut frozen_builder = vane_versioned_dataset_builder(path, version, storage_options)
+            .with_serialized_manifest(serialized_manifest)
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("load coordinator-frozen dataset manifest: {err}"),
+                )
+            })?;
+        if let Some(shared_session) = shared_session.as_ref() {
+            frozen_builder = frozen_builder.with_session(shared_session.clone());
+        }
+        frozen_builder.load().await.map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("open coordinator-frozen dataset version {version} at '{path}': {err}"),
+            )
+        })?
+    };
 
     let frozen_generation = format!("snapshot|{}", dataset_snapshot_identity(&frozen).await?);
     if frozen_generation != expected_generation {
@@ -966,30 +1031,10 @@ unsafe fn vane_open_dataset_version_from_manifest_inner(
             "coordinator-frozen index metadata requires a shared Lance session",
         ));
     }
-    // Frozen index metadata must never be inserted into the database-wide
-    // Session under Lance's URI/version key: that key intentionally has no
-    // Vane generation component. Give this snapshot a private pin overlay and
-    // delegate all ordinary index entries to the shared bounded cache.
-    let (dataset_session, scoped_index_cache) = match (frozen_indices.as_ref(), session_handle) {
-        (Some(_), Some(session_handle)) => {
-            let scoped_index_cache = session_handle.vane_index_cache.snapshot_scope();
-            let backend: Arc<dyn CacheBackend> = scoped_index_cache.clone();
-            let dataset_session = Arc::new(Session::with_index_cache_backend(
-                backend,
-                session_handle.metadata_cache_size_bytes,
-                session_handle.session.store_registry(),
-            ));
-            (Some(dataset_session), Some(scoped_index_cache))
-        }
-        (None, Some(session_handle)) => (Some(session_handle.session.clone()), None),
-        (None, None) => (None, None),
-        (Some(_), None) => {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                "coordinator-frozen index metadata requires a shared Lance session",
-            ));
-        }
-    };
+    // Keep Lance's database-wide metadata cache while isolating frozen index
+    // keys through the generation-scoped object-store identity constructed by
+    // `vane_load_dataset_version_from_manifest`.
+    let dataset_session = session_handle.map(|handle| handle.session.clone());
     let dataset = match runtime::block_on(vane_load_dataset_version_from_manifest(
         path_str,
         version,
@@ -1009,15 +1054,15 @@ unsafe fn vane_open_dataset_version_from_manifest_inner(
         }
     };
     let frozen_index_metadata_lease = if let Some(frozen_indices) = frozen_indices.as_deref() {
-        let Some(scoped_index_cache) = scoped_index_cache.as_ref() else {
+        let Some(session_handle) = session_handle else {
             return Err(FfiError::new(
                 ErrorCode::InvalidArgument,
-                "coordinator-frozen index metadata requires a scoped cache",
+                "coordinator-frozen index metadata requires a shared Lance session",
             ));
         };
         match runtime::block_on(seed_frozen_index_metadata(
             dataset.as_ref(),
-            scoped_index_cache,
+            session_handle,
             frozen_indices,
         )) {
             Ok(Ok(lease)) => Some(lease),
@@ -2021,7 +2066,7 @@ mod tests {
                 registry,
             )),
             index_cache,
-            metadata_cache_size_bytes: 0,
+            index_metadata_seed_lock: Arc::new(tokio::sync::Mutex::new(())),
             vane_index_cache,
         }
     }
@@ -2216,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_index_section_uses_snapshot_local_pin_above_cache_capacity() {
+    fn frozen_index_section_uses_generation_scoped_pin_above_cache_capacity() {
         let _counter_guard = super::super::session::DEBUG_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2317,7 +2362,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(actual_indices.as_ref(), &expected_frozen_indices);
-        assert!(!Arc::ptr_eq(
+        assert!(Arc::ptr_eq(
             &opened.dataset.session(),
             &worker_session.session
         ));
@@ -2327,7 +2372,7 @@ mod tests {
             worker_io.read_iops, 1,
             "worker reopened the manifest IndexSection instead of using frozen metadata: {worker_io}"
         );
-        assert_eq!(worker_session.vane_index_cache.pinned_entry_count(), 0);
+        assert_eq!(worker_session.vane_index_cache.pinned_entry_count(), 1);
         drop(opened);
         assert_eq!(worker_session.vane_index_cache.pinned_entry_count(), 0);
     }
@@ -2391,11 +2436,11 @@ mod tests {
             )
         }
         .unwrap();
-        assert!(!Arc::ptr_eq(
+        assert!(Arc::ptr_eq(
             &frozen.dataset.session(),
             &shared_session.session
         ));
-        assert_eq!(shared_session.vane_index_cache.pinned_entry_count(), 0);
+        assert_eq!(shared_session.vane_index_cache.pinned_entry_count(), 1);
 
         fs::remove_dir_all(&dataset_dir).unwrap();
         let mut replacement = write_test_dataset(&uri, vec![4, 5, 6]);
@@ -2417,6 +2462,17 @@ mod tests {
             &current.dataset.session(),
             &shared_session.session
         ));
+        let frozen_store_identity = runtime::block_on(frozen.dataset.object_store(None))
+            .unwrap()
+            .unwrap()
+            .store_prefix
+            .clone();
+        let current_store_identity = runtime::block_on(current.dataset.object_store(None))
+            .unwrap()
+            .unwrap()
+            .store_prefix
+            .clone();
+        assert_ne!(frozen_store_identity, current_store_identity);
         let current_indices = runtime::block_on(current.dataset.load_indices())
             .unwrap()
             .unwrap();
@@ -2430,10 +2486,11 @@ mod tests {
         assert!(still_frozen
             .iter()
             .all(|index| index.name != "replacement_idx"));
-        assert_eq!(shared_session.vane_index_cache.pinned_entry_count(), 0);
+        assert_eq!(shared_session.vane_index_cache.pinned_entry_count(), 1);
 
         drop(current);
         drop(frozen);
+        assert_eq!(shared_session.vane_index_cache.pinned_entry_count(), 0);
         let _ = fs::remove_dir_all(dataset_dir);
     }
 

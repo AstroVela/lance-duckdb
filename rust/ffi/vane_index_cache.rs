@@ -41,15 +41,6 @@ impl VaneIndexCacheBackend {
         }
     }
 
-    /// Create a snapshot-local overlay whose ordinary entries still delegate
-    /// to this session cache. Pins live only in the returned backend, so a
-    /// dataset opened for one frozen generation cannot affect another dataset
-    /// that happens to reuse the same URI and version.
-    pub(crate) fn snapshot_scope(self: &Arc<Self>) -> Arc<Self> {
-        let shared: Arc<dyn CacheBackend> = self.clone();
-        Arc::new(Self::new(shared))
-    }
-
     fn lock_pinned(&self) -> MutexGuard<'_, HashMap<InternalCacheKey, PinnedEntry>> {
         self.pinned
             .lock()
@@ -282,24 +273,4 @@ mod tests {
         assert!(cache.get_with_key(&TestKey).await.is_none());
     }
 
-    #[tokio::test]
-    async fn snapshot_pin_is_invisible_to_the_shared_session() {
-        let bounded: Arc<dyn CacheBackend> = Arc::new(MokaCacheBackend::with_capacity(256));
-        let shared = Arc::new(VaneIndexCacheBackend::new(bounded));
-        let scope = shared.snapshot_scope();
-        let shared_cache =
-            LanceCache::with_backend_and_prefix(shared.clone(), "dataset/".to_string());
-        let scoped_cache =
-            LanceCache::with_backend_and_prefix(scope.clone(), "dataset/".to_string());
-        let expected = Arc::new(vec![1_u8; 1024]);
-        let lease = scope.pin_with_key("dataset/", &TestKey, expected.clone());
-
-        assert_eq!(scoped_cache.get_with_key(&TestKey).await, Some(expected));
-        assert!(shared_cache.get_with_key(&TestKey).await.is_none());
-        assert_eq!(shared.pinned_entry_count(), 0);
-        assert_eq!(scope.pinned_entry_count(), 1);
-
-        drop(lease);
-        assert_eq!(scope.pinned_entry_count(), 0);
-    }
 }

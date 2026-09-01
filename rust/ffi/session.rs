@@ -125,7 +125,7 @@ fn create_session_inner(
         session,
         index_cache,
         #[cfg(feature = "vane-distributed")]
-        metadata_cache_size_bytes,
+        index_metadata_seed_lock: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(feature = "vane-distributed")]
         vane_index_cache,
     })

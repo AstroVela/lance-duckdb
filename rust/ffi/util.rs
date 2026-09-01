@@ -7,6 +7,8 @@ use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
 #[cfg(feature = "vane-distributed")]
 use lance::dataset::builder::DatasetBuilder;
+#[cfg(feature = "vane-distributed")]
+use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::session::Session;
 use lance_core::datatypes::Schema as LanceSchema;
 #[cfg(feature = "vane-distributed")]
@@ -210,6 +212,25 @@ pub(crate) fn with_explicit_aws_credentials(
         return builder;
     };
     builder.with_aws_credentials_provider(Arc::new(StaticCredentialProvider::new(credentials)))
+}
+
+#[cfg(feature = "vane-distributed")]
+pub(crate) fn vane_object_store_params(
+    storage_options: Option<&std::collections::HashMap<String, String>>,
+) -> ObjectStoreParams {
+    let Some(storage_options) = storage_options else {
+        return ObjectStoreParams::default();
+    };
+    let mut params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            storage_options.clone(),
+        ))),
+        ..ObjectStoreParams::default()
+    };
+    if let Some(credentials) = explicit_aws_credentials(storage_options) {
+        params.aws_credentials = Some(Arc::new(StaticCredentialProvider::new(credentials)));
+    }
+    params
 }
 
 #[cfg(feature = "vane-distributed")]
