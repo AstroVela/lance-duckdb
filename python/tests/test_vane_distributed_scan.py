@@ -2555,9 +2555,7 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
             assignment_payload = singleton[variant_offset : digest_offset + 32]
             assert len(assignment_payload) == 69
 
-            truncated_plan = _worker_plan_with_truncated_search_index_plan(
-                task.plan()
-            )
+            truncated_plan = _worker_plan_with_truncated_search_index_plan(task.plan())
             worker = _connect()
             cursor = worker.cursor()
             try:
