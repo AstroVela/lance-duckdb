@@ -10,16 +10,26 @@ on:
     paths-ignore:
       - "**.md"
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Run CI only or publish the pinned Lance provider candidate to TestPyPI
+        type: choice
+        options:
+          - build-only
+          - testpypi-dev
+        default: build-only
+        required: true
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ inputs.operation || 'ci' }}
+  cancel-in-progress: ${{ inputs.operation != 'testpypi-dev' }}
 
 permissions:
   contents: read
 
 jobs:
   preflight:
+    if: inputs.operation != 'testpypi-dev'
     name: CI contract preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -181,8 +191,41 @@ jobs:
       - name: Check Python test formatting and syntax
         run: |
           python -m pip install "black==24.10.0"
-          python -m black --check python/tests
-          python -m compileall -q python/tests
+          python -m black --check \
+            python/tests \
+            scripts/build_vane_dynamic_wheel.py \
+            scripts/validate_vane_provider_release.py
+          python -m compileall -q \
+            python/tests \
+            scripts/build_vane_dynamic_wheel.py \
+            scripts/validate_vane_provider_release.py
+
+  vane-provider-release-tooling:
+    if: inputs.operation != 'testpypi-dev'
+    name: Validate Lance provider release tooling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Exercise the immutable release validator
+        run: |
+          python -m pip install --disable-pip-version-check packaging pytest
+          python -m pytest -q \
+            python/tests/test_vane_dynamic_wheel.py \
+            python/tests/test_vane_provider_release.py
 
   vane-native-build:
     name: Build and test Vane ABI
@@ -825,3 +868,892 @@ jobs:
         run: |
           docker logs lance-vane-write-minio || true
           docker rm -f lance-vane-write-minio || true
+
+  vane-dynamic-provider-build:
+    if: inputs.operation != 'testpypi-dev'
+    name: Build signed Vane dynamic Lance wheel
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTUP_TOOLCHAIN: 1.98.0
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-lance-provider-ccache
+      CCACHE_MAXSIZE: 1G
+      VANE_BUILD_JOBS: "8"
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VANE_DYNAMIC_BUILD_DIR: ${{ github.workspace }}/build/vane-dynamic-provider
+      VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-dynamic-provider-dist
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
+      VCPKG_BINARY_SOURCES: clear
+      VCPKG_TARGET_TRIPLET: x64-linux
+
+    steps:
+      - name: Checkout extension and submodules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout exact Vane CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane-extension-ci-tools
+          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
+          path: vane-ci-tools
+          persist-credentials: false
+
+      - name: Select manylinux CPython
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_directory=/opt/python/cp312-cp312/bin
+          test -x "$python_directory/python"
+          echo "$python_directory" >> "$GITHUB_PATH"
+          "$python_directory/python" --version
+
+      - name: Read integration manifest
+        id: manifest
+        run: |
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install native and wheel tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y \
+            autoconf automake binutils ccache curl file flex gcc gcc-c++ git libtool m4 \
+            make ninja-build openssl openssl-devel patch perl-IPC-Cmd \
+            perl-Time-Piece pkgconf-pkg-config tar unzip xz zip
+          python -m pip install \
+            "auditwheel>=6.4" \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            packaging \
+            "patchelf>=0.17.2" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0"
+
+      - name: Set up pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Install pinned cargo-about
+        shell: bash
+        env:
+          CARGO_ABOUT_SHA256: 9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
+          CARGO_ABOUT_VERSION: 0.9.2
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-about.tar.gz"
+          root="$RUNNER_TEMP/cargo-about"
+          curl --fail --location --retry 5 --retry-delay 1 \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$CARGO_ABOUT_SHA256" "$archive" | sha256sum --check -
+          mkdir -p "$root"
+          tar -C "$root" --strip-components=1 -xzf "$archive"
+          test -x "$root/cargo-about"
+          echo "VANE_CARGO_ABOUT=$root/cargo-about" >> "$GITHUB_ENV"
+
+      - name: Build pinned Bison
+        shell: bash
+        env:
+          BISON_SHA256: 9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2
+          BISON_VERSION: 3.8.2
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bison-${BISON_VERSION}.tar.xz"
+          source="$RUNNER_TEMP/bison-${BISON_VERSION}"
+          prefix="$RUNNER_TEMP/vane-bison-${BISON_VERSION}"
+          curl --fail --location --retry 5 --retry-delay 1 \
+            "https://ftp.gnu.org/gnu/bison/bison-${BISON_VERSION}.tar.xz" \
+            --output "$archive"
+          printf '%s  %s\n' "$BISON_SHA256" "$archive" | sha256sum --check -
+          tar -C "$RUNNER_TEMP" -xf "$archive"
+          (cd "$source" && ./configure --disable-nls --prefix="$prefix" && \
+            make -j "$VANE_BUILD_JOBS" && make install)
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          echo "VANE_BISON=$prefix/bin/bison" >> "$GITHUB_ENV"
+
+      - name: Validate exact source identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C extension/extension-ci-tools rev-parse HEAD)" = \
+            de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+          test "$(git -C vane-ci-tools rev-parse HEAD)" = \
+            28c253d71645b627e90307a8c0f42bf74bda0046
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools \
+            --ci-tools-source "$GITHUB_WORKSPACE/vane-ci-tools" \
+            --expected-sha 28c253d71645b627e90307a8c0f42bf74bda0046
+          python vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            identity \
+            --vane-source "$VANE_SOURCE_DIR"
+
+      - name: Restore provider compiler cache
+        id: provider-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: vane-lance-provider-v1-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json') }}
+
+      - name: Bootstrap exact Vane dependencies
+        run: |
+          set -euo pipefail
+          test "$(command -v bison)" = "$VANE_BISON"
+          ccache --zero-stats
+          make -f extension/makefiles/vane_extension.Makefile \
+            vane_wheel_dependencies \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
+            VANE_CI_TOOLS_DIR="$GITHUB_WORKSPACE/vane-ci-tools" \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_EXTENSION_VCPKG_ROOT="$VANE_EXTENSION_VCPKG_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
+            VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT"
+
+      - name: Build, sign, and verify dynamic provider wheels
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ env.VANE_EXTENSION_VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
+        run: |
+          python -I extension/scripts/build_vane_dynamic_wheel.py \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
+            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
+            --cargo-about "$VANE_CARGO_ABOUT" \
+            --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
+            --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS" \
+            --signing-profile ci-test \
+            --signing-private-key "$VANE_SOURCE_DIR/external/duckdb/test/mbedtls/private.pem" \
+            --package-local-runtime
+
+      - name: Report provider compiler cache
+        if: always()
+        shell: bash
+        env:
+          VANE_CACHE_ACTION_HIT: ${{ steps.provider-cache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload dynamic runtime and provider wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-lance-dynamic-wheels
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  vane-dynamic-provider-local-test:
+    if: inputs.operation != 'testpypi-dev'
+    name: Vane dynamic Lance local integration
+    needs: [python-quality, vane-dynamic-provider-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
+      VANE_RUNNER: local-fast
+
+    steps:
+      - name: Checkout tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download dynamic wheels
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-lance-dynamic-wheels
+          path: wheels
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Exercise provider-backed Lance locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv-provider-local
+          . .venv-provider-local/bin/activate
+          mapfile -t wheels < <(find wheels -maxdepth 1 -type f -name '*.whl' -print | sort)
+          test "${#wheels[@]}" -eq 2
+          python -m pip install "${wheels[@]}" pytest
+          python -m pip check
+          python -m pytest -q \
+            python/tests/test_vane_single_scan.py::test_single_node_lance_scan
+
+  vane-dynamic-provider-ray-test:
+    if: inputs.operation != 'testpypi-dev'
+    name: Vane dynamic Lance two-worker integration
+    needs: [rust-quality, python-quality, vane-dynamic-provider-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    env:
+      RAY_DEDUP_LOGS: "0"
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
+      VANE_RUNNER: ray
+
+    steps:
+      - name: Checkout tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download dynamic wheels
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-lance-dynamic-wheels
+          path: wheels
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Exercise provider-backed Lance on two Ray workers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv-provider-ray
+          . .venv-provider-ray/bin/activate
+          mapfile -t wheels < <(find wheels -maxdepth 1 -type f -name '*.whl' -print | sort)
+          test "${#wheels[@]}" -eq 2
+          python -m pip install "${wheels[@]}" "grpcio>=1.42.0" pytest
+          python -m pip check
+          python -m pytest -q \
+            python/tests/test_vane_distributed_scan.py::test_fragment_scan_uses_both_ray_execution_nodes
+
+  vane-testpypi-wheels:
+    if: inputs.operation == 'testpypi-dev'
+    name: Build signed TestPyPI Lance provider wheels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vane-extension-lance
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
+    permissions:
+      contents: read
+    outputs:
+      lance_version: ${{ steps.release.outputs.lance_version }}
+      vane_version: ${{ steps.release.outputs.vane_version }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTUP_TOOLCHAIN: 1.98.0
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-lance-testpypi-ccache
+      CCACHE_MAXSIZE: 1G
+      VANE_BUILD_JOBS: "8"
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VANE_DYNAMIC_BUILD_DIR: ${{ github.workspace }}/build/vane-testpypi-provider
+      VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-testpypi-provider-dist
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_PYTHON: /opt/python/cp312-cp312/bin/python
+      VANE_RUNTIME_WHEEL_DIR: ${{ github.workspace }}/build/vane-testpypi-runtime-wheels
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      VCPKG_TARGET_TRIPLET: x64-linux
+
+    steps:
+      - name: Require the protected release branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main_vane
+
+      - name: Checkout extension and submodules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout exact Vane CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane-extension-ci-tools
+          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
+          path: vane-ci-tools
+          persist-credentials: false
+
+      - name: Read integration manifest
+        id: manifest
+        run: |
+          "$VANE_PYTHON" vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install native and wheel tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y \
+            autoconf automake binutils ccache curl file flex gcc gcc-c++ git libtool m4 \
+            make ninja-build openssl openssl-devel patch perl-IPC-Cmd \
+            perl-Time-Piece pkgconf-pkg-config tar unzip xz zip
+          "$VANE_PYTHON" -m pip install \
+            "auditwheel>=6.4" \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            packaging \
+            "patchelf>=0.17.2" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0"
+          dirname "$VANE_PYTHON" >> "$GITHUB_PATH"
+
+      - name: Set up pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Install pinned cargo-about
+        shell: bash
+        env:
+          CARGO_ABOUT_SHA256: 9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
+          CARGO_ABOUT_VERSION: 0.9.2
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-about.tar.gz"
+          root="$RUNNER_TEMP/cargo-about"
+          curl --fail --location --retry 5 --retry-delay 1 \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$CARGO_ABOUT_SHA256" "$archive" | sha256sum --check -
+          mkdir -p "$root"
+          tar -C "$root" --strip-components=1 -xzf "$archive"
+          test -x "$root/cargo-about"
+          echo "VANE_CARGO_ABOUT=$root/cargo-about" >> "$GITHUB_ENV"
+
+      - name: Build pinned Bison
+        shell: bash
+        env:
+          BISON_SHA256: 9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2
+          BISON_VERSION: 3.8.2
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bison-${BISON_VERSION}.tar.xz"
+          source="$RUNNER_TEMP/bison-${BISON_VERSION}"
+          prefix="$RUNNER_TEMP/vane-bison-${BISON_VERSION}"
+          curl --fail --location --retry 5 --retry-delay 1 \
+            "https://ftp.gnu.org/gnu/bison/bison-${BISON_VERSION}.tar.xz" \
+            --output "$archive"
+          printf '%s  %s\n' "$BISON_SHA256" "$archive" | sha256sum --check -
+          tar -C "$RUNNER_TEMP" -xf "$archive"
+          (cd "$source" && ./configure --disable-nls --prefix="$prefix" && \
+            make -j "$VANE_BUILD_JOBS" && make install)
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          echo "VANE_BISON=$prefix/bin/bison" >> "$GITHUB_ENV"
+
+      - name: Validate exact source identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C extension/extension-ci-tools rev-parse HEAD)" = \
+            de54d6cef550b4b54cc3e817eeb8c4415faf6c35
+          test "$(git -C vane-ci-tools rev-parse HEAD)" = \
+            28c253d71645b627e90307a8c0f42bf74bda0046
+          "$VANE_PYTHON" vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools \
+            --ci-tools-source "$GITHUB_WORKSPACE/vane-ci-tools" \
+            --expected-sha 28c253d71645b627e90307a8c0f42bf74bda0046
+          "$VANE_PYTHON" vane-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            identity \
+            --vane-source "$VANE_SOURCE_DIR"
+
+      - name: Restore compiler and package caches
+        id: testpypi-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ${{ env.CCACHE_DIR }}
+            ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vane-lance-testpypi-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json') }}
+
+      - name: Bootstrap exact Vane dependencies
+        run: |
+          set -euo pipefail
+          test "$(command -v bison)" = "$VANE_BISON"
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ccache --zero-stats
+          make -f extension/makefiles/vane_extension.Makefile \
+            vane_wheel_dependencies \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
+            VANE_CI_TOOLS_DIR="$GITHUB_WORKSPACE/vane-ci-tools" \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_EXTENSION_VCPKG_ROOT="$VANE_EXTENSION_VCPKG_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_PYTHON="$VANE_PYTHON" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
+            VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT"
+
+      - name: Download every exact indexed Vane runtime wheel
+        id: vane-candidate
+        shell: bash
+        env:
+          INDEX_URL: https://test.pypi.org/simple/
+        run: |
+          set -euo pipefail
+          version="$(cd "$VANE_SOURCE_DIR" && "$VANE_PYTHON" -m setuptools_scm)"
+          "$VANE_PYTHON" - "$version" <<'PY'
+          import sys
+          from packaging.version import Version
+
+          raw = sys.argv[1]
+          version = Version(raw)
+          if str(version) != raw or not version.is_devrelease or version.local is not None:
+              raise SystemExit(f"Vane source has no canonical public development version: {raw!r}")
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p "$VANE_RUNTIME_WHEEL_DIR"
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            destination="$VANE_RUNTIME_WHEEL_DIR/$runtime"
+            mkdir -p "$destination"
+            "/opt/python/$runtime/bin/python" -m pip download \
+              --disable-pip-version-check \
+              --no-cache-dir \
+              --no-deps \
+              --only-binary=:all: \
+              --index-url "$INDEX_URL" \
+              --dest "$destination" \
+              "vane-ai==$version"
+            test "$(find "$destination" -maxdepth 1 -type f -name 'vane_ai-*.whl' | wc -l)" -eq 1
+          done
+
+      - name: Build, sign, and verify the Lance provider wheel matrix
+        shell: bash
+        env:
+          VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY: ${{ secrets.VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY }}
+          VCPKG_TOOLCHAIN_PATH: ${{ env.VANE_EXTENSION_VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
+        run: |
+          set -euo pipefail
+          test -n "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY"
+          signing_key="$RUNNER_TEMP/vane-testpypi-extension-signing.pem"
+          cleanup() {
+            shred --force --remove "$signing_key" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          umask 077
+          printf '%s' "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY" > "$signing_key"
+          unset VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY
+
+          runtime_arguments=()
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            mapfile -t wheels < <(find "$VANE_RUNTIME_WHEEL_DIR/$runtime" \
+              -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+            test "${#wheels[@]}" -eq 1
+            runtime_arguments+=(
+              --runtime-python "/opt/python/$runtime/bin/python"
+              --runtime-wheel "${wheels[0]}"
+            )
+          done
+
+          "$VANE_PYTHON" -I extension/scripts/build_vane_dynamic_wheel.py \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
+            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
+            --cargo-about "$VANE_CARGO_ABOUT" \
+            --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
+            --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS" \
+            --signing-profile testpypi \
+            --signing-private-key "$signing_key" \
+            --consume-signing-private-key \
+            "${runtime_arguments[@]}"
+
+      - name: Validate the immutable publishable release set
+        id: release
+        shell: bash
+        run: |
+          "$VANE_PYTHON" extension/scripts/validate_vane_provider_release.py validate \
+            --directory "$VANE_DYNAMIC_DIST_DIR" \
+            --vane-version "${{ steps.vane-candidate.outputs.version }}" \
+            --require-testpypi-publishable \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Report compiler cache
+        if: always()
+        shell: bash
+        env:
+          VANE_CACHE_ACTION_HIT: ${{ steps.testpypi-cache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload verified Lance provider wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-lance-wheels
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble-testpypi-lance:
+    name: Validate, attest, and sign TestPyPI Lance provider
+    needs: vane-testpypi-wheels
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      lance_version: ${{ needs.vane-testpypi-wheels.outputs.lance_version }}
+      vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check packaging
+
+      - name: Download Lance provider wheels
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-lance-wheels
+          path: packages
+
+      - name: Revalidate the complete release set
+        run: |
+          python scripts/validate_vane_provider_release.py validate \
+            --directory packages \
+            --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
+            --require-testpypi-publishable
+
+      - name: Assemble distributions and checksums
+        run: |
+          mkdir -p distributions release-assets
+          cp packages/vane_extension_lance-*.whl distributions/
+          (cd packages && sha256sum -- ./*.whl) > release-assets/SHA256SUMS
+
+      - name: Generate a CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: packages
+          format: cyclonedx-json
+          output-file: release-assets/vane-extension-lance-sbom.cdx.json
+          upload-artifact: false
+
+      - name: Attest provider provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ github.workspace }}/packages/*
+
+      - name: Preserve the provenance bundle
+        run: |
+          cp "${{ steps.provenance.outputs.bundle-path }}" \
+            release-assets/vane-extension-lance-build-provenance.sigstore.json
+
+      - name: Sign provider distributions with Sigstore
+        uses: sigstore/gh-action-sigstore-python@f7ad0af51a5648d09a20d00370f0a91c3bdf8f84 # v3.0.1
+        with:
+          inputs: packages/*.whl
+
+      - name: Upload Lance distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-lance-distributions
+          path: distributions/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-lance-supplemental
+          path: |
+            release-assets/*
+            packages/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-testpypi-lance:
+    name: Publish Lance provider to TestPyPI
+    needs: assemble-testpypi-lance
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vane-extension-lance
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download Lance distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-lance-distributions
+          path: dist
+
+      - name: Publish through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: true
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  verify-testpypi-lance:
+    name: Verify indexed Lance provider
+    needs: [assemble-testpypi-lance, publish-testpypi-lance]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check packaging
+
+      - name: Download Lance distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-lance-distributions
+          path: dist
+
+      - name: Compare the immutable indexed release
+        run: |
+          python scripts/validate_vane_provider_release.py verify-index \
+            --directory dist \
+            --version "${{ needs.assemble-testpypi-lance.outputs.lance_version }}"
+
+  testpypi-local-lance-integration:
+    name: TestPyPI local Lance integration
+    needs: [assemble-testpypi-lance, verify-testpypi-lance]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      INDEX_URL: https://test.pypi.org/simple/
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
+      VANE_RUNNER: local-fast
+
+    steps:
+      - name: Checkout extension tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download expected Lance distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-lance-distributions
+          path: expected/lance
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact indexed package graph
+        shell: bash
+        env:
+          LANCE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.lance_version }}
+          VANE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.vane_version }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-testpypi-local
+          . .venv-vane-testpypi-local/bin/activate
+          python -m pip install --upgrade pip
+          mkdir -p indexed
+          download_exact() {
+            local requirement="$1"
+            for attempt in 1 2 3 4 5; do
+              if python -m pip download \
+                --disable-pip-version-check \
+                --no-cache-dir \
+                --no-deps \
+                --only-binary=:all: \
+                --index-url "$INDEX_URL" \
+                --dest indexed \
+                "$requirement"; then
+                return
+              fi
+              if [ "$attempt" -lt 5 ]; then
+                sleep 15
+              fi
+            done
+            return 1
+          }
+          download_exact "vane-ai==$VANE_VERSION"
+          download_exact "vane-extension-lance==$LANCE_VERSION"
+          mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+          mapfile -t lance_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_lance-*.whl' -print)
+          mapfile -t expected_lance < <(find expected/lance -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#lance_wheels[@]}" -eq 1
+          test "${#expected_lance[@]}" -eq 1
+          cmp "${expected_lance[0]}" "${lance_wheels[0]}"
+          python -m pip install "${base_wheels[0]}" "${lance_wheels[0]}" pytest
+          python -m pip check
+
+      - name: Exercise the indexed provider locally
+        run: |
+          .venv-vane-testpypi-local/bin/python -m pytest -q \
+            python/tests/test_vane_single_scan.py::test_single_node_lance_scan
+
+  testpypi-ray-lance-integration:
+    name: TestPyPI two-worker Ray Lance integration
+    needs: [assemble-testpypi-lance, verify-testpypi-lance]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    env:
+      INDEX_URL: https://test.pypi.org/simple/
+      RAY_DEDUP_LOGS: "0"
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
+      VANE_RUNNER: ray
+
+    steps:
+      - name: Checkout extension tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact indexed package graph
+        shell: bash
+        env:
+          LANCE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.lance_version }}
+          VANE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.vane_version }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-testpypi-ray
+          . .venv-vane-testpypi-ray/bin/activate
+          python -m pip install --upgrade pip
+          mkdir -p indexed
+          download_exact() {
+            local requirement="$1"
+            for attempt in 1 2 3 4 5; do
+              if python -m pip download \
+                --disable-pip-version-check \
+                --no-cache-dir \
+                --no-deps \
+                --only-binary=:all: \
+                --index-url "$INDEX_URL" \
+                --dest indexed \
+                "$requirement"; then
+                return
+              fi
+              if [ "$attempt" -lt 5 ]; then
+                sleep 15
+              fi
+            done
+            return 1
+          }
+          download_exact "vane-ai==$VANE_VERSION"
+          download_exact "vane-extension-lance==$LANCE_VERSION"
+          mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+          mapfile -t lance_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_lance-*.whl' -print)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#lance_wheels[@]}" -eq 1
+          python -m pip install \
+            "${base_wheels[0]}" \
+            "${lance_wheels[0]}" \
+            "grpcio>=1.42.0" \
+            pytest
+          python -m pip check
+
+      - name: Exercise the indexed provider through two Ray workers
+        run: |
+          .venv-vane-testpypi-ray/bin/python -m pytest -q \
+            python/tests/test_vane_distributed_scan.py::test_fragment_scan_uses_both_ray_execution_nodes

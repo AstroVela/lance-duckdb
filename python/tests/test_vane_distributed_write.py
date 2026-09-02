@@ -17,6 +17,8 @@ import vane
 from vane import runners
 from vane.runners.ray import set_runner_ray
 
+from packaged_dynamic_extension import load_packaged_dynamic_lance
+
 WORKER_COUNT = 2
 STABLE_ROW_IDS_DATASET = (
     Path(__file__).resolve().parents[2] / "test/data/stable_row_ids.lance"
@@ -34,13 +36,20 @@ def _connect():
             "autoload_known_extensions": "false",
         }
     )
-    connection.execute("LOAD lance")
+    dynamic_provider = os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY")
+    if dynamic_provider:
+        load_packaged_dynamic_lance(connection)
+    else:
+        connection.execute("LOAD lance")
     loaded, install_mode = connection.execute(
         "SELECT loaded, install_mode FROM duckdb_extensions() "
         "WHERE lower(extension_name) = 'lance'"
     ).fetchone()
     assert loaded is True
-    assert str(install_mode).upper() == "STATICALLY_LINKED"
+    if dynamic_provider:
+        assert str(install_mode).upper() == "NOT_INSTALLED"
+    else:
+        assert str(install_mode).upper() == "STATICALLY_LINKED"
     return connection
 
 
