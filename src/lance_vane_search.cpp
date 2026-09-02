@@ -488,13 +488,17 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
       state.authorized_task_ids[0] == ExpectedSearchTaskId(state) &&
       state.authorized_task_payloads[0] ==
           EncodeSearchTaskAssignment(ExpectedSearchTaskAssignment(state));
+  const bool has_no_task_assignment = state.authorized_task_ids.empty() &&
+                                      state.authorized_task_payloads.empty();
   if ((!state.worker_bind &&
        (state.task_assignment_applied || state.empty_assignment ||
         state.authorization_restricted ||
         !state.authorized_task_ids.empty())) ||
       (state.worker_bind &&
-       (!state.authorization_restricted || state.empty_assignment ||
-        !has_expected_task_assignment))) {
+       (!state.authorization_restricted ||
+        (state.empty_assignment &&
+         (!state.task_assignment_applied || !has_no_task_assignment)) ||
+        (!state.empty_assignment && !has_expected_task_assignment)))) {
     throw SerializationException(
         "Distributed Lance search assignment state is contradictory");
   }
@@ -910,6 +914,27 @@ void LanceVaneApplySearchTaskAssignments(
     throw InvalidInputException(
         "Distributed Lance search task assignments require a detached worker "
         "bind");
+  }
+  if (splits.empty()) {
+    // Vane removes the explicit EmptyExtension envelope before invoking the
+    // callback. The physical scan is suppressed after this state is installed.
+    if (state.task_assignment_applied) {
+      if (!state.empty_assignment) {
+        throw InvalidInputException(
+            "Distributed Lance search retry changed its task assignment");
+      }
+      return;
+    }
+    state.authorized_task_ids.clear();
+    state.authorized_task_payloads.clear();
+    state.empty_assignment = true;
+    state.task_assignment_applied = true;
+    ValidateGlobalSearchState(state, true);
+    return;
+  }
+  if (state.empty_assignment) {
+    throw InvalidInputException(
+        "Distributed Lance search retry changed its task assignment");
   }
   if (splits.size() != 1) {
     throw InvalidInputException(

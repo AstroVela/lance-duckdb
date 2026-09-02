@@ -79,9 +79,12 @@ search-node UUID, and the SHA-256 identity of the serialized global search
 state. Unknown variants, candidate variants not implemented by the current
 operator, malformed payload sizes, foreign state identities, and changed retry
 assignments fail closed. The worker executes Lance's global top-k operation,
-including hybrid reranking, against the frozen coordinator snapshot. Vane does
-not currently divide one search node into fragment candidates across multiple
-workers; that parallel execution model is tracked in
+including hybrid reranking, against the frozen coordinator snapshot. An
+explicit Vane no-work assignment is accepted and suppresses that worker scan
+without opening the snapshot; once applied, it cannot be interchanged with an
+executable assignment. Vane does not currently divide one search node into
+fragment candidates across multiple workers; that parallel execution model is
+tracked in
 [Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
 
 Before task creation, the coordinator freezes the source class, physical URI,

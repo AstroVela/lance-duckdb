@@ -2572,10 +2572,9 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
                     foreign_singleton,
                     "unauthorized SearchTaskAssignment identity",
                 ),
-                (
-                    _empty_search_task_assignment_batch(singleton),
-                    "requires exactly one preauthorized SearchTaskAssignment",
-                ),
+                # Vane passes an explicit no-work extension split to the
+                # callback as an empty assignment and suppresses execution.
+                (_empty_search_task_assignment_batch(singleton), None),
             )
             for attempt_id, (retry_batch, expected_error) in enumerate(
                 retry_assignments
