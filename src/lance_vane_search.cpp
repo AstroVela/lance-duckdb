@@ -119,8 +119,17 @@ static string LanceVaneSha256(const string &value) {
 static void
 ValidateAndMarkSearchPlanPayloads(LanceVaneGlobalSearchState &state) {
   auto *index_plan = reinterpret_cast<const uint8_t *>(state.index_plan.data());
-  if (lance_vane_validate_search_index_plan(index_plan,
-                                            state.index_plan.size()) != 0) {
+  auto *vector_column = state.arguments.vector_column.empty()
+                            ? nullptr
+                            : state.arguments.vector_column.c_str();
+  auto *text_column = state.arguments.text_column.empty()
+                          ? nullptr
+                          : state.arguments.text_column.c_str();
+  if (lance_vane_validate_search_index_plan(
+          index_plan, state.index_plan.size(), state.dataset_version,
+          state.dataset_generation_id.c_str(),
+          static_cast<uint8_t>(state.arguments.kind), vector_column,
+          text_column, state.arguments.use_index ? 1 : 0) != 0) {
     throw SerializationException(
         "Distributed Lance SearchIndexPlan is malformed" +
         LanceFormatErrorSuffix());

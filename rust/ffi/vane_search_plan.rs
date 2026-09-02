@@ -277,6 +277,9 @@ impl SearchIndexPlan {
         if self.dataset_version == 0 || self.generation.is_empty() {
             bail!("SearchIndexPlan is missing its fixed snapshot identity");
         }
+        if self.vector.is_none() && self.fts.is_none() {
+            bail!("SearchIndexPlan has no search branch");
+        }
         validate_sorted_unique(&self.fragments, "fragment ids")?;
         for (name, branch) in [("vector", &self.vector), ("fts", &self.fts)] {
             let Some(branch) = branch else {
@@ -341,6 +344,47 @@ impl SearchIndexPlan {
         Ok(())
     }
 
+    pub(crate) fn validate_admission(
+        &self,
+        dataset_version: u64,
+        generation: &str,
+        kind: SearchKind,
+        vector_column: Option<&str>,
+        text_column: Option<&str>,
+        use_vector_index: bool,
+    ) -> Result<()> {
+        if self.dataset_version != dataset_version {
+            bail!("SearchIndexPlan dataset version does not match the admitted search");
+        }
+        if self.generation != generation {
+            bail!("SearchIndexPlan dataset generation does not match the admitted search");
+        }
+
+        match kind {
+            SearchKind::Vector if self.vector.is_none() || self.fts.is_some() => {
+                bail!("SearchIndexPlan branch set does not describe vector search")
+            }
+            SearchKind::Fts if self.vector.is_some() || self.fts.is_none() => {
+                bail!("SearchIndexPlan branch set does not describe FTS")
+            }
+            SearchKind::Hybrid if self.vector.is_none() || self.fts.is_none() => {
+                bail!("SearchIndexPlan branch set does not describe hybrid search")
+            }
+            _ => {}
+        }
+
+        if let Some(branch) = &self.vector {
+            validate_admitted_branch_name(branch, vector_column, "vector")?;
+            if branch.use_index && !use_vector_index {
+                bail!("SearchIndexPlan vector index decision differs from the search arguments");
+            }
+        }
+        if let Some(branch) = &self.fts {
+            validate_admitted_branch_name(branch, text_column, "FTS")?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn fragments(
         &self,
         dataset: &Dataset,
@@ -361,26 +405,15 @@ impl SearchIndexPlan {
         text_column: Option<&str>,
         use_vector_index: bool,
     ) -> Result<ValidatedSearchIndexPlan> {
-        if self.dataset_version != dataset.version_id() {
-            bail!("SearchIndexPlan dataset version does not match the worker snapshot");
-        }
-        if self.generation != generation {
-            bail!("SearchIndexPlan dataset generation does not match the worker snapshot");
-        }
+        self.validate_admission(
+            dataset.version_id(),
+            generation,
+            kind,
+            vector_column,
+            text_column,
+            use_vector_index,
+        )?;
         self.fragments(dataset)?;
-
-        match kind {
-            SearchKind::Vector if self.vector.is_none() || self.fts.is_some() => {
-                bail!("SearchIndexPlan branch set does not describe vector search")
-            }
-            SearchKind::Fts if self.vector.is_some() || self.fts.is_none() => {
-                bail!("SearchIndexPlan branch set does not describe FTS")
-            }
-            SearchKind::Hybrid if self.vector.is_none() || self.fts.is_none() => {
-                bail!("SearchIndexPlan branch set does not describe hybrid search")
-            }
-            _ => {}
-        }
 
         // `load_indices` can return only the current logical-index summary.
         // SearchIndexPlan freezes individual segments, so re-read every frozen logical
@@ -409,11 +442,6 @@ impl SearchIndexPlan {
         let vector_segments = match &self.vector {
             Some(branch) => {
                 validate_branch_identity(dataset, branch, vector_column, "vector")?;
-                if branch.use_index && !use_vector_index {
-                    bail!(
-                        "SearchIndexPlan vector index decision differs from the search arguments"
-                    );
-                }
                 validate_branch_metadata(branch, &by_uuid, &self.fragments)?
             }
             None => Vec::new(),
@@ -575,6 +603,19 @@ fn branch_from_metadata(
         bail!("selected index metadata does not contain field {field_id}");
     }
     Ok(result)
+}
+
+fn validate_admitted_branch_name(
+    branch: &BranchPlan,
+    expected_name: Option<&str>,
+    branch_name: &str,
+) -> Result<()> {
+    let expected_name =
+        expected_name.ok_or_else(|| anyhow!("missing admitted {branch_name} column"))?;
+    if branch.field_name != expected_name {
+        bail!("SearchIndexPlan {branch_name} field name does not match the admitted search");
+    }
+    Ok(())
 }
 
 fn validate_branch_identity(
@@ -917,6 +958,75 @@ mod tests {
         let mut plan = plan(Some(branch(4, "vector")), None);
         plan.fragments = vec![3, 1];
         assert!(SearchIndexPlan::decode(&plan.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn search_index_plan_rejects_branchless_and_admission_mismatches() {
+        assert!(SearchIndexPlan::decode(&plan(None, None).encode().unwrap()).is_err());
+
+        let vector =
+            SearchIndexPlan::decode(&plan(Some(branch(4, "vector")), None).encode().unwrap())
+                .unwrap();
+        assert!(vector
+            .validate_admission(
+                7,
+                "generation",
+                SearchKind::Vector,
+                Some("vector"),
+                None,
+                false,
+            )
+            .is_ok());
+        assert!(vector
+            .validate_admission(
+                8,
+                "generation",
+                SearchKind::Vector,
+                Some("vector"),
+                None,
+                false,
+            )
+            .is_err());
+        assert!(vector
+            .validate_admission(
+                7,
+                "other-generation",
+                SearchKind::Vector,
+                Some("vector"),
+                None,
+                false,
+            )
+            .is_err());
+        assert!(vector
+            .validate_admission(7, "generation", SearchKind::Fts, None, Some("text"), false,)
+            .is_err());
+        assert!(vector
+            .validate_admission(
+                7,
+                "generation",
+                SearchKind::Vector,
+                Some("other-vector"),
+                None,
+                false,
+            )
+            .is_err());
+
+        let indexed = SearchIndexPlan::decode(
+            &plan(Some(indexed_branch(4, "vector", 1)), None)
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(indexed
+            .validate_admission(
+                7,
+                "generation",
+                SearchKind::Vector,
+                Some("vector"),
+                None,
+                false,
+            )
+            .is_err());
     }
 
     #[test]

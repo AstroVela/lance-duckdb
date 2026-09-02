@@ -415,15 +415,55 @@ unsafe fn parse_index_plan<'a>(data: *const u8, len: usize) -> FfiResult<&'a [u8
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_vane_validate_search_index_plan(data: *const u8, len: usize) -> i32 {
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_vane_validate_search_index_plan(
+    data: *const u8,
+    len: usize,
+    dataset_version: u64,
+    generation: *const c_char,
+    search_kind: u8,
+    vector_column: *const c_char,
+    text_column: *const c_char,
+    use_vector_index: u8,
+) -> i32 {
     let result = (|| -> FfiResult<()> {
         let bytes = unsafe { parse_index_plan(data, len)? };
-        SearchIndexPlan::decode(bytes).map_err(|err| {
+        let generation = unsafe { cstr_to_str(generation, "search generation")? };
+        let kind = SearchKind::try_from(search_kind).map_err(|err| {
             FfiError::new(
                 ErrorCode::InvalidArgument,
-                format!("decode SearchIndexPlan: {err}"),
+                format!("SearchIndexPlan search kind: {err}"),
             )
         })?;
+        let vector_column = unsafe { optional_cstr(vector_column, "vector column")? };
+        let text_column = unsafe { optional_cstr(text_column, "text column")? };
+        let use_vector_index = match use_vector_index {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "SearchIndexPlan use_vector_index is not boolean",
+                ));
+            }
+        };
+        SearchIndexPlan::decode(bytes)
+            .and_then(|plan| {
+                plan.validate_admission(
+                    dataset_version,
+                    generation,
+                    kind,
+                    vector_column,
+                    text_column,
+                    use_vector_index,
+                )
+            })
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("validate SearchIndexPlan admission: {err}"),
+                )
+            })?;
         Ok(())
     })();
     match result {
@@ -1212,6 +1252,7 @@ fn cmp_desc_f32(left: f32, right: f32) -> Ordering {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ffi::CString;
 
     use super::*;
 
@@ -1296,20 +1337,63 @@ mod tests {
     fn search_index_plan_ffi_validator_rejects_truncation_and_trailing_bytes() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&7_u64.to_le_bytes());
         bytes.extend_from_slice(&1_u32.to_le_bytes());
         bytes.push(b'g');
         bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&4_i32.to_le_bytes());
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(b"vector");
         bytes.push(0);
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes.push(0);
 
+        let generation = CString::new("g").unwrap();
+        let other_generation = CString::new("other").unwrap();
+        let vector_column = CString::new("vector").unwrap();
+        let other_vector_column = CString::new("other_vector").unwrap();
+        let validate = |candidate: &[u8],
+                        dataset_version: u64,
+                        generation: &CString,
+                        kind: SearchKind,
+                        vector_column: Option<&CString>,
+                        use_vector_index: u8| unsafe {
+            lance_vane_validate_search_index_plan(
+                candidate.as_ptr(),
+                candidate.len(),
+                dataset_version,
+                generation.as_ptr(),
+                kind as u8,
+                vector_column.map_or(ptr::null(), |column| column.as_ptr()),
+                ptr::null(),
+                use_vector_index,
+            )
+        };
+
         assert_eq!(
-            unsafe { lance_vane_validate_search_index_plan(bytes.as_ptr(), bytes.len()) },
+            validate(
+                &bytes,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
             0
         );
         for len in 0..bytes.len() {
             assert_ne!(
-                unsafe { lance_vane_validate_search_index_plan(bytes.as_ptr(), len) },
+                validate(
+                    &bytes[..len],
+                    7,
+                    &generation,
+                    SearchKind::Vector,
+                    Some(&vector_column),
+                    0,
+                ),
                 0
             );
         }
@@ -1317,11 +1401,73 @@ mod tests {
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert_ne!(
-            unsafe { lance_vane_validate_search_index_plan(trailing.as_ptr(), trailing.len()) },
+            validate(
+                &trailing,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
             0
         );
         assert_eq!(
-            unsafe { lance_vane_validate_search_index_plan(bytes.as_ptr(), bytes.len()) },
+            validate(
+                &bytes,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
+            0
+        );
+        assert_ne!(
+            validate(
+                &bytes,
+                8,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
+            0
+        );
+        assert_ne!(
+            validate(
+                &bytes,
+                7,
+                &other_generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
+            0
+        );
+        assert_ne!(
+            validate(&bytes, 7, &generation, SearchKind::Fts, None, 0,),
+            0
+        );
+        assert_ne!(
+            validate(
+                &bytes,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&other_vector_column),
+                0,
+            ),
+            0
+        );
+        assert_ne!(
+            validate(
+                &bytes,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                2,
+            ),
             0
         );
     }
