@@ -899,8 +899,17 @@ LanceVaneCreateSearchTaskAssignment(const LanceVaneGlobalSearchState &state) {
 
 void LanceVanePrepareSearchWorkerBindState(LanceVaneGlobalSearchState &state) {
   ValidateGlobalSearchState(state, true);
-  if (!state.valid || !state.finalized || state.worker_bind ||
-      state.task_assignment_applied || state.empty_assignment ||
+  if (!state.valid || !state.finalized) {
+    throw InvalidInputException(
+        "Distributed Lance search cannot prepare a contradictory worker bind");
+  }
+  // Vane may translate a serialized detached worker plan again before task
+  // assignment. Its already-restricted bind is the portable source of truth;
+  // preserving it also keeps an applied no-work assignment fail closed.
+  if (state.worker_bind) {
+    return;
+  }
+  if (state.task_assignment_applied || state.empty_assignment ||
       state.authorization_restricted || !state.authorized_task_ids.empty() ||
       !state.authorized_task_payloads.empty()) {
     throw InvalidInputException(

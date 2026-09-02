@@ -329,6 +329,11 @@ impl SearchIndexPlan {
                     }
                 }
             }
+            if covered_fragments(&branch.selected, &self.fragments) != branch.covered_fragments {
+                bail!(
+                    "SearchIndexPlan {name} fragment coverage does not match its selected index segments"
+                );
+            }
             let mut uuids = branch
                 .selected
                 .iter()
@@ -1070,6 +1075,14 @@ mod tests {
         let mut overlap = indexed_branch(4, "vector", 1);
         overlap.uncovered_fragments = vec![1, 3];
         assert!(SearchIndexPlan::decode(&plan(Some(overlap), None).encode().unwrap()).is_err());
+
+        let mut contradictory_coverage = indexed_branch(4, "vector", 1);
+        contradictory_coverage.covered_fragments = vec![3];
+        contradictory_coverage.uncovered_fragments = vec![1];
+        assert!(SearchIndexPlan::decode(
+            &plan(Some(contradictory_coverage), None).encode().unwrap()
+        )
+        .is_err());
     }
 
     #[test]

@@ -1312,6 +1312,9 @@ static vector<DistributedScanSplit> LancePlanDistributedKnnSearch(
     const TableFunctionDistributedScanPlanningInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto state = LanceBuildKnnVaneState(input, bind_data);
+  if (state.empty_assignment) {
+    return {};
+  }
   auto split = LanceVaneCreateSearchTaskAssignment(state);
   if (state.authorization_restricted) {
     if (state.authorized_task_ids != vector<string>{split.split_id} ||
@@ -2419,6 +2422,9 @@ static vector<DistributedScanSplit> LancePlanDistributedSharedSearch(
     const TableFunctionDistributedScanPlanningInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
   auto state = LanceBuildSharedVaneState(input, bind_data);
+  if (state.empty_assignment) {
+    return {};
+  }
   auto split = LanceVaneCreateSearchTaskAssignment(state);
   if (state.authorization_restricted) {
     if (state.authorized_task_ids != vector<string>{split.split_id} ||

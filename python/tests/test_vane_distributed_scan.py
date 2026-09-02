@@ -2476,6 +2476,59 @@ def test_namespace_outer_filters_remain_after_top_k(ray_runner) -> None:
         connection.close()
 
 
+def test_global_search_worker_bind_retranslation_preserves_assignment() -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    searches = (
+        (
+            "vector",
+            "SELECT id FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 3, use_index = false)",
+        ),
+        (
+            "fts",
+            f"SELECT id FROM lance_fts({path_sql}, 'text', 'puppy', k = 3)",
+        ),
+        (
+            "hybrid",
+            "SELECT id FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, use_index = false)",
+        ),
+    )
+
+    connection = _connect()
+    try:
+        for name, sql in searches:
+            physical = _physical_plan(connection, connection.sql(sql))
+            with _capture_worker_tasks(physical, connection) as tasks:
+                assert len(tasks) == 1, name
+                task = tasks[0]
+                assigned_batches = [
+                    bytes(entry["data"])
+                    for entry in task.Inputs().values()
+                    if entry["kind"] == "scan_split_batch"
+                ]
+                assert len(assigned_batches) == 1, name
+
+                detached = task.plan()
+                replanned_batches = [
+                    bytes(batch)
+                    for batches in detached.scan_split_batch_map().values()
+                    for batch in batches
+                ]
+                assert replanned_batches == assigned_batches, name
+                metadata = detached.collect_query_resource_graph_metadata(
+                    conn=connection
+                )
+                assert metadata["nodes"], name
+    finally:
+        connection.close()
+
+
 def test_two_global_search_nodes_keep_independent_singleton_tasks(ray_runner) -> None:
     path = (
         Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
@@ -2602,6 +2655,23 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
                         assert (
                             retry_result.completion_status == expected_completion_status
                         )
+                        if expected_completion_status == "empty":
+                            replanned_batches = [
+                                bytes(batch)
+                                for batches in retry_plan.scan_split_batch_map().values()
+                                for batch in batches
+                            ]
+                            assert len(replanned_batches) == 1
+                            assert [
+                                split_id
+                                for split_id, _, _ in vane.ray_cxx.split_scan_split_batch(
+                                    replanned_batches[0]
+                                )
+                            ] == ["empty"]
+                            metadata = retry_plan.collect_query_resource_graph_metadata(
+                                conn=retry_cursor
+                            )
+                            assert metadata["nodes"]
                     else:
                         with pytest.raises(Exception, match=expected_error):
                             _execute_captured_worker_task(

@@ -82,9 +82,10 @@ assignments fail closed. The worker executes Lance's global top-k operation,
 including hybrid reranking, against the frozen coordinator snapshot. An
 explicit Vane no-work assignment is accepted and suppresses that worker scan
 without opening the snapshot; once applied, it cannot be interchanged with an
-executable assignment. Vane does not currently divide one search node into
-fragment candidates across multiple workers; that parallel execution model is
-tracked in
+executable assignment. A valid detached worker bind remains idempotent when
+Vane translates its serialized plan again, including the no-work state. Vane
+does not currently divide one search node into fragment candidates across
+multiple workers; that parallel execution model is tracked in
 [Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
 
 Before task creation, the coordinator freezes the source class, physical URI,
