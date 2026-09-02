@@ -2514,7 +2514,7 @@ def test_global_search_worker_bind_retranslation_preserves_assignment() -> None:
                 ]
                 assert len(assigned_batches) == 1, name
 
-                detached = task.plan()
+                detached = task.plan().clone(connection)
                 replanned_batches = [
                     bytes(batch)
                     for batches in detached.scan_split_batch_map().values()
