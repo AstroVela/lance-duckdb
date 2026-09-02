@@ -1417,6 +1417,7 @@ def _write_dataset(
 def _write_vector_candidate_dataset(connection, path: str | Path) -> None:
     connection.execute(
         "COPY (SELECT i::BIGINT AS id, (i % 3 = 1) AS keep, "
+        "struct_pack(label := i::BIGINT, even := (i % 2 = 0)) AS payload, "
         f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> "
         "CASE WHEN x = 0 THEN (i % 8)::FLOAT ELSE 0.0::FLOAT END)"
         f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}] AS vec "
@@ -2377,6 +2378,12 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
                 "ORDER BY _distance",
             ),
             (
+                "nested-projection",
+                "SELECT payload.label, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
+                "ORDER BY _distance, payload.label",
+            ),
+            (
                 "prefilter",
                 "SELECT id, keep, _distance FROM lance_vector_search("
                 f"{path_sql}, 'vec', {query}, k = 33, prefilter = true, "
@@ -2404,6 +2411,8 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
                 assert [row[1] for row in expected] == [24, 32, 40]
             elif name == "distance-only":
                 assert expected == [(0.0,), (0.0,), (0.0,)]
+            elif name == "nested-projection":
+                assert [row[0] for row in expected] == [24, 32, 40]
             elif name == "empty-prefilter":
                 assert expected == []
 

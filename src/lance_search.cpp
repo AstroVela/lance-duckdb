@@ -1486,6 +1486,10 @@ struct LanceVectorMaterializeLocalState : public ArrowScanLocalState {
   explicit LanceVectorMaterializeLocalState(
       unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &context)
       : ArrowScanLocalState(std::move(current_chunk), context) {}
+
+  DataChunk materialized_columns;
+  vector<ColumnIndex> output_columns;
+  vector<column_t> output_arrow_column_ids;
 };
 
 static unique_ptr<FunctionData>
@@ -1495,15 +1499,15 @@ LanceVectorMaterializeBind(ClientContext &, TableFunctionBindInput &,
       "__lance_vector_search_materialize is an internal table function");
 }
 
-static vector<column_t>
-LanceVectorMaterializeColumnIds(const LanceVaneGlobalSearchState &state) {
+static vector<ColumnIndex>
+LanceVectorMaterializeColumns(const LanceVaneGlobalSearchState &state) {
   if (state.output_names.empty() ||
       state.output_names.size() != state.output_types.size() ||
       state.output_names.back() != "_distance") {
     throw SerializationException(
         "Distributed Lance vector materialization schema is malformed");
   }
-  auto append_column = [&](vector<column_t> &result,
+  auto append_column = [&](vector<ColumnIndex> &result,
                            const ColumnIndex &column) {
     if (!column.HasPrimaryIndex() || column.IsVirtualColumn()) {
       throw SerializationException(
@@ -1515,10 +1519,10 @@ LanceVectorMaterializeColumnIds(const LanceVaneGlobalSearchState &state) {
       throw SerializationException(
           "Distributed Lance vector materialization column is malformed");
     }
-    result.push_back(column_id);
+    result.push_back(column);
   };
 
-  vector<column_t> result;
+  vector<ColumnIndex> result;
   if (state.projection_ids.empty()) {
     result.reserve(state.column_ids.size());
     for (auto &column : state.column_ids) {
@@ -1541,18 +1545,28 @@ struct LanceVectorMaterializeProjection {
   vector<string> take_columns;
   vector<string> arrow_names;
   vector<LogicalType> arrow_types;
+  vector<ColumnIndex> output_columns;
   vector<column_t> arrow_column_ids;
 };
 
 static LanceVectorMaterializeProjection
 LanceBuildVectorMaterializeProjection(const LanceVaneGlobalSearchState &state) {
-  auto output_column_ids = LanceVectorMaterializeColumnIds(state);
+  auto output_columns = LanceVectorMaterializeColumns(state);
   auto distance_column_id = state.output_names.size() - 1;
   LanceVectorMaterializeProjection result;
   unordered_map<column_t, column_t> arrow_positions;
-  result.arrow_column_ids.reserve(output_column_ids.size());
-  for (auto column_id : output_column_ids) {
+  // Preserve every DuckDB child path for the output mapping. Only the
+  // top-level physical columns sent to Lance take_rows are deduplicated.
+  result.output_columns = output_columns;
+  result.arrow_column_ids.reserve(output_columns.size());
+  for (auto &column : output_columns) {
+    auto column_id = column.GetPrimaryIndex();
     if (column_id == distance_column_id) {
+      if (column.HasChildren()) {
+        throw SerializationException(
+            "Distributed Lance vector materialization distance column has "
+            "an invalid child path");
+      }
       continue;
     }
     if (column_id > distance_column_id) {
@@ -1572,7 +1586,8 @@ LanceBuildVectorMaterializeProjection(const LanceVaneGlobalSearchState &state) {
       NumericCast<column_t>(result.arrow_names.size());
   result.arrow_names.push_back(state.output_names[distance_column_id]);
   result.arrow_types.push_back(state.output_types[distance_column_id]);
-  for (auto column_id : output_column_ids) {
+  for (auto &column : output_columns) {
+    auto column_id = column.GetPrimaryIndex();
     if (column_id == distance_column_id) {
       result.arrow_column_ids.push_back(distance_arrow_position);
       continue;
@@ -1599,17 +1614,66 @@ static void LancePrepareVectorMaterializeBindData(
 
 static vector<LogicalType>
 LanceVectorMaterializeOutputTypes(const LanceVaneGlobalSearchState &state) {
-  auto column_ids = LanceVectorMaterializeColumnIds(state);
+  auto columns = LanceVectorMaterializeColumns(state);
   vector<LogicalType> result;
-  result.reserve(column_ids.size());
-  for (auto column_id : column_ids) {
+  result.reserve(columns.size());
+  for (auto &column : columns) {
+    auto column_id = column.GetPrimaryIndex();
     if (column_id >= state.output_types.size()) {
       throw SerializationException(
           "Distributed Lance vector materialization schema is malformed");
     }
-    result.push_back(state.output_types[column_id]);
+    if (column.IsPushdownExtract()) {
+      if (!column.HasType() || !column.HasChildren()) {
+        throw SerializationException(
+            "Distributed Lance vector materialization extract is malformed");
+      }
+      result.push_back(column.GetScanType());
+    } else {
+      result.push_back(state.output_types[column_id]);
+    }
   }
   return result;
+}
+
+static Vector &LanceVectorMaterializeOutputVector(Vector &root,
+                                                  const ColumnIndex &column) {
+  if (!column.IsPushdownExtract()) {
+    // Child indexes on a normal ColumnIndex are optional DuckDB pruning hints.
+    // The projection above the scan still expects the complete root value.
+    return root;
+  }
+
+  auto *current = &root;
+  auto *path = &column;
+  while (path->HasChildren()) {
+    if (path->ChildIndexCount() != 1 ||
+        current->GetType().id() != LogicalTypeId::STRUCT) {
+      throw SerializationException(
+          "Distributed Lance vector materialization extract path is "
+          "malformed");
+    }
+    auto &child = path->GetChildIndex(0);
+    if (!child.HasPrimaryIndex() || child.IsVirtualColumn()) {
+      throw SerializationException(
+          "Distributed Lance vector materialization extract path must use "
+          "primary struct indexes");
+    }
+    auto child_id = child.GetPrimaryIndex();
+    auto &entries = StructVector::GetEntries(*current);
+    if (child_id >= entries.size()) {
+      throw SerializationException(
+          "Distributed Lance vector materialization extract path is out of "
+          "range");
+    }
+    current = entries[child_id].get();
+    path = &child;
+  }
+  if (!column.HasType() || current->GetType() != column.GetScanType()) {
+    throw SerializationException(
+        "Distributed Lance vector materialization extract type is malformed");
+  }
+  return *current;
 }
 
 static unique_ptr<GlobalTableFunctionState>
@@ -1638,9 +1702,16 @@ LanceVectorMaterializeInitLocal(ExecutionContext &context,
   auto chunk = make_uniq<ArrowArrayWrapper>();
   auto result = make_uniq<LanceVectorMaterializeLocalState>(std::move(chunk),
                                                             context.client);
-  result->column_ids =
-      LanceBuildVectorMaterializeProjection(bind_data.vane_state)
-          .arrow_column_ids;
+  auto projection = LanceBuildVectorMaterializeProjection(bind_data.vane_state);
+  result->output_columns = std::move(projection.output_columns);
+  result->output_arrow_column_ids = std::move(projection.arrow_column_ids);
+  result->column_ids.reserve(projection.arrow_types.size());
+  for (idx_t column_id = 0; column_id < projection.arrow_types.size();
+       column_id++) {
+    result->column_ids.push_back(column_id);
+  }
+  result->materialized_columns.Initialize(context.client,
+                                          projection.arrow_types);
   return result;
 }
 
@@ -1730,10 +1801,33 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &,
 
   local.chunk = std::move(new_chunk);
   local.Reset();
-  output.SetCardinality(input.size());
+  local.materialized_columns.Reset();
+  local.materialized_columns.SetCardinality(input.size());
   ArrowTableFunction::ArrowToDuckDB(local, bind_data.arrow_table.GetColumns(),
-                                    output, false);
+                                    local.materialized_columns, false);
   local.chunk_offset += input.size();
+
+  if (output.ColumnCount() != local.output_columns.size() ||
+      output.ColumnCount() != local.output_arrow_column_ids.size()) {
+    throw InternalException(
+        "Distributed Lance vector materialization output mapping changed");
+  }
+  output.SetCardinality(input.size());
+  for (idx_t output_id = 0; output_id < output.ColumnCount(); output_id++) {
+    auto arrow_id = local.output_arrow_column_ids[output_id];
+    if (arrow_id >= local.materialized_columns.ColumnCount()) {
+      throw InternalException(
+          "Distributed Lance vector materialization output is out of range");
+    }
+    auto &source = local.materialized_columns.data[arrow_id];
+    auto &selected = LanceVectorMaterializeOutputVector(
+        source, local.output_columns[output_id]);
+    if (selected.GetType() != output.data[output_id].GetType()) {
+      throw SerializationException(
+          "Distributed Lance vector materialization output type changed");
+    }
+    output.data[output_id].Reference(selected);
+  }
   output.Verify();
   return OperatorResultType::NEED_MORE_INPUT;
 }
