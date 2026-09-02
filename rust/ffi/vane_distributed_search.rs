@@ -1060,12 +1060,6 @@ pub unsafe extern "C" fn lance_vane_take_vector_rows(
                 "vector materialization requires at least one row",
             ));
         }
-        if distances.iter().any(|distance| !distance.is_finite()) {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                "vector materialization received a non-finite distance",
-            ));
-        }
         let mut unique_columns = HashSet::with_capacity(columns.len());
         for column in &columns {
             if column == DISTANCE_COLUMN

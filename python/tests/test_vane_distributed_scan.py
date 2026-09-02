@@ -1437,6 +1437,14 @@ def _zero_vector_sql() -> str:
     )
 
 
+def _overflow_vector_sql() -> str:
+    return (
+        f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), "
+        "x -> CASE WHEN x = 0 THEN 3e20::FLOAT ELSE 0.0::FLOAT END)"
+        f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}]"
+    )
+
+
 def _physical_plan(connection, relation):
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation, f"lance-distributed-scan-{uuid.uuid4()}"
@@ -2349,6 +2357,7 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
     path = tmp_path / "vector_candidates.lance"
     path_sql = _sql_literal(path)
     query = _zero_vector_sql()
+    overflow_query = _overflow_vector_sql()
     try:
         _write_vector_candidate_dataset(connection, path)
         connection.execute(
@@ -2385,6 +2394,12 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
                 "ORDER BY _distance, id",
             ),
             (
+                "non-finite-distance",
+                "SELECT id, isinf(_distance) FROM lance_vector_search("
+                f"{path_sql}, 'vec', {overflow_query}, k = 3, "
+                "use_index = false) ORDER BY id",
+            ),
+            (
                 "prefilter",
                 "SELECT id, keep, _distance FROM lance_vector_search("
                 f"{path_sql}, 'vec', {query}, k = 33, prefilter = true, "
@@ -2415,6 +2430,8 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
             elif name == "nested-projection":
                 assert [row[0] for row in expected] == [24, 32, 40]
                 assert [row[1] for row in expected] == [None, 32, 40]
+            elif name == "non-finite-distance":
+                assert expected == [(1, True), (2, True), (3, True)]
             elif name == "empty-prefilter":
                 assert expected == []
 

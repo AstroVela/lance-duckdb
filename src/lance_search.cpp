@@ -1760,12 +1760,13 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &,
   for (idx_t row = 0; row < input.size(); row++) {
     auto row_id_index = row_id_format.sel->get_index(row);
     auto distance_index = distance_format.sel->get_index(row);
-    if (!row_id_format.validity.RowIsValid(row_id_index) ||
-        !distance_format.validity.RowIsValid(distance_index) ||
-        !std::isfinite(distance_data[distance_index])) {
+    if (!row_id_format.validity.RowIsValid(row_id_index)) {
       throw InvalidInputException(
-          "Distributed Lance vector materialization received an invalid "
-          "candidate");
+          "Distributed Lance vector materialization received a NULL row id");
+    }
+    if (!distance_format.validity.RowIsValid(distance_index)) {
+      throw InvalidInputException(
+          "Distributed Lance vector materialization received a NULL distance");
     }
     auto row_id = row_id_data[row_id_index];
     if (!global.seen_row_ids.insert(row_id).second) {
