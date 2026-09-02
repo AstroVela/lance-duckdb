@@ -10,9 +10,16 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
+#include "duckdb/execution/external_block.hpp"
 #include "duckdb/function/distributed_table_function.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_top_n.hpp"
 #endif
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -48,6 +55,9 @@
 #include <limits>
 #include <mutex>
 #include <unordered_map>
+#ifdef LANCE_VANE_DISTRIBUTED
+#include <unordered_set>
+#endif
 
 namespace duckdb {
 
@@ -831,6 +841,15 @@ LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     global.filter_pushed_down = bind_data.vane_state.filter_pushed_down;
     return state;
   }
+  if (bind_data.vane_state.execution_variant ==
+      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+    global.vane_dataset_entry = LanceVaneOpenSearchSnapshotForMaterialization(
+        context, bind_data.vane_state);
+    global.vane_dataset = global.vane_dataset_entry->Handle();
+    global.lance_filter_ir = bind_data.vane_state.final_filter_ir;
+    global.filter_pushed_down = bind_data.vane_state.filter_pushed_down;
+    return state;
+  }
 #endif
 
   if (bind_data.namespace_backed) {
@@ -888,13 +907,15 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   }
 
 #ifdef LANCE_VANE_DISTRIBUTED
-  if (bind_data.vane_state.worker_bind) {
+  if (bind_data.vane_state.worker_bind ||
+      bind_data.vane_state.execution_variant ==
+          LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
     auto &search = bind_data.vane_state;
     const uint8_t *filter_ir =
         search.final_filter_ir.empty()
             ? nullptr
             : reinterpret_cast<const uint8_t *>(search.final_filter_ir.data());
-    auto create_stream = [&](const uint8_t *ir, size_t ir_len) {
+    auto create_final_stream = [&](const uint8_t *ir, size_t ir_len) {
       return lance_vane_create_knn_stream_ir(
           global.vane_dataset, search.dataset_generation_id.c_str(),
           search.arguments.vector_column.c_str(),
@@ -911,12 +932,33 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
           reinterpret_cast<const uint8_t *>(search.index_plan.data()),
           search.index_plan.size());
     };
-    result->stream = create_stream(filter_ir, search.final_filter_ir.size());
-    if (!result->stream && filter_ir && !search.arguments.prefilter) {
-      global.filter_pushdown_fallbacks.fetch_add(1);
-      global.filter_pushed_down = false;
-      result->filter_pushed_down = false;
-      result->stream = create_stream(nullptr, 0);
+    if (search.execution_variant ==
+        LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+      auto &fragment_ids = search.worker_bind ? search.selected_fragment_ids
+                                              : search.fragment_ids;
+      result->stream = lance_vane_create_vector_candidate_stream_ir(
+          global.vane_dataset, search.dataset_generation_id.c_str(),
+          search.arguments.vector_column.c_str(),
+          search.arguments.vector_query.data(),
+          search.arguments.vector_query.size(), search.arguments.k, filter_ir,
+          search.final_filter_ir.size(),
+          search.namespace_filter_plan.empty()
+              ? nullptr
+              : reinterpret_cast<const uint8_t *>(
+                    search.namespace_filter_plan.data()),
+          search.namespace_filter_plan.size(),
+          search.arguments.prefilter ? 1 : 0,
+          reinterpret_cast<const uint8_t *>(search.index_plan.data()),
+          search.index_plan.size(), fragment_ids.data(), fragment_ids.size());
+    } else {
+      result->stream =
+          create_final_stream(filter_ir, search.final_filter_ir.size());
+      if (!result->stream && filter_ir && !search.arguments.prefilter) {
+        global.filter_pushdown_fallbacks.fetch_add(1);
+        global.filter_pushed_down = false;
+        result->filter_pushed_down = false;
+        result->stream = create_final_stream(nullptr, 0);
+      }
     }
     if (!result->stream) {
       throw IOException(
@@ -1312,18 +1354,7 @@ static vector<DistributedScanSplit> LancePlanDistributedKnnSearch(
     const TableFunctionDistributedScanPlanningInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto state = LanceBuildKnnVaneState(input, bind_data);
-  if (state.empty_assignment) {
-    return {};
-  }
-  auto split = LanceVaneCreateSearchTaskAssignment(state);
-  if (state.authorization_restricted) {
-    if (state.authorized_task_ids != vector<string>{split.split_id} ||
-        state.authorized_task_payloads != vector<string>{split.payload}) {
-      throw InvalidInputException(
-          "Distributed Lance vector search clone changed authorization");
-    }
-  }
-  return {std::move(split)};
+  return LanceVaneCreateSearchTaskAssignments(state);
 }
 
 static unique_ptr<FunctionData> LanceCreateDistributedKnnWorkerBind(
@@ -1346,8 +1377,14 @@ static unique_ptr<FunctionData> LanceCreateDistributedKnnWorkerBind(
   result->explain_verbose = state.arguments.explain_verbose;
   result->namespace_backed = false;
   result->namespace_filter = state.arguments.namespace_filter;
-  result->names = state.output_names;
-  result->types = state.output_types;
+  if (state.execution_variant ==
+      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+    result->names = {"_rowid", "_distance"};
+    result->types = {LogicalType::UBIGINT, LogicalType::FLOAT};
+  } else {
+    result->names = state.output_names;
+    result->types = state.output_types;
+  }
   result->vane_overload = state.arguments.overload;
   result->vane_state = std::move(state);
   return result;
@@ -1394,8 +1431,14 @@ static unique_ptr<FunctionData> LanceKnnDeserialize(Deserializer &deserializer,
   result->use_index = state.arguments.use_index;
   result->explain_verbose = state.arguments.explain_verbose;
   result->namespace_filter = state.arguments.namespace_filter;
-  result->names = state.output_names;
-  result->types = state.output_types;
+  if (state.execution_variant ==
+      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+    result->names = {"_rowid", "_distance"};
+    result->types = {LogicalType::UBIGINT, LogicalType::FLOAT};
+  } else {
+    result->names = state.output_names;
+    result->types = state.output_types;
+  }
   result->vane_overload = state.arguments.overload;
   result->vane_state = std::move(state);
   auto &context = deserializer.Get<ClientContext &>();
@@ -1409,6 +1452,434 @@ LanceKnnDistributedSearchCallbacks() {
   return LanceVaneSearchTaskCallbacks(LancePlanDistributedKnnSearch,
                                       LanceCreateDistributedKnnWorkerBind,
                                       LanceApplyDistributedKnnSearch);
+}
+
+struct LanceVectorMaterializeBindData : public TableFunctionData {
+  LanceVaneGlobalSearchState vane_state;
+  vector<string> names;
+  vector<LogicalType> types;
+  ArrowSchemaWrapper schema_root;
+  ArrowTableSchema arrow_table;
+
+  unique_ptr<FunctionData> Copy() const override {
+    auto result = make_uniq<LanceVectorMaterializeBindData>();
+    result->column_ids = column_ids;
+    result->vane_state = vane_state;
+    result->names = names;
+    result->types = types;
+    result->arrow_table = arrow_table;
+    return result;
+  }
+};
+
+struct LanceVectorMaterializeGlobalState : public GlobalTableFunctionState {
+  shared_ptr<LanceDatasetCacheEntry> dataset_entry;
+  void *dataset = nullptr;
+  unordered_set<uint64_t> seen_row_ids;
+
+  idx_t MaxThreads() const override { return 1; }
+};
+
+struct LanceVectorMaterializeLocalState : public ArrowScanLocalState {
+  explicit LanceVectorMaterializeLocalState(
+      unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &context)
+      : ArrowScanLocalState(std::move(current_chunk), context) {}
+};
+
+static unique_ptr<FunctionData>
+LanceVectorMaterializeBind(ClientContext &, TableFunctionBindInput &,
+                           vector<LogicalType> &, vector<string> &) {
+  throw BinderException(
+      "__lance_vector_search_materialize is an internal table function");
+}
+
+static vector<column_t>
+LanceVectorMaterializeColumnIds(const LanceVaneGlobalSearchState &state) {
+  vector<column_t> result;
+  if (state.projection_ids.empty()) {
+    result.reserve(state.column_ids.size());
+    for (auto &column : state.column_ids) {
+      result.push_back(column.GetPrimaryIndex());
+    }
+    return result;
+  }
+  result.reserve(state.projection_ids.size());
+  for (auto projection_id : state.projection_ids) {
+    if (projection_id >= state.column_ids.size()) {
+      throw SerializationException(
+          "Distributed Lance vector materialization projection is malformed");
+    }
+    result.push_back(state.column_ids[projection_id].GetPrimaryIndex());
+  }
+  return result;
+}
+
+static vector<LogicalType>
+LanceVectorMaterializeOutputTypes(const LanceVaneGlobalSearchState &state) {
+  auto column_ids = LanceVectorMaterializeColumnIds(state);
+  vector<LogicalType> result;
+  result.reserve(column_ids.size());
+  for (auto column_id : column_ids) {
+    if (column_id >= state.output_types.size()) {
+      throw SerializationException(
+          "Distributed Lance vector materialization schema is malformed");
+    }
+    result.push_back(state.output_types[column_id]);
+  }
+  return result;
+}
+
+static unique_ptr<GlobalTableFunctionState>
+LanceVectorMaterializeInitGlobal(ClientContext &context,
+                                 TableFunctionInitInput &input) {
+  auto &bind_data = input.bind_data->Cast<LanceVectorMaterializeBindData>();
+  if (input.column_indexes != bind_data.vane_state.column_ids) {
+    throw InvalidInputException(
+        "Distributed Lance vector materialization projection changed after "
+        "admission");
+  }
+  auto result = make_uniq_base<GlobalTableFunctionState,
+                               LanceVectorMaterializeGlobalState>();
+  auto &global = result->Cast<LanceVectorMaterializeGlobalState>();
+  global.dataset_entry = LanceVaneOpenSearchSnapshotForMaterialization(
+      context, bind_data.vane_state);
+  global.dataset = global.dataset_entry->Handle();
+  return result;
+}
+
+static unique_ptr<LocalTableFunctionState>
+LanceVectorMaterializeInitLocal(ExecutionContext &context,
+                                TableFunctionInitInput &input,
+                                GlobalTableFunctionState *) {
+  auto &bind_data = input.bind_data->Cast<LanceVectorMaterializeBindData>();
+  auto chunk = make_uniq<ArrowArrayWrapper>();
+  auto result = make_uniq<LanceVectorMaterializeLocalState>(std::move(chunk),
+                                                            context.client);
+  result->column_ids = LanceVectorMaterializeColumnIds(bind_data.vane_state);
+  return result;
+}
+
+static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &,
+                                                     TableFunctionInput &data,
+                                                     DataChunk &input,
+                                                     DataChunk &output) {
+  if (input.size() == 0) {
+    return OperatorResultType::NEED_MORE_INPUT;
+  }
+  if (input.ColumnCount() != 2 ||
+      input.data[0].GetType() != LogicalType::UBIGINT ||
+      input.data[1].GetType() != LogicalType::FLOAT) {
+    throw InvalidInputException(
+        "Distributed Lance vector materialization received an invalid "
+        "candidate schema");
+  }
+
+  auto &bind_data = data.bind_data->Cast<LanceVectorMaterializeBindData>();
+  auto &global = data.global_state->Cast<LanceVectorMaterializeGlobalState>();
+  auto &local = data.local_state->Cast<LanceVectorMaterializeLocalState>();
+  UnifiedVectorFormat row_id_format;
+  UnifiedVectorFormat distance_format;
+  input.data[0].ToUnifiedFormat(input.size(), row_id_format);
+  input.data[1].ToUnifiedFormat(input.size(), distance_format);
+  auto row_id_data = UnifiedVectorFormat::GetData<uint64_t>(row_id_format);
+  auto distance_data = UnifiedVectorFormat::GetData<float>(distance_format);
+  vector<uint64_t> row_ids;
+  vector<float> distances;
+  row_ids.reserve(input.size());
+  distances.reserve(input.size());
+  for (idx_t row = 0; row < input.size(); row++) {
+    auto row_id_index = row_id_format.sel->get_index(row);
+    auto distance_index = distance_format.sel->get_index(row);
+    if (!row_id_format.validity.RowIsValid(row_id_index) ||
+        !distance_format.validity.RowIsValid(distance_index) ||
+        !std::isfinite(distance_data[distance_index])) {
+      throw InvalidInputException(
+          "Distributed Lance vector materialization received an invalid "
+          "candidate");
+    }
+    auto row_id = row_id_data[row_id_index];
+    if (!global.seen_row_ids.insert(row_id).second) {
+      throw InvalidInputException(
+          "Distributed Lance vector materialization received duplicate row "
+          "id %llu at candidate offset %llu after observing %llu unique "
+          "rows",
+          row_id, row, global.seen_row_ids.size());
+    }
+    row_ids.push_back(row_id);
+    distances.push_back(distance_data[distance_index]);
+  }
+
+  auto *batch = lance_vane_take_vector_rows(global.dataset, row_ids.data(),
+                                            distances.data(), row_ids.size());
+  if (!batch) {
+    throw IOException(
+        "Failed to materialize distributed Lance vector search rows" +
+        LanceVaneFormatErrorSuffix(
+            bind_data.vane_state.physical_uri,
+            bind_data.vane_state.private_uri_diagnostics));
+  }
+  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
+  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
+  ArrowSchema batch_schema;
+  memset(&batch_schema, 0, sizeof(batch_schema));
+  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &batch_schema) !=
+      0) {
+    lance_free_batch(batch);
+    throw IOException(
+        "Failed to export distributed Lance vector materialization batch" +
+        LanceVaneFormatErrorSuffix(
+            bind_data.vane_state.physical_uri,
+            bind_data.vane_state.private_uri_diagnostics));
+  }
+  lance_free_batch(batch);
+  LanceCoerceArrowArrayForDuckDB(&batch_schema, &new_chunk->arrow_array);
+  if (batch_schema.release) {
+    batch_schema.release(&batch_schema);
+  }
+
+  local.chunk = std::move(new_chunk);
+  local.Reset();
+  output.SetCardinality(input.size());
+  ArrowTableFunction::ArrowToDuckDB(local, bind_data.arrow_table.GetColumns(),
+                                    output, false);
+  local.chunk_offset += input.size();
+  output.Verify();
+  return OperatorResultType::NEED_MORE_INPUT;
+}
+
+static OperatorResultType
+LanceVectorMaterializeBatchFunc(ExecutionContext &context,
+                                TableFunctionInput &data, ExecutionBatch &input,
+                                ExecutionBatch &output) {
+  if (input.kind != ExecutionBatchKind::MATERIALIZED_CHUNK) {
+    throw InvalidInputException(
+        "Distributed Lance vector materialization requires a native TopN "
+        "batch");
+  }
+  if (!input.materialized) {
+    if (input.rows != 0) {
+      throw InvalidInputException(
+          "Distributed Lance vector materialization received a missing "
+          "candidate batch");
+    }
+    input.materialized = make_uniq<DataChunk>();
+    input.materialized->Initialize(
+        BufferAllocator::Get(context.client),
+        vector<LogicalType>{LogicalType::UBIGINT, LogicalType::FLOAT});
+  }
+  auto output_chunk = make_uniq<DataChunk>();
+  auto &bind_data = data.bind_data->Cast<LanceVectorMaterializeBindData>();
+  output_chunk->Initialize(
+      BufferAllocator::Get(context.client),
+      LanceVectorMaterializeOutputTypes(bind_data.vane_state));
+  auto result = LanceVectorMaterializeFunc(context, data, *input.materialized,
+                                           *output_chunk);
+  output = ExecutionBatch();
+  output.kind = ExecutionBatchKind::MATERIALIZED_CHUNK;
+  output.rows = output_chunk->size();
+  output.estimated_bytes = output_chunk->GetAllocationSize();
+  output.materialized = std::move(output_chunk);
+  return result;
+}
+
+static void
+LanceVectorMaterializeSerialize(Serializer &serializer,
+                                const optional_ptr<FunctionData> bind_data,
+                                const TableFunction &) {
+  auto &data = bind_data->Cast<LanceVectorMaterializeBindData>();
+  LanceVaneSerializeGlobalSearchState(serializer, data.vane_state);
+}
+
+static unique_ptr<FunctionData>
+LanceVectorMaterializeDeserialize(Deserializer &deserializer, TableFunction &) {
+  auto state = LanceVaneDeserializeGlobalSearchState(deserializer);
+  if (state.execution_variant !=
+          LanceVaneSearchTaskVariant::VECTOR_CANDIDATES ||
+      state.arguments.kind != LanceVaneSearchKind::VECTOR ||
+      state.worker_bind) {
+    throw SerializationException(
+        "Distributed Lance vector materialization state is malformed");
+  }
+  auto result = make_uniq<LanceVectorMaterializeBindData>();
+  result->vane_state = std::move(state);
+  result->names = result->vane_state.output_names;
+  result->types = result->vane_state.output_types;
+  auto &context = deserializer.Get<ClientContext &>();
+  LanceVanePopulateSearchSchema(context, result->names, result->types,
+                                result->schema_root, result->arrow_table);
+  return result;
+}
+
+static TableFunction LanceVectorMaterializeFunction() {
+  TableFunction result(
+      "__lance_vector_search_materialize", {LogicalType::TABLE}, nullptr,
+      LanceVectorMaterializeBind, LanceVectorMaterializeInitGlobal,
+      LanceVectorMaterializeInitLocal);
+  result.in_out_function = LanceVectorMaterializeFunc;
+  result.in_out_function_batch = LanceVectorMaterializeBatchFunc;
+  result.serialize = LanceVectorMaterializeSerialize;
+  result.deserialize = LanceVectorMaterializeDeserialize;
+  result.projection_pushdown = true;
+  return result;
+}
+
+static unique_ptr<LogicalOperator>
+LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
+                                  unique_ptr<LogicalOperator> op,
+                                  vector<const Expression *> ancestor_filters) {
+  if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
+    auto &filter = op->Cast<LogicalFilter>();
+    for (auto &expression : filter.expressions) {
+      if (!expression) {
+        return op;
+      }
+      ancestor_filters.push_back(expression.get());
+    }
+  }
+  for (auto &child : op->children) {
+    child = LanceRewriteExactVectorCandidates(
+        context, optimizer, std::move(child), ancestor_filters);
+  }
+  if (op->type != LogicalOperatorType::LOGICAL_GET) {
+    return op;
+  }
+  auto &get = op->Cast<LogicalGet>();
+  if (get.function.name != "lance_vector_search" || !get.bind_data ||
+      !get.children.empty()) {
+    return op;
+  }
+  auto &bind_data = get.bind_data->Cast<LanceKnnBindData>();
+  if (bind_data.vane_state.worker_bind ||
+      bind_data.vane_state.execution_variant !=
+          LanceVaneSearchTaskVariant::FINAL_SEARCH) {
+    return op;
+  }
+  if (bind_data.complex_filter_pushdown_failed) {
+    // This can represent a computed or mixed postfilter that the normal
+    // FINAL_SEARCH path preserves above the scan. Candidate admission must
+    // not finalize it as though every predicate were a Lance prefilter.
+    return op;
+  }
+  for (auto &entry : get.table_filters.filters) {
+    auto scan_index = NumericCast<idx_t>(entry.first);
+    auto &column_ids = get.GetColumnIds();
+    if (scan_index >= column_ids.size()) {
+      return op;
+    }
+    auto &column_index = column_ids[scan_index];
+    if (column_index.IsVirtualColumn() || !column_index.HasPrimaryIndex()) {
+      return op;
+    }
+    auto column_id = column_index.GetPrimaryIndex();
+    if (column_id >= bind_data.names.size() ||
+        IsComputedSearchColumn(bind_data.names[column_id])) {
+      // DuckDB can represent a computed score postfilter in TableFilterSet
+      // while retaining a base-column safety filter above the scan.
+      return op;
+    }
+  }
+  bool has_base_filter_ancestor = false;
+  for (auto *expression : ancestor_filters) {
+    auto reference_class =
+        ClassifyVaneSearchColumnReferences(get, bind_data.names, *expression);
+    if (reference_class != LanceVaneSearchColumnReferenceClass::BASE_ONLY) {
+      // Computed, constant, mixed, and unresolved residual predicates are
+      // postfilters. Leave FINAL_SEARCH intact; its normal planning path also
+      // retains the established strict error for an incomplete prefilter.
+      return op;
+    }
+    has_base_filter_ancestor = true;
+  }
+
+  TableFunctionDistributedScanInput distributed_input(
+      get.bind_data.get(), get.parameters, get.GetColumnIds(),
+      get.projection_ids, &get.table_filters, get.estimated_cardinality);
+  auto state = LanceVaneFinalizeGlobalSearchState(
+      distributed_input, bind_data.vane_state,
+      bind_data.lance_pushed_filter_ir_parts,
+      bind_data.complex_filter_pushdown_failed);
+  auto has_postfilter = !state.arguments.prefilter && has_base_filter_ancestor;
+  if (!state.arguments.prefilter) {
+    has_postfilter = has_postfilter || !get.table_filters.filters.empty() ||
+                     !bind_data.lance_pushed_filter_ir_parts.empty() ||
+                     bind_data.complex_filter_pushdown_failed ||
+                     !bind_data.namespace_filter.empty();
+  }
+  if (!LanceVaneTryEnableExactVectorCandidates(state, has_postfilter)) {
+    return op;
+  }
+
+  vector<string> candidate_names = {"_rowid", "_distance"};
+  vector<LogicalType> candidate_types = {LogicalType::UBIGINT,
+                                         LogicalType::FLOAT};
+  auto candidate_bind = bind_data.Copy();
+  auto &candidate_data = candidate_bind->Cast<LanceKnnBindData>();
+  candidate_data.column_ids = {0, 1};
+  candidate_data.names = candidate_names;
+  candidate_data.types = candidate_types;
+  candidate_data.arrow_table = ArrowTableSchema();
+  candidate_data.lance_pushed_filter_ir_parts.clear();
+  candidate_data.complex_filter_pushdown_failed = false;
+  candidate_data.vane_state = state;
+  LanceVanePopulateSearchSchema(context, candidate_names, candidate_types,
+                                candidate_data.schema_root,
+                                candidate_data.arrow_table);
+
+  auto candidate_table_index = optimizer.binder.GenerateTableIndex();
+  auto candidate_get = make_uniq<LogicalGet>(
+      candidate_table_index, get.function, std::move(candidate_bind),
+      candidate_types, candidate_names);
+  candidate_get->parameters = get.parameters;
+  candidate_get->named_parameters = get.named_parameters;
+  candidate_get->SetColumnIds(
+      vector<ColumnIndex>{ColumnIndex(0), ColumnIndex(1)});
+  auto max_cardinality = NumericLimits<idx_t>::Maximum();
+  auto k = NumericCast<idx_t>(state.arguments.k);
+  auto fragment_count = state.fragment_ids.size();
+  auto candidate_cardinality =
+      fragment_count > 0 && k > max_cardinality / fragment_count
+          ? max_cardinality
+          : k * fragment_count;
+  candidate_get->SetEstimatedCardinality(candidate_cardinality);
+
+  vector<BoundOrderByNode> orders;
+  orders.emplace_back(
+      OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+      make_uniq<BoundColumnRefExpression>(
+          LogicalType::FLOAT, ColumnBinding(candidate_table_index, 1)));
+  orders.emplace_back(
+      OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+      make_uniq<BoundColumnRefExpression>(
+          LogicalType::UBIGINT, ColumnBinding(candidate_table_index, 0)));
+  auto top_k = make_uniq<LogicalTopN>(std::move(orders), k, 0);
+  top_k->children.push_back(std::move(candidate_get));
+  top_k->SetEstimatedCardinality(k);
+
+  auto materialize_bind = make_uniq<LanceVectorMaterializeBindData>();
+  materialize_bind->vane_state = state;
+  materialize_bind->names = state.output_names;
+  materialize_bind->types = state.output_types;
+  LanceVanePopulateSearchSchema(
+      context, materialize_bind->names, materialize_bind->types,
+      materialize_bind->schema_root, materialize_bind->arrow_table);
+  auto materialize_get = make_uniq<LogicalGet>(
+      get.table_index, LanceVectorMaterializeFunction(),
+      std::move(materialize_bind), state.output_types, state.output_names);
+  materialize_get->SetColumnIds(vector<ColumnIndex>(get.GetColumnIds().begin(),
+                                                    get.GetColumnIds().end()));
+  materialize_get->projection_ids = get.projection_ids;
+  materialize_get->input_table_types = candidate_types;
+  materialize_get->input_table_names = candidate_names;
+  materialize_get->children.push_back(std::move(top_k));
+  materialize_get->SetEstimatedCardinality(k);
+  return std::move(materialize_get);
+}
+
+static void
+LanceExactVectorCandidatesOptimizer(OptimizerExtensionInput &input,
+                                    unique_ptr<LogicalOperator> &plan) {
+  plan = LanceRewriteExactVectorCandidates(input.context, input.optimizer,
+                                           std::move(plan), {});
 }
 #endif
 
@@ -1450,6 +1921,10 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
                            LanceKnnInitGlobal, LanceKnnLocalInit);
   configure(search_f64);
   loader.RegisterFunction(search_f64);
+#ifdef LANCE_VANE_DISTRIBUTED
+  auto materialize = LanceVectorMaterializeFunction();
+  loader.RegisterFunction(materialize);
+#endif
 }
 
 // --- FTS / hybrid search ---
@@ -2422,18 +2897,7 @@ static vector<DistributedScanSplit> LancePlanDistributedSharedSearch(
     const TableFunctionDistributedScanPlanningInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
   auto state = LanceBuildSharedVaneState(input, bind_data);
-  if (state.empty_assignment) {
-    return {};
-  }
-  auto split = LanceVaneCreateSearchTaskAssignment(state);
-  if (state.authorization_restricted) {
-    if (state.authorized_task_ids != vector<string>{split.split_id} ||
-        state.authorized_task_payloads != vector<string>{split.payload}) {
-      throw InvalidInputException(
-          "Distributed Lance search clone changed authorization");
-    }
-  }
-  return {std::move(split)};
+  return LanceVaneCreateSearchTaskAssignments(state);
 }
 
 static unique_ptr<FunctionData> LanceCreateDistributedSharedWorkerBind(
@@ -2612,5 +3076,13 @@ void RegisterLanceSearch(ExtensionLoader &loader) {
   RegisterLanceFtsSearch(loader);
   RegisterLanceHybridSearch(loader);
 }
+
+#ifdef LANCE_VANE_DISTRIBUTED
+void RegisterLanceSearchOptimizer(DBConfig &config) {
+  OptimizerExtension extension;
+  extension.optimize_function = LanceExactVectorCandidatesOptimizer;
+  OptimizerExtension::Register(config, std::move(extension));
+}
+#endif
 
 } // namespace duckdb

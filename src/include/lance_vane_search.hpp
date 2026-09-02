@@ -103,6 +103,11 @@ struct LanceVaneGlobalSearchState {
   bool search_plan_payloads_validated = false;
   shared_ptr<const LanceVaneFrozenSearchSnapshot> frozen_snapshot;
   bool frozen_snapshot_payload_validated = false;
+  LanceVaneSearchTaskVariant execution_variant =
+      LanceVaneSearchTaskVariant::FINAL_SEARCH;
+  vector<uint64_t> fragment_ids;
+  vector<int64_t> fragment_row_counts;
+  vector<uint64_t> fragment_bytes_on_disk;
   string state_sha256;
 
   bool worker_bind = false;
@@ -111,6 +116,7 @@ struct LanceVaneGlobalSearchState {
   bool authorization_restricted = false;
   vector<string> authorized_task_ids;
   vector<string> authorized_task_payloads;
+  vector<uint64_t> selected_fragment_ids;
 };
 
 void LanceVaneCapturePhysicalCandidate(
@@ -137,8 +143,11 @@ LanceVaneGlobalSearchState LanceVaneFinalizeGlobalSearchState(
     const vector<string> &pushed_filter_ir_parts,
     bool complex_filter_pushdown_failed);
 
-DistributedScanSplit
-LanceVaneCreateSearchTaskAssignment(const LanceVaneGlobalSearchState &state);
+bool LanceVaneTryEnableExactVectorCandidates(LanceVaneGlobalSearchState &state,
+                                             bool has_postfilter);
+
+vector<DistributedScanSplit>
+LanceVaneCreateSearchTaskAssignments(const LanceVaneGlobalSearchState &state);
 
 void LanceVanePrepareSearchWorkerBindState(LanceVaneGlobalSearchState &state);
 
@@ -154,6 +163,10 @@ LanceVaneDeserializeGlobalSearchState(Deserializer &deserializer);
 shared_ptr<LanceDatasetCacheEntry>
 LanceVaneOpenSearchSnapshot(ClientContext &context,
                             const LanceVaneGlobalSearchState &state);
+
+shared_ptr<LanceDatasetCacheEntry>
+LanceVaneOpenSearchSnapshotForMaterialization(
+    ClientContext &context, const LanceVaneGlobalSearchState &state);
 
 void LanceVanePopulateSearchSchema(ClientContext &context,
                                    const vector<string> &names,

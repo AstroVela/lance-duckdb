@@ -71,22 +71,39 @@ after loading the statically linked extension on each worker database.
 
 ## Global search contract
 
-Vector, full-text, and hybrid search are admitted as global operations. Each
-search node produces exactly one authenticated `FINAL_SEARCH` task assignment
-using the `lance.search-task` version 1 split codec, and Vane schedules that task
-on one worker. The fixed-size task payload contains only its typed variant, the
-search-node UUID, and the SHA-256 identity of the serialized global search
-state. Unknown variants, candidate variants not implemented by the current
-operator, malformed payload sizes, foreign state identities, and changed retry
-assignments fail closed. The worker executes Lance's global top-k operation,
-including hybrid reranking, against the frozen coordinator snapshot. An
-explicit Vane no-work assignment is accepted and suppresses that worker scan
-without opening the snapshot; once applied, it cannot be interchanged with an
-executable assignment. A valid detached worker bind remains idempotent when
-Vane translates its serialized plan again, including the no-work state. Vane
-does not currently divide one search node into fragment candidates across
-multiple workers; that parallel execution model is tracked in
+Vector, full-text, and hybrid search are admitted as global operations. The
+`lance.search-task` version 1 split codec has two executable variants in this
+phase. `FINAL_SEARCH` contains the search-node UUID and the SHA-256 identity of
+the serialized global search state. `VECTOR_CANDIDATES` additionally identifies
+one Lance fragment.
+
+An exact vector search is planned as `VECTOR_CANDIDATES` only when
+`use_index = false`, the filter is absent or is applied as a prefilter, the
+snapshot has at least two fragments with known row counts, and the estimated
+distance work is large enough to justify distributed scheduling. The
+coordinator emits one authenticated assignment per fragment. Vane may batch
+these mutually exclusive assignments into worker tasks; each worker performs
+one exact local top-k over its assigned fragment set and returns only `_rowid`
+and `_distance`. Vane's native `TopN` operator orders the union by
+`_distance ASC, _rowid ASC` and retains the global k. A final internal
+table-in/table-out operator uses batched Lance takes to materialize the requested
+result columns. Because every fragment is assigned exactly once, the
+union of fragment-local top-k sets contains the dataset-wide exact top-k.
+
+Small exact searches, indexed vector searches, vector post-filter searches,
+full-text searches, and hybrid searches are deliberately planned as one
+authenticated `FINAL_SEARCH` assignment. Their search and reranking semantics
+therefore remain one global Lance operation during this phase. Indexed vector
+candidates, full-text candidates, and hybrid global normalization and reranking
+are later phases of
 [Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
+
+Unknown variants, malformed payload sizes, foreign state identities, duplicate
+or overlapping fragment assignments, and changed retry assignments fail
+closed. An explicit Vane no-work assignment suppresses that worker scan without
+opening the snapshot; once applied, it cannot be interchanged with an
+executable assignment. A valid detached worker bind remains idempotent when
+Vane translates its serialized plan again, including the no-work state.
 
 Before task creation, the coordinator freezes the source class, physical URI,
 dataset version and generation, schema fingerprint, filter state, search
@@ -221,9 +238,9 @@ each fragment split. The official DuckDB build retains these pushdowns.
 | --- | --- | --- |
 | Ordinary Lance scan | One split per fragment, scheduled across workers | The physical dataset and frozen snapshot must be replayable by every worker. |
 | `rowid`/`_rowid` point lookup | Ordered take splits, scheduled across workers | Duplicate `IN` candidates are normalized; final row order still requires `ORDER BY`. |
-| `lance_vector_search` | One authenticated `FINAL_SEARCH` task on one worker | Global top-k semantics are preserved; cross-worker candidate search is tracked in #9. |
-| `lance_fts` | One authenticated `FINAL_SEARCH` task on one worker | Global score ordering is preserved; cross-worker candidate search is tracked in #9. |
-| `lance_hybrid_search` | One authenticated `FINAL_SEARCH` task on one worker | Vector/text retrieval and reranking remain one global operation; cross-worker execution is tracked in #9. |
+| `lance_vector_search` | Exact flat searches use disjoint fragment candidate assignments, Vane native global `TopN`, and one batched Lance take | Requires `use_index = false`, no post-filter, at least two fragments with known row counts, and enough estimated work. Other vector searches use one `FINAL_SEARCH` assignment. |
+| `lance_fts` | One authenticated `FINAL_SEARCH` task on one worker | Global score ordering remains one Lance operation in this phase. |
+| `lance_hybrid_search` | One authenticated `FINAL_SEARCH` task on one worker | Vector/text retrieval, normalization, and reranking remain one global Lance operation in this phase. |
 | Directory namespace reads | Resolved to a frozen replayable physical URI | Attach-time and planning-time storage state must agree. |
 | Standard REST namespace reads | Coordinator resolves the bound version; workers read the physical snapshot | Requires a materialized table URI plus detailed version and schema metadata; workers do not use the REST control plane. |
 | Coordinator-only `TYPE LANCE` storage secrets | Rejected for distributed execution | Use Vane's replayable query-session settings or credential provider. Native local queries retain secret support. |
@@ -233,13 +250,11 @@ each fragment split. The official DuckDB build retains these pushdowns.
 
 The scan integration covers read-only table scans, including filters,
 projections, point lookups, aggregates, sampling, global limits, empty datasets,
-directory namespace tables, vector search, full-text search, hybrid search, and
-standard REST tables that provide a stable replayable physical snapshot.
-Parallelizing one global search across multiple workers remains outside this
-contract and is tracked in
-[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). Additional
-defensive limits for malformed internal `SearchIndexPlan` collection counts are tracked in
-[Issue #10](https://github.com/AstroVela/lance-duckdb/issues/10). Distributed
+directory namespace tables, exact flat vector candidates, singleton indexed
+vector search, full-text search, hybrid search, and standard REST tables that
+provide a stable replayable physical snapshot. Later candidate and reranking
+phases remain tracked in
+[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). Distributed
 writes have a separate
 [write contract](./vane_distributed_write.md). Distributed replay of
 `TYPE LANCE` secret catalog entries is not part of either contract.
@@ -258,10 +273,11 @@ execution workers. They cover split parallelism, point lookups, sampling,
 global limits, fixed snapshots, replacement detection, empty scans, directory
 namespaces, and MinIO-backed S3 session replay, including static and
 temporary-profile credentials. Advanced-read coverage also compares vector,
-full-text, and hybrid results with native execution; verifies singleton search
-splits, partial index coverage, frozen selected-index segments, retry identity,
-and stale-state rejection; and proves standard REST scans and searches continue
-from their physical snapshot after the namespace service is unavailable.
+full-text, and hybrid results with native execution; verifies exact flat vector
+candidate partitioning, deterministic global top-k, phase-one singleton routing,
+partial index coverage, frozen selected-index segments, retry identity, and
+stale-state rejection; and proves standard REST scans and searches continue from
+their physical snapshot after the namespace service is unavailable.
 The [frozen snapshot benchmark](../benches/vane_frozen_snapshot/README.md)
 reports cold and warm planning and execution latency, serialized plan and split
 sizes, and observed manifest `HEAD`/`GET` requests for 1, 8, and 32 workers.

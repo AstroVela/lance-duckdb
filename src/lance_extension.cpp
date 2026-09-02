@@ -26,6 +26,9 @@ void RegisterLanceStorage(DBConfig &config);
 void RegisterLanceTruncate(DBConfig &config, ExtensionLoader &loader);
 void RegisterLanceIndex(DBConfig &config, ExtensionLoader &loader);
 void RegisterLanceScanOptimizer(DBConfig &config);
+#ifdef LANCE_VANE_DISTRIBUTED
+void RegisterLanceSearchOptimizer(DBConfig &config);
+#endif
 
 static void LoadInternal(ExtensionLoader &loader) {
   // Register internal scan table functions.
@@ -53,6 +56,9 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   RegisterLanceVaneSessionOptions(config);
 #endif
   RegisterLanceScanOptimizer(config);
+#ifdef LANCE_VANE_DISTRIBUTED
+  RegisterLanceSearchOptimizer(config);
+#endif
   RegisterLanceStorage(config);
   RegisterLanceReplacement(config);
   RegisterLanceTruncate(config, loader);

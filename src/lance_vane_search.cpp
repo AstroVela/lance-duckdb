@@ -31,10 +31,17 @@ static constexpr const char *LANCE_VANE_SEARCH_STATE_HASH_DOMAIN =
     "lance.vane.global-search-state.sha256";
 static constexpr const char *LANCE_VANE_FINAL_SEARCH_TASK_ID_PREFIX =
     "final-search:";
+static constexpr const char *LANCE_VANE_VECTOR_CANDIDATE_TASK_ID_PREFIX =
+    "vector-candidates:";
+static constexpr idx_t LANCE_VANE_VECTOR_CANDIDATE_MIN_FRAGMENTS = 2;
+static constexpr uint64_t LANCE_VANE_VECTOR_CANDIDATE_MIN_DISTANCE_VALUES =
+    1ULL << 20;
 static constexpr idx_t LANCE_VANE_SEARCH_UUID_SIZE = BaseUUID::STRING_SIZE;
 static constexpr idx_t LANCE_VANE_SHA256_SIZE = 32;
-static constexpr idx_t LANCE_VANE_SEARCH_TASK_PAYLOAD_SIZE =
+static constexpr idx_t LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE =
     1 + LANCE_VANE_SEARCH_UUID_SIZE + LANCE_VANE_SHA256_SIZE;
+static constexpr idx_t LANCE_VANE_VECTOR_CANDIDATE_TASK_PAYLOAD_SIZE =
+    LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE + sizeof(uint64_t);
 
 struct LanceVaneSearchBytesDeleter {
   size_t len;
@@ -281,6 +288,14 @@ CanonicalSearchStateBytes(const LanceVaneGlobalSearchState &state) {
                 [&](const string &part) { writer.String(part); });
   writer.Bool(state.pending_complex_filter_pushdown_failed);
   writer.String(state.index_plan);
+  writer.U8(static_cast<uint8_t>(state.execution_variant));
+  writer.Vector(state.fragment_ids,
+                [&](uint64_t fragment_id) { writer.U64(fragment_id); });
+  writer.Vector(state.fragment_row_counts, [&](int64_t row_count) {
+    writer.U64(static_cast<uint64_t>(row_count));
+  });
+  writer.Vector(state.fragment_bytes_on_disk,
+                [&](uint64_t bytes) { writer.U64(bytes); });
   writer.Bool(static_cast<bool>(state.frozen_snapshot));
   if (state.frozen_snapshot) {
     writer.String(state.frozen_snapshot->dataset.manifest_sha256);
@@ -346,7 +361,23 @@ struct LanceVaneSearchTaskAssignment {
   LanceVaneSearchTaskVariant variant = LanceVaneSearchTaskVariant::FINAL_SEARCH;
   string search_node_uuid;
   string state_sha256;
+  optional_idx fragment_id;
 };
+
+static void AppendU64(string &payload, uint64_t value) {
+  for (idx_t i = 0; i < sizeof(value); i++) {
+    payload.push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+  }
+}
+
+static uint64_t ReadU64(const string &payload, idx_t offset) {
+  uint64_t result = 0;
+  for (idx_t i = 0; i < sizeof(result); i++) {
+    result |= static_cast<uint64_t>(static_cast<uint8_t>(payload[offset + i]))
+              << (i * 8);
+  }
+  return result;
+}
 
 static string
 EncodeSearchTaskAssignment(const LanceVaneSearchTaskAssignment &assignment) {
@@ -360,31 +391,54 @@ EncodeSearchTaskAssignment(const LanceVaneSearchTaskAssignment &assignment) {
                             "variant");
   }
   if (!IsValidSearchUUID(assignment.search_node_uuid) ||
-      assignment.state_sha256.size() != LANCE_VANE_SHA256_SIZE) {
+      assignment.state_sha256.size() != LANCE_VANE_SHA256_SIZE ||
+      (assignment.variant == LanceVaneSearchTaskVariant::FINAL_SEARCH &&
+       assignment.fragment_id.IsValid()) ||
+      (assignment.variant == LanceVaneSearchTaskVariant::VECTOR_CANDIDATES &&
+       !assignment.fragment_id.IsValid()) ||
+      assignment.variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
     throw InternalException("Cannot encode a malformed SearchTaskAssignment");
   }
   string payload;
-  payload.reserve(LANCE_VANE_SEARCH_TASK_PAYLOAD_SIZE);
+  payload.reserve(assignment.fragment_id.IsValid()
+                      ? LANCE_VANE_VECTOR_CANDIDATE_TASK_PAYLOAD_SIZE
+                      : LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE);
   payload.push_back(static_cast<char>(assignment.variant));
   payload.append(assignment.search_node_uuid);
   payload.append(assignment.state_sha256);
+  if (assignment.fragment_id.IsValid()) {
+    AppendU64(payload, assignment.fragment_id.GetIndex());
+  }
   return payload;
 }
 
 static LanceVaneSearchTaskAssignment
 DecodeSearchTaskAssignment(const string &payload) {
-  if (payload.size() != LANCE_VANE_SEARCH_TASK_PAYLOAD_SIZE) {
+  if (payload.empty()) {
     throw SerializationException(
         "SearchTaskAssignment payload has an invalid size");
   }
   LanceVaneSearchTaskAssignment result;
   auto variant = static_cast<uint8_t>(payload[0]);
   switch (variant) {
-  case static_cast<uint8_t>(LanceVaneSearchTaskVariant::FINAL_SEARCH):
-  case static_cast<uint8_t>(LanceVaneSearchTaskVariant::VECTOR_CANDIDATES):
-  case static_cast<uint8_t>(LanceVaneSearchTaskVariant::FTS_CANDIDATES):
-    result.variant = static_cast<LanceVaneSearchTaskVariant>(variant);
+  case static_cast<uint8_t>(LanceVaneSearchTaskVariant::FINAL_SEARCH): {
+    if (payload.size() != LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE) {
+      throw SerializationException(
+          "SearchTaskAssignment payload has an invalid size");
+    }
+    result.variant = LanceVaneSearchTaskVariant::FINAL_SEARCH;
     break;
+  }
+  case static_cast<uint8_t>(LanceVaneSearchTaskVariant::VECTOR_CANDIDATES): {
+    if (payload.size() != LANCE_VANE_VECTOR_CANDIDATE_TASK_PAYLOAD_SIZE) {
+      throw SerializationException(
+          "SearchTaskAssignment payload has an invalid size");
+    }
+    result.variant = LanceVaneSearchTaskVariant::VECTOR_CANDIDATES;
+    result.fragment_id = optional_idx(
+        ReadU64(payload, LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE));
+    break;
+  }
   default:
     throw SerializationException(
         "SearchTaskAssignment payload has an invalid variant");
@@ -400,14 +454,81 @@ DecodeSearchTaskAssignment(const string &payload) {
 }
 
 static LanceVaneSearchTaskAssignment
-ExpectedSearchTaskAssignment(const LanceVaneGlobalSearchState &state) {
-  return {LanceVaneSearchTaskVariant::FINAL_SEARCH, state.search_node_uuid,
-          state.state_sha256};
+ExpectedSearchTaskAssignment(const LanceVaneGlobalSearchState &state,
+                             optional_idx fragment_id = optional_idx()) {
+  return {state.execution_variant, state.search_node_uuid, state.state_sha256,
+          fragment_id};
 }
 
-static string ExpectedSearchTaskId(const LanceVaneGlobalSearchState &state) {
-  return string(LANCE_VANE_FINAL_SEARCH_TASK_ID_PREFIX) +
-         state.search_node_uuid;
+static string ExpectedSearchTaskId(const LanceVaneGlobalSearchState &state,
+                                   optional_idx fragment_id = optional_idx()) {
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FINAL_SEARCH) {
+    if (fragment_id.IsValid()) {
+      throw InternalException("FINAL_SEARCH cannot identify a fragment");
+    }
+    return string(LANCE_VANE_FINAL_SEARCH_TASK_ID_PREFIX) +
+           state.search_node_uuid;
+  }
+  if (state.execution_variant ==
+          LanceVaneSearchTaskVariant::VECTOR_CANDIDATES &&
+      fragment_id.IsValid()) {
+    return string(LANCE_VANE_VECTOR_CANDIDATE_TASK_ID_PREFIX) +
+           state.search_node_uuid + ":" + to_string(fragment_id.GetIndex());
+  }
+  throw InternalException("Unsupported distributed search task identity");
+}
+
+static bool HasValidFragmentStats(const LanceVaneGlobalSearchState &state) {
+  if (state.fragment_ids.size() != state.fragment_row_counts.size() ||
+      state.fragment_ids.size() != state.fragment_bytes_on_disk.size()) {
+    return false;
+  }
+  for (idx_t i = 0; i < state.fragment_ids.size(); i++) {
+    if (state.fragment_row_counts[i] < -1 ||
+        (i > 0 && state.fragment_ids[i - 1] >= state.fragment_ids[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static LanceVaneSearchTaskAssignment
+ValidateAuthorizedTask(const LanceVaneGlobalSearchState &state,
+                       const string &task_id, const string &payload) {
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FINAL_SEARCH &&
+      task_id != ExpectedSearchTaskId(state)) {
+    throw SerializationException(
+        "Distributed Lance search received an unauthorized "
+        "SearchTaskAssignment identity");
+  }
+  auto assignment = DecodeSearchTaskAssignment(payload);
+  if (assignment.variant != state.execution_variant) {
+    throw SerializationException(
+        "Distributed Lance search received an unsupported "
+        "SearchTaskAssignment variant");
+  }
+  if (assignment.search_node_uuid != state.search_node_uuid ||
+      assignment.state_sha256 != state.state_sha256) {
+    throw SerializationException(
+        "Distributed Lance search received a SearchTaskAssignment for a "
+        "different global state");
+  }
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FINAL_SEARCH) {
+    if (assignment.fragment_id.IsValid()) {
+      throw SerializationException(
+          "Distributed Lance FINAL_SEARCH authorization is malformed");
+    }
+    return assignment;
+  }
+  if (!assignment.fragment_id.IsValid() ||
+      !std::binary_search(state.fragment_ids.begin(), state.fragment_ids.end(),
+                          assignment.fragment_id.GetIndex()) ||
+      task_id != ExpectedSearchTaskId(state, assignment.fragment_id)) {
+    throw SerializationException(
+        "Distributed Lance search received an unauthorized "
+        "SearchTaskAssignment identity");
+  }
+  return assignment;
 }
 
 static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
@@ -420,7 +541,9 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
       state.output_names.size() != state.output_types.size() ||
       state.state_sha256.size() != LANCE_VANE_SHA256_SIZE ||
       state.authorized_task_ids.size() !=
-          state.authorized_task_payloads.size()) {
+          state.authorized_task_payloads.size() ||
+      state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES ||
+      !HasValidFragmentStats(state)) {
     throw SerializationException("Distributed Lance search state is malformed");
   }
   for (auto &name : state.output_names) {
@@ -455,7 +578,9 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
         state.worker_bind || state.task_assignment_applied ||
         state.empty_assignment || state.authorization_restricted ||
         !state.authorized_task_ids.empty() || state.frozen_snapshot ||
-        state.frozen_snapshot_payload_validated) {
+        state.frozen_snapshot_payload_validated ||
+        state.execution_variant != LanceVaneSearchTaskVariant::FINAL_SEARCH ||
+        !state.fragment_ids.empty() || !state.selected_fragment_ids.empty()) {
       throw SerializationException(
           "Distributed Lance search qualification failure is malformed");
     }
@@ -481,9 +606,11 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
   if (!state.finalized &&
       (!state.column_ids.empty() || !state.projection_ids.empty() ||
        !state.final_filter_ir.empty() || state.filter_pushed_down ||
+       state.execution_variant != LanceVaneSearchTaskVariant::FINAL_SEARCH ||
        state.worker_bind || state.task_assignment_applied ||
        state.empty_assignment || state.authorization_restricted ||
-       !state.authorized_task_ids.empty())) {
+       !state.authorized_task_ids.empty() ||
+       !state.selected_fragment_ids.empty())) {
     throw SerializationException(
         "Distributed Lance search coordinator state is contradictory");
   }
@@ -492,24 +619,82 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
     throw SerializationException(
         "Distributed Lance search finalized state retains planning inputs");
   }
-  const bool has_expected_task_assignment =
-      state.authorized_task_ids.size() == 1 &&
-      state.authorized_task_ids[0] == ExpectedSearchTaskId(state) &&
-      state.authorized_task_payloads[0] ==
-          EncodeSearchTaskAssignment(ExpectedSearchTaskAssignment(state));
   const bool has_no_task_assignment = state.authorized_task_ids.empty() &&
                                       state.authorized_task_payloads.empty();
-  if ((!state.worker_bind &&
-       (state.task_assignment_applied || state.empty_assignment ||
-        state.authorization_restricted ||
-        !state.authorized_task_ids.empty())) ||
-      (state.worker_bind &&
-       (!state.authorization_restricted ||
-        (state.empty_assignment &&
-         (!state.task_assignment_applied || !has_no_task_assignment)) ||
-        (!state.empty_assignment && !has_expected_task_assignment)))) {
+  if (state.execution_variant ==
+      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+    if (state.arguments.kind != LanceVaneSearchKind::VECTOR ||
+        state.arguments.use_index ||
+        state.fragment_ids.size() < LANCE_VANE_VECTOR_CANDIDATE_MIN_FRAGMENTS ||
+        (!state.arguments.prefilter &&
+         (!state.final_filter_ir.empty() ||
+          !state.namespace_filter_plan.empty()))) {
+      throw SerializationException(
+          "Distributed Lance vector candidate state is contradictory");
+    }
+    for (auto row_count : state.fragment_row_counts) {
+      if (row_count < 0) {
+        throw SerializationException(
+            "Distributed Lance vector candidate row counts are incomplete");
+      }
+    }
+  } else if (!state.selected_fragment_ids.empty()) {
+    throw SerializationException(
+        "Distributed Lance FINAL_SEARCH selected fragments unexpectedly");
+  }
+  if (!state.worker_bind &&
+      (state.task_assignment_applied || state.empty_assignment ||
+       state.authorization_restricted || !has_no_task_assignment ||
+       !state.selected_fragment_ids.empty())) {
     throw SerializationException(
         "Distributed Lance search assignment state is contradictory");
+  }
+  if (state.worker_bind) {
+    if (!state.authorization_restricted ||
+        (state.empty_assignment &&
+         (!state.task_assignment_applied || !has_no_task_assignment ||
+          !state.selected_fragment_ids.empty())) ||
+        (!state.empty_assignment && has_no_task_assignment)) {
+      throw SerializationException(
+          "Distributed Lance search assignment state is contradictory");
+    }
+    vector<uint64_t> authorized_fragments;
+    authorized_fragments.reserve(state.authorized_task_ids.size());
+    for (idx_t i = 0; i < state.authorized_task_ids.size(); i++) {
+      auto assignment =
+          ValidateAuthorizedTask(state, state.authorized_task_ids[i],
+                                 state.authorized_task_payloads[i]);
+      if (assignment.fragment_id.IsValid()) {
+        authorized_fragments.push_back(assignment.fragment_id.GetIndex());
+      }
+    }
+    if (state.execution_variant == LanceVaneSearchTaskVariant::FINAL_SEARCH) {
+      if (!state.empty_assignment && state.authorized_task_ids.size() != 1) {
+        throw SerializationException(
+            "Distributed Lance FINAL_SEARCH authorization is contradictory");
+      }
+    } else {
+      if (!std::is_sorted(authorized_fragments.begin(),
+                          authorized_fragments.end()) ||
+          std::adjacent_find(authorized_fragments.begin(),
+                             authorized_fragments.end()) !=
+              authorized_fragments.end()) {
+        throw SerializationException(
+            "Distributed Lance vector candidate authorization is not unique");
+      }
+      if (!state.task_assignment_applied) {
+        if (authorized_fragments != state.fragment_ids ||
+            !state.selected_fragment_ids.empty()) {
+          throw SerializationException(
+              "Distributed Lance vector candidate preauthorization is "
+              "contradictory");
+        }
+      } else if (!state.empty_assignment &&
+                 authorized_fragments != state.selected_fragment_ids) {
+        throw SerializationException(
+            "Distributed Lance vector candidate assignment is contradictory");
+      }
+    }
   }
   if (verify_digest &&
       LanceVaneSha256(CanonicalSearchStateBytes(state)) != state.state_sha256) {
@@ -661,6 +846,55 @@ FreezeSearchSnapshot(const LanceVanePhysicalCandidate &candidate) {
   return result;
 }
 
+struct LanceVaneFragmentStatsDeleter {
+  size_t len;
+
+  void operator()(LanceFragmentStats *value) const {
+    if (value) {
+      lance_free_fragment_stats_list(value, len);
+    }
+  }
+};
+
+static void
+FreezeExactVectorFragmentStats(const LanceVanePhysicalCandidate &candidate,
+                               LanceVaneGlobalSearchState &state) {
+  if (state.arguments.kind != LanceVaneSearchKind::VECTOR ||
+      state.arguments.use_index) {
+    return;
+  }
+  size_t stats_len = 0;
+  auto *stats = lance_dataset_list_distributed_fragment_stats(candidate.dataset,
+                                                              &stats_len);
+  if (!stats) {
+    throw IOException(
+        "Failed to freeze distributed Lance vector fragment statistics" +
+        LanceVaneFormatErrorSuffix(candidate.physical_uri,
+                                   candidate.private_uri_diagnostics));
+  }
+  unique_ptr<LanceFragmentStats, LanceVaneFragmentStatsDeleter> stats_owner(
+      stats, LanceVaneFragmentStatsDeleter{stats_len});
+  vector<LanceFragmentStats> ordered(stats, stats + stats_len);
+  std::sort(
+      ordered.begin(), ordered.end(),
+      [](const LanceFragmentStats &left, const LanceFragmentStats &right) {
+        return left.fragment_id < right.fragment_id;
+      });
+  state.fragment_ids.reserve(ordered.size());
+  state.fragment_row_counts.reserve(ordered.size());
+  state.fragment_bytes_on_disk.reserve(ordered.size());
+  for (auto &fragment : ordered) {
+    if (!state.fragment_ids.empty() &&
+        state.fragment_ids.back() == fragment.fragment_id) {
+      throw IOException(
+          "Distributed Lance vector fragment identities are not unique");
+    }
+    state.fragment_ids.push_back(fragment.fragment_id);
+    state.fragment_row_counts.push_back(fragment.num_rows);
+    state.fragment_bytes_on_disk.push_back(fragment.bytes_on_disk);
+  }
+}
+
 static string
 BuildNamespaceFilterPlan(const LanceVanePhysicalCandidate &candidate,
                          const string &namespace_filter) {
@@ -723,6 +957,7 @@ LanceVanePrepareGlobalSearchState(const LanceVanePhysicalCandidate &candidate,
     state.schema_fingerprint = candidate.schema_fingerprint;
     state.frozen_snapshot = FreezeSearchSnapshot(candidate);
     ValidateAndMarkFrozenSearchSnapshot(state);
+    FreezeExactVectorFragmentStats(candidate, state);
     state.namespace_filter_plan =
         BuildNamespaceFilterPlan(candidate, arguments.namespace_filter);
     state.filter_fingerprint =
@@ -854,47 +1089,116 @@ LanceVaneGlobalSearchState LanceVaneFinalizeGlobalSearchState(
   return state;
 }
 
-static string EncodeFinalSearchTask(const LanceVaneGlobalSearchState &state) {
+bool LanceVaneTryEnableExactVectorCandidates(LanceVaneGlobalSearchState &state,
+                                             bool has_postfilter) {
   ValidateGlobalSearchState(state, true);
-  return EncodeSearchTaskAssignment(ExpectedSearchTaskAssignment(state));
+  if (!state.valid || !state.finalized || state.worker_bind ||
+      state.execution_variant != LanceVaneSearchTaskVariant::FINAL_SEARCH ||
+      state.arguments.kind != LanceVaneSearchKind::VECTOR ||
+      state.arguments.use_index ||
+      state.fragment_ids.size() < LANCE_VANE_VECTOR_CANDIDATE_MIN_FRAGMENTS ||
+      state.output_names.empty() || state.output_types.empty() ||
+      state.output_names.back() != "_distance" ||
+      state.output_types.back() != LogicalType::FLOAT || has_postfilter ||
+      (!state.arguments.prefilter && (!state.final_filter_ir.empty() ||
+                                      !state.namespace_filter_plan.empty()))) {
+    return false;
+  }
+
+  uint64_t total_rows = 0;
+  for (auto row_count : state.fragment_row_counts) {
+    if (row_count < 0) {
+      return false;
+    }
+    auto rows = static_cast<uint64_t>(row_count);
+    if (rows > NumericLimits<uint64_t>::Maximum() - total_rows) {
+      return false;
+    }
+    total_rows += rows;
+  }
+  auto query_dimension =
+      NumericCast<uint64_t>(state.arguments.vector_query.size());
+  if (query_dimension == 0 ||
+      total_rows > NumericLimits<uint64_t>::Maximum() / query_dimension ||
+      total_rows * query_dimension <
+          LANCE_VANE_VECTOR_CANDIDATE_MIN_DISTANCE_VALUES) {
+    return false;
+  }
+
+  state.execution_variant = LanceVaneSearchTaskVariant::VECTOR_CANDIDATES;
+  state.state_sha256 = LanceVaneSha256(CanonicalSearchStateBytes(state));
+  ValidateGlobalSearchState(state, true);
+  return true;
 }
 
-static void
-ValidateSearchTaskAssignment(const LanceVaneGlobalSearchState &state,
-                             const DistributedScanSplit &split) {
+static DistributedScanSplit
+BuildSearchTaskAssignment(const LanceVaneGlobalSearchState &state,
+                          optional_idx fragment_id = optional_idx()) {
+  DistributedScanSplit split;
+  split.split_id = ExpectedSearchTaskId(state, fragment_id);
+  split.payload = EncodeSearchTaskAssignment(
+      ExpectedSearchTaskAssignment(state, fragment_id));
+  auto cardinality = state.arguments.k;
+  if (fragment_id.IsValid()) {
+    auto entry =
+        std::lower_bound(state.fragment_ids.begin(), state.fragment_ids.end(),
+                         fragment_id.GetIndex());
+    if (entry == state.fragment_ids.end() || *entry != fragment_id.GetIndex()) {
+      throw InternalException(
+          "Cannot build a vector candidate task for an unknown fragment");
+    }
+    auto index = NumericCast<idx_t>(entry - state.fragment_ids.begin());
+    auto row_count = state.fragment_row_counts[index];
+    if (row_count >= 0) {
+      cardinality =
+          MinValue<uint64_t>(cardinality, NumericCast<uint64_t>(row_count));
+    }
+    if (state.fragment_bytes_on_disk[index] > 0) {
+      split.estimated_bytes = optional_idx(state.fragment_bytes_on_disk[index]);
+    }
+  }
+  split.estimated_cardinality = optional_idx(NumericCast<idx_t>(cardinality));
   split.Validate();
-  if (split.split_id != ExpectedSearchTaskId(state)) {
-    throw SerializationException(
-        "Distributed Lance search received an unauthorized "
-        "SearchTaskAssignment identity");
-  }
-  auto assignment = DecodeSearchTaskAssignment(split.payload);
-  if (assignment.variant != LanceVaneSearchTaskVariant::FINAL_SEARCH) {
-    throw SerializationException(
-        "Distributed Lance search received an unsupported "
-        "SearchTaskAssignment variant");
-  }
-  if (assignment.search_node_uuid != state.search_node_uuid ||
-      assignment.state_sha256 != state.state_sha256) {
-    throw SerializationException(
-        "Distributed Lance search received a SearchTaskAssignment for a "
-        "different global state");
-  }
+  return split;
 }
 
-DistributedScanSplit
-LanceVaneCreateSearchTaskAssignment(const LanceVaneGlobalSearchState &state) {
+vector<DistributedScanSplit>
+LanceVaneCreateSearchTaskAssignments(const LanceVaneGlobalSearchState &state) {
+  ValidateGlobalSearchState(state, true);
   if (!state.finalized) {
     throw InvalidInputException(
         "Distributed Lance search was not finalized before task planning");
   }
-  DistributedScanSplit split;
-  split.split_id = ExpectedSearchTaskId(state);
-  split.payload = EncodeFinalSearchTask(state);
-  split.estimated_cardinality =
-      optional_idx(NumericCast<idx_t>(state.arguments.k));
-  split.Validate();
-  return split;
+  if (state.empty_assignment) {
+    return {};
+  }
+  if (state.authorization_restricted) {
+    vector<DistributedScanSplit> result;
+    result.reserve(state.authorized_task_ids.size());
+    for (idx_t i = 0; i < state.authorized_task_ids.size(); i++) {
+      auto assignment =
+          ValidateAuthorizedTask(state, state.authorized_task_ids[i],
+                                 state.authorized_task_payloads[i]);
+      auto split = BuildSearchTaskAssignment(state, assignment.fragment_id);
+      if (split.split_id != state.authorized_task_ids[i] ||
+          split.payload != state.authorized_task_payloads[i]) {
+        throw InvalidInputException(
+            "Distributed Lance search clone changed authorization");
+      }
+      result.push_back(std::move(split));
+    }
+    return result;
+  }
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FINAL_SEARCH) {
+    return {BuildSearchTaskAssignment(state)};
+  }
+  vector<DistributedScanSplit> result;
+  result.reserve(state.fragment_ids.size());
+  for (auto fragment_id : state.fragment_ids) {
+    result.push_back(
+        BuildSearchTaskAssignment(state, optional_idx(fragment_id)));
+  }
+  return result;
 }
 
 void LanceVanePrepareSearchWorkerBindState(LanceVaneGlobalSearchState &state) {
@@ -916,11 +1220,15 @@ void LanceVanePrepareSearchWorkerBindState(LanceVaneGlobalSearchState &state) {
         "Distributed Lance search cannot prepare a contradictory worker bind");
   }
 
+  auto assignments = LanceVaneCreateSearchTaskAssignments(state);
   state.worker_bind = true;
   state.authorization_restricted = true;
-  state.authorized_task_ids = {ExpectedSearchTaskId(state)};
-  state.authorized_task_payloads = {
-      EncodeSearchTaskAssignment(ExpectedSearchTaskAssignment(state))};
+  state.authorized_task_ids.reserve(assignments.size());
+  state.authorized_task_payloads.reserve(assignments.size());
+  for (auto &assignment : assignments) {
+    state.authorized_task_ids.push_back(assignment.split_id);
+    state.authorized_task_payloads.push_back(assignment.payload);
+  }
   ValidateGlobalSearchState(state, true);
 }
 
@@ -945,6 +1253,7 @@ void LanceVaneApplySearchTaskAssignments(
     }
     state.authorized_task_ids.clear();
     state.authorized_task_payloads.clear();
+    state.selected_fragment_ids.clear();
     state.empty_assignment = true;
     state.task_assignment_applied = true;
     ValidateGlobalSearchState(state, true);
@@ -954,18 +1263,80 @@ void LanceVaneApplySearchTaskAssignments(
     throw InvalidInputException(
         "Distributed Lance search retry changed its task assignment");
   }
-  if (splits.size() != 1) {
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FINAL_SEARCH &&
+      splits.size() != 1) {
     throw InvalidInputException(
         "Distributed Lance search requires exactly one preauthorized "
         "SearchTaskAssignment");
   }
-  ValidateSearchTaskAssignment(state, splits[0]);
-  if (!state.authorization_restricted ||
-      state.authorized_task_ids != vector<string>{splits[0].split_id} ||
-      state.authorized_task_payloads != vector<string>{splits[0].payload}) {
+  if (!state.authorization_restricted) {
+    throw InvalidInputException(
+        "Distributed Lance search task assignment was not preauthorized");
+  }
+
+  struct ValidatedSplit {
+    string task_id;
+    string payload;
+    optional_idx fragment_id;
+  };
+  vector<ValidatedSplit> normalized;
+  normalized.reserve(splits.size());
+  for (auto &split : splits) {
+    split.Validate();
+    auto assignment =
+        ValidateAuthorizedTask(state, split.split_id, split.payload);
+    bool preauthorized = false;
+    for (idx_t i = 0; i < state.authorized_task_ids.size(); i++) {
+      if (state.authorized_task_ids[i] == split.split_id &&
+          state.authorized_task_payloads[i] == split.payload) {
+        preauthorized = true;
+        break;
+      }
+    }
+    if (!preauthorized) {
+      throw InvalidInputException(
+          "Distributed Lance search received an unauthorized task");
+    }
+    normalized.push_back(
+        {split.split_id, split.payload, assignment.fragment_id});
+  }
+  std::sort(normalized.begin(), normalized.end(),
+            [](const ValidatedSplit &left, const ValidatedSplit &right) {
+              if (left.fragment_id.IsValid() && right.fragment_id.IsValid()) {
+                return left.fragment_id.GetIndex() <
+                       right.fragment_id.GetIndex();
+              }
+              return left.task_id < right.task_id;
+            });
+  for (idx_t i = 1; i < normalized.size(); i++) {
+    if (normalized[i - 1].task_id == normalized[i].task_id) {
+      throw InvalidInputException(
+          "Distributed Lance search received a duplicate task assignment");
+    }
+  }
+  vector<string> assigned_ids;
+  vector<string> assigned_payloads;
+  vector<uint64_t> selected_fragments;
+  assigned_ids.reserve(normalized.size());
+  assigned_payloads.reserve(normalized.size());
+  selected_fragments.reserve(normalized.size());
+  for (auto &assignment : normalized) {
+    assigned_ids.push_back(std::move(assignment.task_id));
+    assigned_payloads.push_back(std::move(assignment.payload));
+    if (assignment.fragment_id.IsValid()) {
+      selected_fragments.push_back(assignment.fragment_id.GetIndex());
+    }
+  }
+  if (state.task_assignment_applied &&
+      (state.authorized_task_ids != assigned_ids ||
+       state.authorized_task_payloads != assigned_payloads ||
+       state.selected_fragment_ids != selected_fragments)) {
     throw InvalidInputException(
         "Distributed Lance search retry changed its task assignment");
   }
+  state.authorized_task_ids = std::move(assigned_ids);
+  state.authorized_task_payloads = std::move(assigned_payloads);
+  state.selected_fragment_ids = std::move(selected_fragments);
   state.empty_assignment = false;
   state.task_assignment_applied = true;
   ValidateGlobalSearchState(state, true);
@@ -1054,6 +1425,15 @@ void LanceVaneSerializeGlobalSearchState(
                            has_frozen_snapshot
                                ? state.frozen_snapshot->index_section_sha256
                                : string());
+  serializer.WriteProperty(250, "execution_variant",
+                           static_cast<uint64_t>(state.execution_variant));
+  serializer.WriteProperty(251, "fragment_ids", state.fragment_ids);
+  serializer.WriteProperty(252, "fragment_row_counts",
+                           state.fragment_row_counts);
+  serializer.WriteProperty(253, "fragment_bytes_on_disk",
+                           state.fragment_bytes_on_disk);
+  serializer.WriteProperty(254, "selected_fragment_ids",
+                           state.selected_fragment_ids);
 }
 
 LanceVaneGlobalSearchState
@@ -1160,6 +1540,23 @@ LanceVaneDeserializeGlobalSearchState(Deserializer &deserializer) {
       deserializer.ReadProperty<string>(248, "serialized_index_section");
   auto index_section_sha256 =
       deserializer.ReadProperty<string>(249, "index_section_sha256");
+  auto execution_variant =
+      deserializer.ReadProperty<uint64_t>(250, "execution_variant");
+  if (execution_variant >
+      static_cast<uint64_t>(LanceVaneSearchTaskVariant::FTS_CANDIDATES)) {
+    throw SerializationException(
+        "Distributed Lance search has an invalid execution variant");
+  }
+  state.execution_variant =
+      static_cast<LanceVaneSearchTaskVariant>(execution_variant);
+  state.fragment_ids =
+      deserializer.ReadProperty<vector<uint64_t>>(251, "fragment_ids");
+  state.fragment_row_counts =
+      deserializer.ReadProperty<vector<int64_t>>(252, "fragment_row_counts");
+  state.fragment_bytes_on_disk = deserializer.ReadProperty<vector<uint64_t>>(
+      253, "fragment_bytes_on_disk");
+  state.selected_fragment_ids =
+      deserializer.ReadProperty<vector<uint64_t>>(254, "selected_fragment_ids");
   if (frozen_snapshot_version != LANCE_VANE_FROZEN_SEARCH_SNAPSHOT_VERSION) {
     throw SerializationException(
         "Distributed Lance search has an unsupported frozen snapshot format");
@@ -1189,15 +1586,8 @@ LanceVaneDeserializeGlobalSearchState(Deserializer &deserializer) {
 }
 
 shared_ptr<LanceDatasetCacheEntry>
-LanceVaneOpenSearchSnapshot(ClientContext &context,
+OpenValidatedSearchSnapshot(ClientContext &context,
                             const LanceVaneGlobalSearchState &state) {
-  ValidateGlobalSearchState(state, true);
-  if (!state.worker_bind || !state.task_assignment_applied ||
-      state.empty_assignment) {
-    throw InvalidInputException(
-        "Distributed Lance search execution requires one authorized "
-        "SearchTaskAssignment");
-  }
   auto replay_path = LanceVaneReplayPath(context, state.physical_uri);
   if (replay_path != state.physical_uri) {
     throw IOException(
@@ -1211,6 +1601,35 @@ LanceVaneOpenSearchSnapshot(ClientContext &context,
       frozen.dataset.manifest_sha256, frozen.serialized_index_section,
       frozen.index_section_sha256, state.schema_fingerprint,
       state.private_uri_diagnostics);
+}
+
+shared_ptr<LanceDatasetCacheEntry>
+LanceVaneOpenSearchSnapshot(ClientContext &context,
+                            const LanceVaneGlobalSearchState &state) {
+  ValidateGlobalSearchState(state, true);
+  if (!state.worker_bind || !state.task_assignment_applied ||
+      state.empty_assignment ||
+      (state.execution_variant ==
+           LanceVaneSearchTaskVariant::VECTOR_CANDIDATES &&
+       state.selected_fragment_ids.empty())) {
+    throw InvalidInputException(
+        "Distributed Lance search execution requires authorized task "
+        "assignments");
+  }
+  return OpenValidatedSearchSnapshot(context, state);
+}
+
+shared_ptr<LanceDatasetCacheEntry>
+LanceVaneOpenSearchSnapshotForMaterialization(
+    ClientContext &context, const LanceVaneGlobalSearchState &state) {
+  ValidateGlobalSearchState(state, true);
+  if (!state.valid || !state.finalized || state.worker_bind ||
+      state.execution_variant !=
+          LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+    throw InvalidInputException(
+        "Distributed Lance vector materialization state is contradictory");
+  }
+  return OpenValidatedSearchSnapshot(context, state);
 }
 
 void LanceVanePopulateSearchSchema(ClientContext &context,
@@ -1234,6 +1653,18 @@ void LanceVanePopulateSearchSchema(ClientContext &context,
 void LanceVaneValidateExecutionInput(const TableFunctionInitInput &input,
                                      const LanceVaneGlobalSearchState &state) {
   ValidateGlobalSearchState(state, true);
+  if (state.execution_variant ==
+      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+    if (input.column_indexes !=
+            vector<ColumnIndex>{ColumnIndex(0), ColumnIndex(1)} ||
+        !input.projection_ids.empty() ||
+        (input.filters && !input.filters->filters.empty())) {
+      throw InvalidInputException(
+          "Distributed Lance vector candidate projection changed after "
+          "admission");
+    }
+    return;
+  }
   if (input.column_indexes != state.column_ids ||
       input.projection_ids != state.projection_ids) {
     throw InvalidInputException(
@@ -1253,6 +1684,18 @@ void LanceVaneValidateDistributedInput(
     const TableFunctionDistributedScanInput &input,
     const LanceVaneGlobalSearchState &state) {
   ValidateGlobalSearchState(state, true);
+  if (state.execution_variant ==
+      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+    if (input.column_ids !=
+            vector<ColumnIndex>{ColumnIndex(0), ColumnIndex(1)} ||
+        !input.projection_ids.empty() ||
+        (input.table_filters && !input.table_filters->filters.empty())) {
+      throw InvalidInputException(
+          "Distributed Lance vector candidate projection changed after "
+          "admission");
+    }
+    return;
+  }
   if (input.column_ids != state.column_ids ||
       input.projection_ids != state.projection_ids) {
     throw InvalidInputException(
