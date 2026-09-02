@@ -1654,6 +1654,52 @@ def _empty_search_task_assignment_batch(batch: bytes) -> bytes:
     return bytes(rewritten)
 
 
+def _worker_plan_with_truncated_search_index_plan(plan):
+    state = list(plan.__reduce_ex__(4)[2])
+    assert state[0] is True
+    serialized_root = bytes(state[1])
+
+    # SearchIndexPlan is bind-state property 229. Locate the property through
+    # its DuckDB field id, LEB128 byte length, version, and following field id
+    # so arbitrary frozen-manifest bytes cannot be mistaken for the plan.
+    matches: list[tuple[int, int, int]] = []
+    for field_offset in range(len(serialized_root) - 4):
+        if serialized_root[field_offset : field_offset + 2] != b"\xe5\x00":
+            continue
+        length_offset = field_offset + 2
+        payload_offset = length_offset
+        payload_len = 0
+        shift = 0
+        while payload_offset < len(serialized_root):
+            byte = serialized_root[payload_offset]
+            payload_offset += 1
+            payload_len |= (byte & 0x7F) << shift
+            if byte & 0x80 == 0:
+                break
+            shift += 7
+            assert shift < 64
+        payload_end = payload_offset + payload_len
+        if (
+            payload_len > 3
+            and serialized_root[payload_offset : payload_offset + 2] == b"\x01\x00"
+            and serialized_root[payload_end : payload_end + 2] == b"\xe6\x00"
+        ):
+            matches.append((length_offset, payload_offset, payload_end))
+    assert len(matches) == 1
+
+    length_offset, payload_offset, payload_end = matches[0]
+    truncated = serialized_root[payload_offset : payload_offset + 3]
+    state[1] = (
+        serialized_root[:length_offset]
+        + bytes([len(truncated)])
+        + truncated
+        + serialized_root[payload_end:]
+    )
+    result = plan.__class__.__new__(plan.__class__)
+    result.__setstate__(tuple(state))
+    return result
+
+
 def _rewrite_take_split(
     batch: bytes,
     *,
@@ -2508,6 +2554,18 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
             )
             assignment_payload = singleton[variant_offset : digest_offset + 32]
             assert len(assignment_payload) == 69
+
+            truncated_plan = _worker_plan_with_truncated_search_index_plan(
+                task.plan()
+            )
+            worker = _connect()
+            cursor = worker.cursor()
+            try:
+                with pytest.raises(Exception, match="SearchIndexPlan is malformed"):
+                    truncated_plan.clone(cursor)
+            finally:
+                cursor.close()
+                worker.close()
 
             retry_assignments = (
                 (singleton, None),

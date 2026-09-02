@@ -414,6 +414,30 @@ unsafe fn parse_index_plan<'a>(data: *const u8, len: usize) -> FfiResult<&'a [u8
     unsafe { slice_from_ptr(data, len, "SearchIndexPlan") }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_validate_search_index_plan(data: *const u8, len: usize) -> i32 {
+    let result = (|| -> FfiResult<()> {
+        let bytes = unsafe { parse_index_plan(data, len)? };
+        SearchIndexPlan::decode(bytes).map_err(|err| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("decode SearchIndexPlan: {err}"),
+            )
+        })?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
 unsafe fn combined_filter(
     filter_ir: *const u8,
     filter_ir_len: usize,
@@ -482,6 +506,28 @@ fn decode_namespace_filter_plan(bytes: &[u8], code: ErrorCode) -> FfiResult<Expr
             format!("NamespaceFilterPlan expression decode: {err}"),
         )
     })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_validate_namespace_filter_plan(
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    let result = (|| -> FfiResult<()> {
+        let bytes = unsafe { slice_from_ptr(data, len, "NamespaceFilterPlan")? };
+        decode_namespace_filter_plan(bytes, ErrorCode::InvalidArgument)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
 }
 
 async fn validate_plan(
@@ -1212,9 +1258,18 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
         let bytes = encode_namespace_filter_plan(schema, "age >= 18").expect("encode");
 
+        assert_eq!(
+            unsafe { lance_vane_validate_namespace_filter_plan(bytes.as_ptr(), bytes.len()) },
+            0
+        );
+
         for len in 0..bytes.len() {
             assert!(
                 decode_namespace_filter_plan(&bytes[..len], ErrorCode::InvalidArgument).is_err()
+            );
+            assert_ne!(
+                unsafe { lance_vane_validate_namespace_filter_plan(bytes.as_ptr(), len) },
+                0
             );
         }
 
@@ -1224,9 +1279,51 @@ mod tests {
             decode_namespace_filter_plan(&unknown_version, ErrorCode::InvalidArgument).is_err()
         );
 
-        let mut trailing = bytes;
+        let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(decode_namespace_filter_plan(&trailing, ErrorCode::InvalidArgument).is_err());
+        assert_ne!(
+            unsafe { lance_vane_validate_namespace_filter_plan(trailing.as_ptr(), trailing.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { lance_vane_validate_namespace_filter_plan(bytes.as_ptr(), bytes.len()) },
+            0
+        );
+    }
+
+    #[test]
+    fn search_index_plan_ffi_validator_rejects_truncation_and_trailing_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.push(b'g');
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(0);
+
+        assert_eq!(
+            unsafe { lance_vane_validate_search_index_plan(bytes.as_ptr(), bytes.len()) },
+            0
+        );
+        for len in 0..bytes.len() {
+            assert_ne!(
+                unsafe { lance_vane_validate_search_index_plan(bytes.as_ptr(), len) },
+                0
+            );
+        }
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_ne!(
+            unsafe { lance_vane_validate_search_index_plan(trailing.as_ptr(), trailing.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { lance_vane_validate_search_index_plan(bytes.as_ptr(), bytes.len()) },
+            0
+        );
     }
 
     #[test]

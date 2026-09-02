@@ -100,6 +100,7 @@ struct LanceVaneGlobalSearchState {
   vector<string> pending_filter_ir_parts;
   bool pending_complex_filter_pushdown_failed = false;
   string index_plan;
+  bool search_plan_payloads_validated = false;
   shared_ptr<const LanceVaneFrozenSearchSnapshot> frozen_snapshot;
   bool frozen_snapshot_payload_validated = false;
   string state_sha256;

@@ -35,10 +35,6 @@ static constexpr idx_t LANCE_VANE_SEARCH_UUID_SIZE = BaseUUID::STRING_SIZE;
 static constexpr idx_t LANCE_VANE_SHA256_SIZE = 32;
 static constexpr idx_t LANCE_VANE_SEARCH_TASK_PAYLOAD_SIZE =
     1 + LANCE_VANE_SEARCH_UUID_SIZE + LANCE_VANE_SHA256_SIZE;
-static constexpr uint16_t LANCE_VANE_SEARCH_INDEX_PLAN_VERSION = 1;
-static constexpr idx_t LANCE_VANE_SEARCH_INDEX_PLAN_HEADER_SIZE = 2;
-static constexpr uint16_t LANCE_VANE_NAMESPACE_FILTER_PLAN_VERSION = 1;
-static constexpr idx_t LANCE_VANE_NAMESPACE_FILTER_PLAN_HEADER_SIZE = 6;
 
 struct LanceVaneSearchBytesDeleter {
   size_t len;
@@ -108,38 +104,6 @@ static bool IsValidSearchUUID(const string &value) {
          BaseUUID::FromString(value, parsed, true);
 }
 
-static uint16_t ReadLittleEndianU16(const string &value, idx_t offset) {
-  return static_cast<uint16_t>(static_cast<uint8_t>(value[offset])) |
-         static_cast<uint16_t>(static_cast<uint8_t>(value[offset + 1])) << 8;
-}
-
-static uint32_t ReadLittleEndianU32(const string &value, idx_t offset) {
-  uint32_t result = 0;
-  for (idx_t byte_index = 0; byte_index < sizeof(result); byte_index++) {
-    result |=
-        static_cast<uint32_t>(static_cast<uint8_t>(value[offset + byte_index]))
-        << (byte_index * 8);
-  }
-  return result;
-}
-
-static bool HasSupportedSearchIndexPlanEnvelope(const string &value) {
-  return value.size() > LANCE_VANE_SEARCH_INDEX_PLAN_HEADER_SIZE &&
-         ReadLittleEndianU16(value, 0) == LANCE_VANE_SEARCH_INDEX_PLAN_VERSION;
-}
-
-static bool HasSupportedNamespaceFilterPlanEnvelope(const string &value) {
-  if (value.size() <= LANCE_VANE_NAMESPACE_FILTER_PLAN_HEADER_SIZE ||
-      ReadLittleEndianU16(value, 0) !=
-          LANCE_VANE_NAMESPACE_FILTER_PLAN_VERSION) {
-    return false;
-  }
-  auto body_size = static_cast<idx_t>(ReadLittleEndianU32(value, 2));
-  return body_size > 0 &&
-         body_size ==
-             value.size() - LANCE_VANE_NAMESPACE_FILTER_PLAN_HEADER_SIZE;
-}
-
 static string LanceVaneSha256(const string &value) {
   string result(LANCE_VANE_SHA256_SIZE, '\0');
   auto rc =
@@ -150,6 +114,28 @@ static string LanceVaneSha256(const string &value) {
                       LanceFormatErrorSuffix());
   }
   return result;
+}
+
+static void
+ValidateAndMarkSearchPlanPayloads(LanceVaneGlobalSearchState &state) {
+  auto *index_plan = reinterpret_cast<const uint8_t *>(state.index_plan.data());
+  if (lance_vane_validate_search_index_plan(index_plan,
+                                            state.index_plan.size()) != 0) {
+    throw SerializationException(
+        "Distributed Lance SearchIndexPlan is malformed" +
+        LanceFormatErrorSuffix());
+  }
+  if (!state.namespace_filter_plan.empty()) {
+    auto *namespace_filter =
+        reinterpret_cast<const uint8_t *>(state.namespace_filter_plan.data());
+    if (lance_vane_validate_namespace_filter_plan(
+            namespace_filter, state.namespace_filter_plan.size()) != 0) {
+      throw SerializationException(
+          "Distributed Lance NamespaceFilterPlan is malformed" +
+          LanceFormatErrorSuffix());
+    }
+  }
+  state.search_plan_payloads_validated = true;
 }
 
 static void
@@ -454,12 +440,13 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
         !state.dataset_generation_id.empty() ||
         !state.schema_fingerprint.empty() ||
         !state.namespace_filter_plan.empty() || !state.index_plan.empty() ||
-        !state.column_ids.empty() || !state.projection_ids.empty() ||
-        !state.final_filter_ir.empty() || !state.filter_fingerprint.empty() ||
-        state.filter_pushed_down || state.worker_bind ||
-        state.task_assignment_applied || state.empty_assignment ||
-        state.authorization_restricted || !state.authorized_task_ids.empty() ||
-        state.frozen_snapshot || state.frozen_snapshot_payload_validated) {
+        state.search_plan_payloads_validated || !state.column_ids.empty() ||
+        !state.projection_ids.empty() || !state.final_filter_ir.empty() ||
+        !state.filter_fingerprint.empty() || state.filter_pushed_down ||
+        state.worker_bind || state.task_assignment_applied ||
+        state.empty_assignment || state.authorization_restricted ||
+        !state.authorized_task_ids.empty() || state.frozen_snapshot ||
+        state.frozen_snapshot_payload_validated) {
       throw SerializationException(
           "Distributed Lance search qualification failure is malformed");
     }
@@ -476,12 +463,10 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
       state.dataset_generation_id.find('\0') != string::npos ||
       state.schema_fingerprint.size() != LANCE_VANE_SHA256_SIZE ||
       state.filter_fingerprint.size() != LANCE_VANE_SHA256_SIZE ||
-      !state.frozen_snapshot || !state.frozen_snapshot_payload_validated ||
+      !state.search_plan_payloads_validated || !state.frozen_snapshot ||
+      !state.frozen_snapshot_payload_validated ||
       state.frozen_snapshot->dataset.schema_fingerprint !=
-          state.schema_fingerprint ||
-      !HasSupportedSearchIndexPlanEnvelope(state.index_plan) ||
-      (!state.namespace_filter_plan.empty() &&
-       !HasSupportedNamespaceFilterPlanEnvelope(state.namespace_filter_plan))) {
+          state.schema_fingerprint) {
     throw SerializationException("Distributed Lance search state is malformed");
   }
   if (!state.finalized &&
@@ -673,8 +658,7 @@ BuildNamespaceFilterPlan(const LanceVanePhysicalCandidate &candidate,
   size_t len = 0;
   auto rc = lance_vane_plan_namespace_filter(
       candidate.dataset, namespace_filter.c_str(), &bytes, &len);
-  if (rc != 0 || !bytes ||
-      len <= LANCE_VANE_NAMESPACE_FILTER_PLAN_HEADER_SIZE) {
+  if (rc != 0 || !bytes || len == 0) {
     if (bytes) {
       lance_vane_free_bytes(bytes, len);
     }
@@ -684,10 +668,6 @@ BuildNamespaceFilterPlan(const LanceVanePhysicalCandidate &candidate,
   }
   string result(reinterpret_cast<const char *>(bytes), len);
   lance_vane_free_bytes(bytes, len);
-  if (!HasSupportedNamespaceFilterPlanEnvelope(result)) {
-    throw InternalException(
-        "Distributed Lance namespace filter planner returned an invalid plan");
-  }
   return result;
 }
 
@@ -736,6 +716,7 @@ LanceVanePrepareGlobalSearchState(const LanceVanePhysicalCandidate &candidate,
         BuildFilterFingerprint(output_names, vector<ColumnIndex>(), nullptr);
     state.index_plan =
         BuildIndexPlan(candidate, arguments, *state.frozen_snapshot);
+    ValidateAndMarkSearchPlanPayloads(state);
   } catch (Exception &) {
     state = {};
     state.arguments = arguments;
@@ -1156,6 +1137,9 @@ LanceVaneDeserializeGlobalSearchState(Deserializer &deserializer) {
              !index_section_sha256.empty()) {
     throw SerializationException(
         "Distributed Lance search has an unclaimed frozen snapshot payload");
+  }
+  if (state.valid) {
+    ValidateAndMarkSearchPlanPayloads(state);
   }
   ValidateGlobalSearchState(state, true);
   return state;

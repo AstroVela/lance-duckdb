@@ -89,12 +89,13 @@ dataset version and generation, schema fingerprint, filter state, search
 arguments, `SearchIndexPlan`, and optional `NamespaceFilterPlan` in the typed,
 versioned global state. These nested plans retain strict version, length,
 UTF-8, collection, full-consumption, and trailing-byte validation without
-separate four-byte magic prefixes. The index plan records the exact index
-segments selected for the snapshot and the fragments that require flat search
-when an index has partial coverage. A worker validates the complete state and
-its assigned task before execution. Retries must reuse the same assignment, and
-execution fails closed if the snapshot, dataset generation, schema, or selected
-index segments no longer match.
+separate four-byte magic prefixes. Their Rust-owned decoders run when worker
+bind state is admitted, before the frozen dataset is opened. The index plan
+records the exact index segments selected for the snapshot and the fragments
+that require flat search when an index has partial coverage. A worker validates
+the complete state and its assigned task before execution. Retries must reuse
+the same assignment, and execution fails closed if the snapshot, dataset
+generation, schema, or selected index segments no longer match.
 
 The core manifest does not contain Lance's separately stored `IndexSection`.
 The coordinator therefore serializes the complete supported index metadata
