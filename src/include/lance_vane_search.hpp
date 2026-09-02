@@ -22,6 +22,11 @@ struct LanceVaneFrozenSearchSnapshot {
 };
 
 enum class LanceVaneSearchKind : uint8_t { VECTOR = 0, FTS = 1, HYBRID = 2 };
+enum class LanceVaneSearchTaskVariant : uint8_t {
+  FINAL_SEARCH = 0,
+  VECTOR_CANDIDATES = 1,
+  FTS_CANDIDATES = 2
+};
 enum class LanceVaneSearchOverload : uint8_t {
   VECTOR_FLOAT = 0,
   VECTOR_DOUBLE = 1,
@@ -100,11 +105,11 @@ struct LanceVaneGlobalSearchState {
   string state_sha256;
 
   bool worker_bind = false;
-  bool splits_applied = false;
+  bool task_assignment_applied = false;
   bool empty_assignment = false;
   bool authorization_restricted = false;
-  vector<string> authorized_split_ids;
-  vector<string> authorized_split_payloads;
+  vector<string> authorized_task_ids;
+  vector<string> authorized_task_payloads;
 };
 
 void LanceVaneCapturePhysicalCandidate(
@@ -132,9 +137,11 @@ LanceVaneGlobalSearchState LanceVaneFinalizeGlobalSearchState(
     bool complex_filter_pushdown_failed);
 
 DistributedScanSplit
-LanceVaneCreateGlobalSearchSplit(const LanceVaneGlobalSearchState &state);
+LanceVaneCreateSearchTaskAssignment(const LanceVaneGlobalSearchState &state);
 
-void LanceVaneApplyGlobalSearchSplits(
+void LanceVanePrepareSearchWorkerBindState(LanceVaneGlobalSearchState &state);
+
+void LanceVaneApplySearchTaskAssignments(
     LanceVaneGlobalSearchState &state,
     const vector<DistributedScanSplit> &splits);
 
@@ -160,7 +167,7 @@ void LanceVaneValidateDistributedInput(
     const TableFunctionDistributedScanInput &input,
     const LanceVaneGlobalSearchState &state);
 
-TableFunctionDistributedScanCallbacks LanceVaneGlobalSearchCallbacks(
+TableFunctionDistributedScanCallbacks LanceVaneSearchTaskCallbacks(
     table_function_plan_distributed_scan_splits_t plan_splits,
     table_function_create_distributed_worker_bind_t create_worker_bind,
     table_function_apply_distributed_scan_splits_t apply_splits);

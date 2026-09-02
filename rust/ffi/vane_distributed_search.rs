@@ -34,8 +34,8 @@ use super::util::{
 };
 use super::vane_search_plan::{build_search_index_plan, SearchIndexPlan, SearchKind};
 
-const NAMESPACE_FILTER_MAGIC: &[u8; 4] = b"LNF1";
 const NAMESPACE_FILTER_VERSION: u16 = 1;
+const NAMESPACE_FILTER_HEADER_LEN: usize = 6;
 
 unsafe fn optional_cstr<'a>(
     value: *const c_char,
@@ -212,9 +212,15 @@ fn encode_namespace_filter_plan(schema: Arc<Schema>, sql: &str) -> FfiResult<Vec
             format!("namespace filter serialization: {err}"),
         )
     })?;
-    let mut result = Vec::with_capacity(6 + encoded.len());
-    result.extend_from_slice(NAMESPACE_FILTER_MAGIC);
+    let encoded_len = u32::try_from(encoded.len()).map_err(|_| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            "NamespaceFilterPlan expression is too large",
+        )
+    })?;
+    let mut result = Vec::with_capacity(NAMESPACE_FILTER_HEADER_LEN + encoded.len());
     result.extend_from_slice(&NAMESPACE_FILTER_VERSION.to_le_bytes());
+    result.extend_from_slice(&encoded_len.to_le_bytes());
     result.extend_from_slice(encoded.as_ref());
     Ok(result)
 }
@@ -374,7 +380,7 @@ pub unsafe extern "C" fn lance_vane_build_search_index_plan(
                 text_column,
                 use_vector_index != 0,
             )),
-            "build LSI1",
+            "build SearchIndexPlan",
         )
     })();
 
@@ -402,10 +408,10 @@ unsafe fn parse_index_plan<'a>(data: *const u8, len: usize) -> FfiResult<&'a [u8
     if len == 0 {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
-            "LSI1 plan must not be empty",
+            "SearchIndexPlan must not be empty",
         ));
     }
-    unsafe { slice_from_ptr(data, len, "LSI1 plan") }
+    unsafe { slice_from_ptr(data, len, "SearchIndexPlan") }
 }
 
 unsafe fn combined_filter(
@@ -449,18 +455,33 @@ unsafe fn combined_filter(
 }
 
 fn decode_namespace_filter_plan(bytes: &[u8], code: ErrorCode) -> FfiResult<Expr> {
-    if bytes.len() <= 6 || &bytes[..4] != NAMESPACE_FILTER_MAGIC {
-        return Err(FfiError::new(code, "namespace filter plan is malformed"));
+    if bytes.len() <= NAMESPACE_FILTER_HEADER_LEN {
+        return Err(FfiError::new(code, "NamespaceFilterPlan is malformed"));
     }
-    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let version = u16::from_le_bytes([bytes[0], bytes[1]]);
     if version != NAMESPACE_FILTER_VERSION {
         return Err(FfiError::new(
             code,
-            format!("unsupported namespace filter plan version {version}"),
+            format!("unsupported NamespaceFilterPlan version {version}"),
         ));
     }
-    Expr::from_bytes(&bytes[6..])
-        .map_err(|err| FfiError::new(code, format!("namespace filter plan decode: {err}")))
+    let encoded_len = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+    let remaining = bytes.len() - NAMESPACE_FILTER_HEADER_LEN;
+    if encoded_len == 0 || encoded_len > remaining {
+        return Err(FfiError::new(code, "NamespaceFilterPlan is truncated"));
+    }
+    if encoded_len < remaining {
+        return Err(FfiError::new(
+            code,
+            "NamespaceFilterPlan contains trailing bytes",
+        ));
+    }
+    Expr::from_bytes(&bytes[NAMESPACE_FILTER_HEADER_LEN..]).map_err(|err| {
+        FfiError::new(
+            code,
+            format!("NamespaceFilterPlan expression decode: {err}"),
+        )
+    })
 }
 
 async fn validate_plan(
@@ -743,7 +764,7 @@ pub unsafe extern "C" fn lance_vane_create_knn_stream_ir(
                 None,
                 use_index != 0,
             )),
-            "validate LSI1",
+            "validate SearchIndexPlan",
         )?;
         let filter = unsafe {
             combined_filter(
@@ -804,7 +825,7 @@ pub unsafe extern "C" fn lance_vane_create_fts_stream_ir(
                 Some(text_column),
                 false,
             )),
-            "validate LSI1",
+            "validate SearchIndexPlan",
         )?;
         let filter = unsafe {
             combined_filter(
@@ -873,7 +894,7 @@ pub unsafe extern "C" fn lance_vane_create_hybrid_stream_ir(
                 Some(text_column),
                 use_index != 0,
             )),
-            "validate LSI1",
+            "validate SearchIndexPlan",
         )?;
         let filter = unsafe {
             combined_filter(
@@ -1172,11 +1193,40 @@ mod tests {
             .parse_filter("age >= 18")
             .expect("coordinator plan");
         let bytes = encode_namespace_filter_plan(schema, "age >= 18").expect("encode");
-        assert_eq!(&bytes[..4], NAMESPACE_FILTER_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            NAMESPACE_FILTER_VERSION
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize,
+            bytes.len() - NAMESPACE_FILTER_HEADER_LEN
+        );
         assert_eq!(
             decode_namespace_filter_plan(&bytes, ErrorCode::InvalidArgument).expect("decode"),
             expected
         );
+    }
+
+    #[test]
+    fn namespace_filter_plan_rejects_versions_truncation_and_trailing_bytes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
+        let bytes = encode_namespace_filter_plan(schema, "age >= 18").expect("encode");
+
+        for len in 0..bytes.len() {
+            assert!(
+                decode_namespace_filter_plan(&bytes[..len], ErrorCode::InvalidArgument).is_err()
+            );
+        }
+
+        let mut unknown_version = bytes.clone();
+        unknown_version[..2].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(
+            decode_namespace_filter_plan(&unknown_version, ErrorCode::InvalidArgument).is_err()
+        );
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode_namespace_filter_plan(&trailing, ErrorCode::InvalidArgument).is_err());
     }
 
     #[test]

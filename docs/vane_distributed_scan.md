@@ -72,21 +72,29 @@ after loading the statically linked extension on each worker database.
 ## Global search contract
 
 Vector, full-text, and hybrid search are admitted as global operations. Each
-search node produces exactly one authenticated global split, and Vane schedules
-that split on one worker. The worker executes Lance's global top-k operation,
+search node produces exactly one authenticated `FINAL_SEARCH` task assignment
+using the `lance.search-task` version 1 split codec, and Vane schedules that task
+on one worker. The fixed-size task payload contains only its typed variant, the
+search-node UUID, and the SHA-256 identity of the serialized global search
+state. Unknown variants, candidate variants not implemented by the current
+operator, malformed payload sizes, foreign state identities, and changed retry
+assignments fail closed. The worker executes Lance's global top-k operation,
 including hybrid reranking, against the frozen coordinator snapshot. Vane does
 not currently divide one search node into fragment candidates across multiple
 workers; that parallel execution model is tracked in
 [Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
 
-Before split creation, the coordinator freezes the source class, physical URI,
+Before task creation, the coordinator freezes the source class, physical URI,
 dataset version and generation, schema fingerprint, filter state, search
-arguments, and selected index plan. The index plan records the exact index
+arguments, `SearchIndexPlan`, and optional `NamespaceFilterPlan` in the typed,
+versioned global state. These nested plans retain strict version, length,
+UTF-8, collection, full-consumption, and trailing-byte validation without
+separate four-byte magic prefixes. The index plan records the exact index
 segments selected for the snapshot and the fragments that require flat search
 when an index has partial coverage. A worker validates the complete state and
-its assigned split before execution. Retries must reuse the same assignment,
-and execution fails closed if the snapshot, dataset generation, schema, or
-selected index segments no longer match.
+its assigned task before execution. Retries must reuse the same assignment, and
+execution fails closed if the snapshot, dataset generation, schema, or selected
+index segments no longer match.
 
 The core manifest does not contain Lance's separately stored `IndexSection`.
 The coordinator therefore serializes the complete supported index metadata
@@ -208,9 +216,9 @@ each fragment split. The official DuckDB build retains these pushdowns.
 | --- | --- | --- |
 | Ordinary Lance scan | One split per fragment, scheduled across workers | The physical dataset and frozen snapshot must be replayable by every worker. |
 | `rowid`/`_rowid` point lookup | Ordered take splits, scheduled across workers | Duplicate `IN` candidates are normalized; final row order still requires `ORDER BY`. |
-| `lance_vector_search` | One authenticated global split on one worker | Global top-k semantics are preserved; cross-worker candidate search is tracked in #9. |
-| `lance_fts` | One authenticated global split on one worker | Global score ordering is preserved; cross-worker candidate search is tracked in #9. |
-| `lance_hybrid_search` | One authenticated global split on one worker | Vector/text retrieval and reranking remain one global operation; cross-worker execution is tracked in #9. |
+| `lance_vector_search` | One authenticated `FINAL_SEARCH` task on one worker | Global top-k semantics are preserved; cross-worker candidate search is tracked in #9. |
+| `lance_fts` | One authenticated `FINAL_SEARCH` task on one worker | Global score ordering is preserved; cross-worker candidate search is tracked in #9. |
+| `lance_hybrid_search` | One authenticated `FINAL_SEARCH` task on one worker | Vector/text retrieval and reranking remain one global operation; cross-worker execution is tracked in #9. |
 | Directory namespace reads | Resolved to a frozen replayable physical URI | Attach-time and planning-time storage state must agree. |
 | Standard REST namespace reads | Coordinator resolves the bound version; workers read the physical snapshot | Requires a materialized table URI plus detailed version and schema metadata; workers do not use the REST control plane. |
 | Coordinator-only `TYPE LANCE` storage secrets | Rejected for distributed execution | Use Vane's replayable query-session settings or credential provider. Native local queries retain secret support. |
@@ -225,7 +233,7 @@ standard REST tables that provide a stable replayable physical snapshot.
 Parallelizing one global search across multiple workers remains outside this
 contract and is tracked in
 [Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). Additional
-defensive limits for malformed internal `LSI1` collection counts are tracked in
+defensive limits for malformed internal `SearchIndexPlan` collection counts are tracked in
 [Issue #10](https://github.com/AstroVela/lance-duckdb/issues/10). Distributed
 writes have a separate
 [write contract](./vane_distributed_write.md). Distributed replay of
