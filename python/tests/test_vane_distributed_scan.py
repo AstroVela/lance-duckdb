@@ -2566,19 +2566,22 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
                 worker.close()
 
             retry_assignments = (
-                (singleton, None),
-                (singleton, None),
+                (singleton, None, "ok"),
+                (singleton, None, "ok"),
                 (
                     foreign_singleton,
                     "unauthorized SearchTaskAssignment identity",
+                    None,
                 ),
                 # Vane passes an explicit no-work extension split to the
                 # callback as an empty assignment and suppresses execution.
-                (_empty_search_task_assignment_batch(singleton), None),
+                (_empty_search_task_assignment_batch(singleton), None, "empty"),
             )
-            for attempt_id, (retry_batch, expected_error) in enumerate(
-                retry_assignments
-            ):
+            for attempt_id, (
+                retry_batch,
+                expected_error,
+                expected_completion_status,
+            ) in enumerate(retry_assignments):
                 retry_cursor = connection.cursor()
                 retry_plan = None
                 retry_result = None
@@ -2596,7 +2599,9 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
                             assignment_batch=retry_batch,
                             attempt_id=attempt_id,
                         )
-                        assert retry_result.completion_status == "ok"
+                        assert (
+                            retry_result.completion_status == expected_completion_status
+                        )
                     else:
                         with pytest.raises(Exception, match=expected_error):
                             _execute_captured_worker_task(
