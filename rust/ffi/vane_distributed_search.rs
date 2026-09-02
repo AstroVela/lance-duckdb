@@ -34,8 +34,8 @@ use super::util::{
 };
 use super::vane_search_plan::{build_search_index_plan, SearchIndexPlan, SearchKind};
 
-const NAMESPACE_FILTER_MAGIC: &[u8; 4] = b"LNF1";
 const NAMESPACE_FILTER_VERSION: u16 = 1;
+const NAMESPACE_FILTER_HEADER_LEN: usize = 6;
 
 unsafe fn optional_cstr<'a>(
     value: *const c_char,
@@ -212,9 +212,15 @@ fn encode_namespace_filter_plan(schema: Arc<Schema>, sql: &str) -> FfiResult<Vec
             format!("namespace filter serialization: {err}"),
         )
     })?;
-    let mut result = Vec::with_capacity(6 + encoded.len());
-    result.extend_from_slice(NAMESPACE_FILTER_MAGIC);
+    let encoded_len = u32::try_from(encoded.len()).map_err(|_| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            "NamespaceFilterPlan expression is too large",
+        )
+    })?;
+    let mut result = Vec::with_capacity(NAMESPACE_FILTER_HEADER_LEN + encoded.len());
     result.extend_from_slice(&NAMESPACE_FILTER_VERSION.to_le_bytes());
+    result.extend_from_slice(&encoded_len.to_le_bytes());
     result.extend_from_slice(encoded.as_ref());
     Ok(result)
 }
@@ -374,7 +380,7 @@ pub unsafe extern "C" fn lance_vane_build_search_index_plan(
                 text_column,
                 use_vector_index != 0,
             )),
-            "build LSI1",
+            "build SearchIndexPlan",
         )
     })();
 
@@ -402,10 +408,74 @@ unsafe fn parse_index_plan<'a>(data: *const u8, len: usize) -> FfiResult<&'a [u8
     if len == 0 {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
-            "LSI1 plan must not be empty",
+            "SearchIndexPlan must not be empty",
         ));
     }
-    unsafe { slice_from_ptr(data, len, "LSI1 plan") }
+    unsafe { slice_from_ptr(data, len, "SearchIndexPlan") }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lance_vane_validate_search_index_plan(
+    data: *const u8,
+    len: usize,
+    dataset_version: u64,
+    generation: *const c_char,
+    search_kind: u8,
+    vector_column: *const c_char,
+    text_column: *const c_char,
+    use_vector_index: u8,
+) -> i32 {
+    let result = (|| -> FfiResult<()> {
+        let bytes = unsafe { parse_index_plan(data, len)? };
+        let generation = unsafe { cstr_to_str(generation, "search generation")? };
+        let kind = SearchKind::try_from(search_kind).map_err(|err| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("SearchIndexPlan search kind: {err}"),
+            )
+        })?;
+        let vector_column = unsafe { optional_cstr(vector_column, "vector column")? };
+        let text_column = unsafe { optional_cstr(text_column, "text column")? };
+        let use_vector_index = match use_vector_index {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "SearchIndexPlan use_vector_index is not boolean",
+                ));
+            }
+        };
+        SearchIndexPlan::decode(bytes)
+            .and_then(|plan| {
+                plan.validate_admission(
+                    dataset_version,
+                    generation,
+                    kind,
+                    vector_column,
+                    text_column,
+                    use_vector_index,
+                )
+            })
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("validate SearchIndexPlan admission: {err}"),
+                )
+            })?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
 }
 
 unsafe fn combined_filter(
@@ -449,18 +519,55 @@ unsafe fn combined_filter(
 }
 
 fn decode_namespace_filter_plan(bytes: &[u8], code: ErrorCode) -> FfiResult<Expr> {
-    if bytes.len() <= 6 || &bytes[..4] != NAMESPACE_FILTER_MAGIC {
-        return Err(FfiError::new(code, "namespace filter plan is malformed"));
+    if bytes.len() <= NAMESPACE_FILTER_HEADER_LEN {
+        return Err(FfiError::new(code, "NamespaceFilterPlan is malformed"));
     }
-    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let version = u16::from_le_bytes([bytes[0], bytes[1]]);
     if version != NAMESPACE_FILTER_VERSION {
         return Err(FfiError::new(
             code,
-            format!("unsupported namespace filter plan version {version}"),
+            format!("unsupported NamespaceFilterPlan version {version}"),
         ));
     }
-    Expr::from_bytes(&bytes[6..])
-        .map_err(|err| FfiError::new(code, format!("namespace filter plan decode: {err}")))
+    let encoded_len = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+    let remaining = bytes.len() - NAMESPACE_FILTER_HEADER_LEN;
+    if encoded_len == 0 || encoded_len > remaining {
+        return Err(FfiError::new(code, "NamespaceFilterPlan is truncated"));
+    }
+    if encoded_len < remaining {
+        return Err(FfiError::new(
+            code,
+            "NamespaceFilterPlan contains trailing bytes",
+        ));
+    }
+    Expr::from_bytes(&bytes[NAMESPACE_FILTER_HEADER_LEN..]).map_err(|err| {
+        FfiError::new(
+            code,
+            format!("NamespaceFilterPlan expression decode: {err}"),
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_validate_namespace_filter_plan(
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    let result = (|| -> FfiResult<()> {
+        let bytes = unsafe { slice_from_ptr(data, len, "NamespaceFilterPlan")? };
+        decode_namespace_filter_plan(bytes, ErrorCode::InvalidArgument)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
 }
 
 async fn validate_plan(
@@ -743,7 +850,7 @@ pub unsafe extern "C" fn lance_vane_create_knn_stream_ir(
                 None,
                 use_index != 0,
             )),
-            "validate LSI1",
+            "validate SearchIndexPlan",
         )?;
         let filter = unsafe {
             combined_filter(
@@ -804,7 +911,7 @@ pub unsafe extern "C" fn lance_vane_create_fts_stream_ir(
                 Some(text_column),
                 false,
             )),
-            "validate LSI1",
+            "validate SearchIndexPlan",
         )?;
         let filter = unsafe {
             combined_filter(
@@ -873,7 +980,7 @@ pub unsafe extern "C" fn lance_vane_create_hybrid_stream_ir(
                 Some(text_column),
                 use_index != 0,
             )),
-            "validate LSI1",
+            "validate SearchIndexPlan",
         )?;
         let filter = unsafe {
             combined_filter(
@@ -1145,6 +1252,7 @@ fn cmp_desc_f32(left: f32, right: f32) -> Ordering {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ffi::CString;
 
     use super::*;
 
@@ -1172,10 +1280,195 @@ mod tests {
             .parse_filter("age >= 18")
             .expect("coordinator plan");
         let bytes = encode_namespace_filter_plan(schema, "age >= 18").expect("encode");
-        assert_eq!(&bytes[..4], NAMESPACE_FILTER_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            NAMESPACE_FILTER_VERSION
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize,
+            bytes.len() - NAMESPACE_FILTER_HEADER_LEN
+        );
         assert_eq!(
             decode_namespace_filter_plan(&bytes, ErrorCode::InvalidArgument).expect("decode"),
             expected
+        );
+    }
+
+    #[test]
+    fn namespace_filter_plan_rejects_versions_truncation_and_trailing_bytes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
+        let bytes = encode_namespace_filter_plan(schema, "age >= 18").expect("encode");
+
+        assert_eq!(
+            unsafe { lance_vane_validate_namespace_filter_plan(bytes.as_ptr(), bytes.len()) },
+            0
+        );
+
+        for len in 0..bytes.len() {
+            assert!(
+                decode_namespace_filter_plan(&bytes[..len], ErrorCode::InvalidArgument).is_err()
+            );
+            assert_ne!(
+                unsafe { lance_vane_validate_namespace_filter_plan(bytes.as_ptr(), len) },
+                0
+            );
+        }
+
+        let mut unknown_version = bytes.clone();
+        unknown_version[..2].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(
+            decode_namespace_filter_plan(&unknown_version, ErrorCode::InvalidArgument).is_err()
+        );
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_namespace_filter_plan(&trailing, ErrorCode::InvalidArgument).is_err());
+        assert_ne!(
+            unsafe { lance_vane_validate_namespace_filter_plan(trailing.as_ptr(), trailing.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { lance_vane_validate_namespace_filter_plan(bytes.as_ptr(), bytes.len()) },
+            0
+        );
+    }
+
+    #[test]
+    fn search_index_plan_ffi_validator_rejects_truncation_and_trailing_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&7_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.push(b'g');
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&4_i32.to_le_bytes());
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(b"vector");
+        bytes.push(0);
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.push(0);
+
+        let generation = CString::new("g").unwrap();
+        let other_generation = CString::new("other").unwrap();
+        let vector_column = CString::new("vector").unwrap();
+        let other_vector_column = CString::new("other_vector").unwrap();
+        let validate = |candidate: &[u8],
+                        dataset_version: u64,
+                        generation: &CString,
+                        kind: SearchKind,
+                        vector_column: Option<&CString>,
+                        use_vector_index: u8| unsafe {
+            lance_vane_validate_search_index_plan(
+                candidate.as_ptr(),
+                candidate.len(),
+                dataset_version,
+                generation.as_ptr(),
+                kind as u8,
+                vector_column.map_or(ptr::null(), |column| column.as_ptr()),
+                ptr::null(),
+                use_vector_index,
+            )
+        };
+
+        assert_eq!(
+            validate(
+                &bytes,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
+            0
+        );
+        for len in 0..bytes.len() {
+            assert_ne!(
+                validate(
+                    &bytes[..len],
+                    7,
+                    &generation,
+                    SearchKind::Vector,
+                    Some(&vector_column),
+                    0,
+                ),
+                0
+            );
+        }
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_ne!(
+            validate(
+                &trailing,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
+            0
+        );
+        assert_eq!(
+            validate(
+                &bytes,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
+            0
+        );
+        assert_ne!(
+            validate(
+                &bytes,
+                8,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
+            0
+        );
+        assert_ne!(
+            validate(
+                &bytes,
+                7,
+                &other_generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                0,
+            ),
+            0
+        );
+        assert_ne!(
+            validate(&bytes, 7, &generation, SearchKind::Fts, None, 0,),
+            0
+        );
+        assert_ne!(
+            validate(
+                &bytes,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&other_vector_column),
+                0,
+            ),
+            0
+        );
+        assert_ne!(
+            validate(
+                &bytes,
+                7,
+                &generation,
+                SearchKind::Vector,
+                Some(&vector_column),
+                2,
+            ),
+            0
         );
     }
 

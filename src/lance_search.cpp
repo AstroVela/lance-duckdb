@@ -1312,13 +1312,13 @@ static vector<DistributedScanSplit> LancePlanDistributedKnnSearch(
     const TableFunctionDistributedScanPlanningInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto state = LanceBuildKnnVaneState(input, bind_data);
-  auto split = LanceVaneCreateGlobalSearchSplit(state);
+  if (state.empty_assignment) {
+    return {};
+  }
+  auto split = LanceVaneCreateSearchTaskAssignment(state);
   if (state.authorization_restricted) {
-    if (state.empty_assignment) {
-      return {};
-    }
-    if (state.authorized_split_ids != vector<string>{split.split_id} ||
-        state.authorized_split_payloads != vector<string>{split.payload}) {
+    if (state.authorized_task_ids != vector<string>{split.split_id} ||
+        state.authorized_task_payloads != vector<string>{split.payload}) {
       throw InvalidInputException(
           "Distributed Lance vector search clone changed authorization");
     }
@@ -1330,7 +1330,7 @@ static unique_ptr<FunctionData> LanceCreateDistributedKnnWorkerBind(
     const TableFunctionDistributedScanInput &input) {
   auto &source = input.bind_data->Cast<LanceKnnBindData>();
   auto state = LanceBuildKnnVaneState(input, source);
-  state.worker_bind = true;
+  LanceVanePrepareSearchWorkerBindState(state);
 
   auto result = make_uniq<LanceKnnBindData>();
   result->column_ids = source.column_ids;
@@ -1357,7 +1357,7 @@ static void
 LanceApplyDistributedKnnSearch(optional_ptr<FunctionData> worker_bind,
                                const vector<DistributedScanSplit> &splits) {
   auto &bind_data = worker_bind->Cast<LanceKnnBindData>();
-  LanceVaneApplyGlobalSearchSplits(bind_data.vane_state, splits);
+  LanceVaneApplySearchTaskAssignments(bind_data.vane_state, splits);
 }
 
 static void LanceKnnSerialize(Serializer &serializer,
@@ -1406,9 +1406,9 @@ static unique_ptr<FunctionData> LanceKnnDeserialize(Deserializer &deserializer,
 
 static TableFunctionDistributedScanCallbacks
 LanceKnnDistributedSearchCallbacks() {
-  return LanceVaneGlobalSearchCallbacks(LancePlanDistributedKnnSearch,
-                                        LanceCreateDistributedKnnWorkerBind,
-                                        LanceApplyDistributedKnnSearch);
+  return LanceVaneSearchTaskCallbacks(LancePlanDistributedKnnSearch,
+                                      LanceCreateDistributedKnnWorkerBind,
+                                      LanceApplyDistributedKnnSearch);
 }
 #endif
 
@@ -2422,13 +2422,13 @@ static vector<DistributedScanSplit> LancePlanDistributedSharedSearch(
     const TableFunctionDistributedScanPlanningInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
   auto state = LanceBuildSharedVaneState(input, bind_data);
-  auto split = LanceVaneCreateGlobalSearchSplit(state);
+  if (state.empty_assignment) {
+    return {};
+  }
+  auto split = LanceVaneCreateSearchTaskAssignment(state);
   if (state.authorization_restricted) {
-    if (state.empty_assignment) {
-      return {};
-    }
-    if (state.authorized_split_ids != vector<string>{split.split_id} ||
-        state.authorized_split_payloads != vector<string>{split.payload}) {
+    if (state.authorized_task_ids != vector<string>{split.split_id} ||
+        state.authorized_task_payloads != vector<string>{split.payload}) {
       throw InvalidInputException(
           "Distributed Lance search clone changed authorization");
     }
@@ -2440,7 +2440,7 @@ static unique_ptr<FunctionData> LanceCreateDistributedSharedWorkerBind(
     const TableFunctionDistributedScanInput &input) {
   auto &source = input.bind_data->Cast<LanceSearchBindData>();
   auto state = LanceBuildSharedVaneState(input, source);
-  state.worker_bind = true;
+  LanceVanePrepareSearchWorkerBindState(state);
 
   auto result = make_uniq<LanceSearchBindData>();
   result->column_ids = source.column_ids;
@@ -2474,7 +2474,7 @@ static void
 LanceApplyDistributedSharedSearch(optional_ptr<FunctionData> worker_bind,
                                   const vector<DistributedScanSplit> &splits) {
   auto &bind_data = worker_bind->Cast<LanceSearchBindData>();
-  LanceVaneApplyGlobalSearchSplits(bind_data.vane_state, splits);
+  LanceVaneApplySearchTaskAssignments(bind_data.vane_state, splits);
 }
 
 static void LanceSearchSerialize(Serializer &serializer,
@@ -2535,9 +2535,9 @@ LanceSearchDeserialize(Deserializer &deserializer, TableFunction &) {
 
 static TableFunctionDistributedScanCallbacks
 LanceSharedDistributedSearchCallbacks() {
-  return LanceVaneGlobalSearchCallbacks(LancePlanDistributedSharedSearch,
-                                        LanceCreateDistributedSharedWorkerBind,
-                                        LanceApplyDistributedSharedSearch);
+  return LanceVaneSearchTaskCallbacks(LancePlanDistributedSharedSearch,
+                                      LanceCreateDistributedSharedWorkerBind,
+                                      LanceApplyDistributedSharedSearch);
 }
 #endif
 

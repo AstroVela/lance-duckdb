@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import contextlib
 import http.server
@@ -1417,6 +1418,166 @@ def _physical_plan(connection, relation):
     return logical.to_physical_plan(connection)
 
 
+class _WorkerTaskCaptureBackend:
+    def __init__(self) -> None:
+        self.tasks: list[object] = []
+
+    def register_query_owner(self, _query_id: str, _owner_query_id: str) -> None:
+        return None
+
+    def worker_snapshots(self) -> list[dict[str, object]]:
+        return [
+            {
+                "worker_id": "lance-search-task-capture",
+                "num_cpus": 4.0,
+                "num_gpus": 0.0,
+                "total_memory_bytes": 8 << 30,
+            }
+        ]
+
+    def submit_tasks(self, tasks) -> list[object]:
+        self.tasks.extend(tasks)
+        return []
+
+    def task_input_stream_exhausted(
+        self, _query_id: str, _source_node_ids
+    ) -> list[object]:
+        return []
+
+    def materialization_barrier_completed(self, _query_id: str, _node_id: str) -> None:
+        return None
+
+    def fte_query_status(self, _query_id: str, *_task_contexts) -> dict[str, object]:
+        return {
+            "failed": False,
+            "finished": True,
+            "matched": True,
+            "selected_attempt_task_ids": [],
+        }
+
+    def drop_query(self, _query_id: str) -> None:
+        return None
+
+    def fte_prepare_drop_query(self, _query_id: str) -> dict[str, int]:
+        return {
+            "tasks_removed": 0,
+            "tasks_canceled": 0,
+            "fragments_removed": 0,
+        }
+
+    def fte_cleanup_query(self, _query_id: str) -> dict[str, object]:
+        return {}
+
+    def fte_drop_query(self, _query_id: str) -> dict[str, int]:
+        return {
+            "tasks_removed": 0,
+            "tasks_canceled": 0,
+            "fragments_removed": 0,
+        }
+
+    def shutdown(self) -> None:
+        return None
+
+
+async def _drain_native_result_stream_async(stream) -> None:
+    ready = asyncio.Event()
+    stream.set_ready_callback(asyncio.get_running_loop(), ready.set)
+    try:
+        while True:
+            try:
+                item = stream.next_nowait()
+            except (StopIteration, StopAsyncIteration):
+                return
+            except RuntimeError as error:
+                if "StopIteration" in str(error):
+                    return
+                raise
+            if item is not None:
+                continue
+            ready.clear()
+            stream.arm_ready_notification()
+            await ready.wait()
+    finally:
+        stream.clear_ready_callback()
+
+
+@contextlib.contextmanager
+def _capture_worker_tasks(physical, connection):
+    from vane.runners.ray.query_resource_graph import (
+        QueryAllocation,
+        ResourceVector,
+    )
+    from vane.runners.ray.query_resource_graph_builder import (
+        build_query_resource_graph,
+    )
+    from vane.runners.ray.query_resource_runtime import (
+        register_query_resource_graph,
+        release_query_resource_manager,
+    )
+
+    graph = build_query_resource_graph(
+        physical.collect_query_resource_graph_metadata(conn=connection),
+        env={"VANE_TARGET_OUTPUT_BLOCK_BYTES": str(1024**2)},
+    )
+    manager = register_query_resource_graph(
+        graph,
+        QueryAllocation(
+            resources=ResourceVector(
+                cpu=128,
+                gpu=8,
+                heap_bytes=1 << 50,
+                object_store_bytes=1 << 50,
+            ),
+            generation=1,
+        ),
+    )
+    runner = None
+    try:
+        for unit in graph.units:
+            manager.update_unit_state(unit.resource_unit_id, runnable=True)
+
+        backend = _WorkerTaskCaptureBackend()
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        stream = runner.run_plan(physical, connection)
+        asyncio.run(_drain_native_result_stream_async(stream))
+        assert backend.tasks
+        yield backend.tasks
+    finally:
+        try:
+            if runner is not None:
+                runner.drop_query_fragments(str(physical.idx()))
+        finally:
+            release_query_resource_manager(graph.query_id, reason="test_complete")
+
+
+def _execute_captured_worker_task(
+    task,
+    cursor,
+    plan,
+    *,
+    node_id: str,
+    assignment_batch: bytes,
+    attempt_id: int,
+):
+    from vane.runners.exchange_sink import bind_exchange_sink_instance
+
+    sink_config = task.exchange_sink_config()
+    sink_instance = None
+    if sink_config is not None:
+        sink_instance = bind_exchange_sink_instance(
+            sink_config,
+            attempt_id=attempt_id,
+            task_partition_id=0,
+            source_task_order=0 if sink_config.get("preserve_order", False) else None,
+        )
+    return vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        cursor,
+        plan,
+        scan_split_batch={node_id: assignment_batch},
+        exchange_sink_instance=sink_instance,
+    )
+
+
 def _split_batches(connection, relation) -> dict[str, list[bytes]]:
     return {
         str(node_id): [bytes(batch) for batch in batches]
@@ -1441,6 +1602,106 @@ def _batch_for_split(physical, split_id: str) -> bytes:
                 if candidate_id == split_id:
                     return bytes(singleton)
     raise AssertionError(f"missing scan split {split_id}")
+
+
+def _search_task_assignment_details(batch: bytes) -> tuple[str, bytes, int, int]:
+    assignments = vane.ray_cxx.split_scan_split_batch(batch)
+    assert len(assignments) == 1
+    task_id, singleton, _ = assignments[0]
+    assert task_id.startswith("final-search:")
+
+    singleton = bytes(singleton)
+    search_uuid = task_id.removeprefix("final-search:").encode()
+    variant_marker = b"\x00" + search_uuid
+    assert singleton.count(variant_marker) == 1
+    variant_offset = singleton.index(variant_marker)
+    digest_offset = variant_offset + len(variant_marker)
+    assert len(singleton[digest_offset : digest_offset + 32]) == 32
+    return task_id, singleton, variant_offset, digest_offset
+
+
+def _rewrite_search_task_assignment_payload(batch: bytes, payload: bytes) -> bytes:
+    _, singleton, payload_offset, digest_offset = _search_task_assignment_details(batch)
+    original_payload_end = digest_offset + 32
+    original_payload = singleton[payload_offset:original_payload_end]
+    assert len(original_payload) == 69
+    # DuckDB's BinarySerializer writes this string as field 22 followed by a
+    # LEB128 byte length. Keep mutations below 128 bytes so the surrounding
+    # scan-split envelope remains structurally valid and the Lance codec sees
+    # the malformed assignment itself.
+    assert len(payload) < 128
+    assert singleton[payload_offset - 3 : payload_offset - 1] == b"\x16\x00"
+    assert singleton[payload_offset - 1] == len(original_payload)
+
+    rewritten = bytearray(singleton)
+    rewritten[payload_offset - 1] = len(payload)
+    rewritten[payload_offset:original_payload_end] = payload
+    return bytes(rewritten)
+
+
+def _empty_search_task_assignment_batch(batch: bytes) -> bytes:
+    task_id, singleton, payload_offset, digest_offset = _search_task_assignment_details(
+        batch
+    )
+    payload_end = digest_offset + 32
+    rewritten = bytearray(_rewrite_search_task_assignment_payload(singleton, b""))
+
+    task_id_bytes = task_id.encode()
+    assert rewritten.count(task_id_bytes) == 1
+    task_id_offset = rewritten.index(task_id_bytes)
+    assert rewritten[task_id_offset - 1] == len(task_id_bytes)
+    empty_field_offset = task_id_offset + len(task_id_bytes)
+    assert rewritten[empty_field_offset : empty_field_offset + 3] == b"\x03\x00\x00"
+    rewritten[empty_field_offset + 2] = 1
+
+    assert len(singleton[payload_offset:payload_end]) == 69
+    return bytes(rewritten)
+
+
+def _worker_plan_with_truncated_search_index_plan(plan):
+    state = list(plan.__reduce_ex__(4)[2])
+    assert state[0] is True
+    serialized_root = bytes(state[1])
+
+    # SearchIndexPlan is bind-state property 229. Locate the property through
+    # its DuckDB field id, LEB128 byte length, version, and following field id
+    # so arbitrary frozen-manifest bytes cannot be mistaken for the plan.
+    matches: list[tuple[int, int, int]] = []
+    for field_offset in range(len(serialized_root) - 4):
+        if serialized_root[field_offset : field_offset + 2] != b"\xe5\x00":
+            continue
+        length_offset = field_offset + 2
+        payload_offset = length_offset
+        payload_len = 0
+        shift = 0
+        while payload_offset < len(serialized_root):
+            byte = serialized_root[payload_offset]
+            payload_offset += 1
+            payload_len |= (byte & 0x7F) << shift
+            if byte & 0x80 == 0:
+                break
+            shift += 7
+            assert shift < 64
+        payload_end = payload_offset + payload_len
+        if (
+            payload_len > 3
+            and serialized_root[payload_offset : payload_offset + 2] == b"\x01\x00"
+            and serialized_root[payload_end : payload_end + 2] == b"\xe6\x00"
+        ):
+            matches.append((length_offset, payload_offset, payload_end))
+    assert len(matches) == 1
+
+    length_offset, payload_offset, payload_end = matches[0]
+    truncated = serialized_root[payload_offset : payload_offset + 3]
+    state[1] = (
+        serialized_root[:length_offset]
+        + bytes([len(truncated)])
+        + truncated
+        + serialized_root[payload_end:]
+    )
+    result = plan.__class__.__new__(plan.__class__)
+    result.__setstate__(tuple(state))
+    return result
 
 
 def _rewrite_take_split(
@@ -2020,8 +2281,13 @@ def test_global_search_overloads_match_native_and_emit_one_task(ray_runner) -> N
                 batch for batches in split_batches.values() for batch in batches
             ]
             assert len(flattened) == 1, name
-            assert flattened[0].count(b"LGS1") == 1, name
-            assert b"global:" in flattened[0], name
+            task_id, singleton, variant_offset, _ = _search_task_assignment_details(
+                flattened[0]
+            )
+            assert task_id.startswith("final-search:"), name
+            assert singleton[variant_offset] == 0, name
+            assert singleton.count(b"lance.search-task") == 1, name
+            assert b"LGS1" not in singleton, name
             assert _run(ray_runner, relation) == expected, name
     finally:
         connection.close()
@@ -2123,6 +2389,9 @@ def test_global_search_repeated_serialization_preserves_pending_filters() -> Non
         serialized_once = pickle.dumps(logical)
         serialized_twice = pickle.dumps(pickle.loads(serialized_once))
         serialized_thrice = pickle.dumps(pickle.loads(serialized_twice))
+        assert all(
+            magic not in serialized_once for magic in (b"LVS1", b"LGS1", b"LSI1")
+        )
 
         signatures = []
         for serialized in (serialized_once, serialized_twice, serialized_thrice):
@@ -2198,8 +2467,68 @@ def test_namespace_outer_filters_remain_after_top_k(ray_runner) -> None:
             if name != "hybrid":
                 assert expected == [], name
             relation = connection.sql(sql)
+            serialized = pickle.dumps(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                    relation, f"lance-namespace-filter-plan-{name}"
+                )
+            )
+            assert b"LNF1" not in serialized, name
+            assert b"LSI1" not in serialized, name
             assert _split_count(connection, relation) == 1, name
             assert _run(ray_runner, relation) == expected, name
+    finally:
+        connection.close()
+
+
+def test_global_search_worker_bind_retranslation_preserves_assignment() -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    searches = (
+        (
+            "vector",
+            "SELECT id FROM lance_vector_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "k = 3, use_index = false)",
+        ),
+        (
+            "fts",
+            f"SELECT id FROM lance_fts({path_sql}, 'text', 'puppy', k = 3)",
+        ),
+        (
+            "hybrid",
+            "SELECT id FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, use_index = false)",
+        ),
+    )
+
+    connection = _connect()
+    try:
+        for name, sql in searches:
+            physical = _physical_plan(connection, connection.sql(sql))
+            with _capture_worker_tasks(physical, connection) as tasks:
+                assert len(tasks) == 1, name
+                task = tasks[0]
+                assigned_batches = [
+                    bytes(entry["data"])
+                    for entry in task.Inputs().values()
+                    if entry["kind"] == "scan_split_batch"
+                ]
+                assert len(assigned_batches) == 1, name
+
+                detached = task.plan().clone(connection)
+                replanned_batches = [
+                    bytes(batch)
+                    for batches in detached.scan_split_batch_map().values()
+                    for batch in batches
+                ]
+                assert replanned_batches == assigned_batches, name
+                metadata = detached.collect_query_resource_graph_metadata(
+                    conn=connection
+                )
+                assert metadata["nodes"], name
     finally:
         connection.close()
 
@@ -2230,9 +2559,190 @@ def test_two_global_search_nodes_keep_independent_singleton_tasks(ray_runner) ->
             for batch in node_batches
         ]
         assert len(batches) == 2
-        assert all(batch.count(b"LGS1") == 1 for batch in batches)
-        assert len({batch[batch.index(b"global:") :][:43] for batch in batches}) == 2
+        assignments = [_search_task_assignment_details(batch) for batch in batches]
+        assert all(
+            assignment[1].count(b"lance.search-task") == 1 for assignment in assignments
+        )
+        assert all(assignment[1][assignment[2]] == 0 for assignment in assignments)
+        assert len({assignment[0] for assignment in assignments}) == 2
         assert _run(ray_runner, relation) == expected
+    finally:
+        connection.close()
+
+
+def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
+    ).resolve()
+    path_sql = _sql_literal(path)
+    first_sql = (
+        "SELECT id FROM lance_vector_search("
+        f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+        "k = 3, use_index = false)"
+    )
+    second_sql = (
+        "SELECT id FROM lance_vector_search("
+        f"{path_sql}, 'vec', [1.0, 1.0, 1.0, 1.0]::FLOAT[4], "
+        "k = 2, use_index = false)"
+    )
+
+    connection = _connect()
+    try:
+        physical = _physical_plan(connection, connection.sql(first_sql))
+        foreign_physical = _physical_plan(connection, connection.sql(second_sql))
+        foreign_split_map = foreign_physical.scan_split_batch_map()
+        _, foreign_singleton, _, _ = _search_task_assignment_details(
+            bytes(next(iter(foreign_split_map.values()))[0])
+        )
+
+        with _capture_worker_tasks(physical, connection) as tasks:
+            assert len(tasks) == 1
+            task = tasks[0]
+            task_inputs = task.Inputs()
+            scan_inputs = [
+                (str(node_id), entry["data"])
+                for node_id, entry in task_inputs.items()
+                if entry["kind"] == "scan_split_batch"
+            ]
+            assert len(scan_inputs) == 1
+            node_id, task_batch = scan_inputs[0]
+            _, singleton, variant_offset, digest_offset = (
+                _search_task_assignment_details(bytes(task_batch))
+            )
+            assignment_payload = singleton[variant_offset : digest_offset + 32]
+            assert len(assignment_payload) == 69
+
+            truncated_plan = _worker_plan_with_truncated_search_index_plan(task.plan())
+            worker = _connect()
+            cursor = worker.cursor()
+            try:
+                with pytest.raises(Exception, match="SearchIndexPlan is malformed"):
+                    truncated_plan.clone(cursor)
+            finally:
+                cursor.close()
+                worker.close()
+
+            retry_assignments = (
+                (singleton, None, "ok"),
+                (singleton, None, "ok"),
+                (
+                    foreign_singleton,
+                    "unauthorized SearchTaskAssignment identity",
+                    None,
+                ),
+                # Vane passes an explicit no-work extension split to the
+                # callback as an empty assignment and suppresses execution.
+                (_empty_search_task_assignment_batch(singleton), None, "empty"),
+            )
+            for attempt_id, (
+                retry_batch,
+                expected_error,
+                expected_completion_status,
+            ) in enumerate(retry_assignments):
+                retry_cursor = connection.cursor()
+                retry_plan = None
+                retry_result = None
+                try:
+                    # A real FTE retry starts from the pristine detached task
+                    # template, not from the bind state mutated by an earlier
+                    # attempt. Exercise that exact authorization boundary.
+                    retry_plan = task.plan().clone(retry_cursor)
+                    if expected_error is None:
+                        retry_result = _execute_captured_worker_task(
+                            task,
+                            retry_cursor,
+                            retry_plan,
+                            node_id=node_id,
+                            assignment_batch=retry_batch,
+                            attempt_id=attempt_id,
+                        )
+                        assert (
+                            retry_result.completion_status == expected_completion_status
+                        )
+                        if expected_completion_status == "empty":
+                            replanned_batches = [
+                                bytes(batch)
+                                for batches in retry_plan.scan_split_batch_map().values()
+                                for batch in batches
+                            ]
+                            assert len(replanned_batches) == 1
+                            assert [
+                                split_id
+                                for split_id, _, _ in vane.ray_cxx.split_scan_split_batch(
+                                    replanned_batches[0]
+                                )
+                            ] == ["empty"]
+                            metadata = retry_plan.collect_query_resource_graph_metadata(
+                                conn=retry_cursor
+                            )
+                            assert metadata["nodes"]
+                    else:
+                        with pytest.raises(Exception, match=expected_error):
+                            _execute_captured_worker_task(
+                                task,
+                                retry_cursor,
+                                retry_plan,
+                                node_id=node_id,
+                                assignment_batch=retry_batch,
+                                attempt_id=attempt_id,
+                            )
+                finally:
+                    retry_result = None
+                    retry_plan = None
+                    retry_cursor.close()
+
+            invalid_variant = bytearray(singleton)
+            invalid_variant[variant_offset] = 0xFF
+            reserved_variant = bytearray(singleton)
+            reserved_variant[variant_offset] = 1
+            foreign_digest = bytearray(singleton)
+            foreign_digest[digest_offset] ^= 1
+            truncated_assignment = _rewrite_search_task_assignment_payload(
+                singleton, assignment_payload[:-1]
+            )
+            trailing_assignment = _rewrite_search_task_assignment_payload(
+                singleton, assignment_payload + b"\x00"
+            )
+            oversized_assignment = _rewrite_search_task_assignment_payload(
+                singleton, assignment_payload + bytes(127 - len(assignment_payload))
+            )
+            assignments = (
+                (
+                    bytes(invalid_variant),
+                    "SearchTaskAssignment payload has an invalid variant",
+                ),
+                (
+                    bytes(reserved_variant),
+                    "unsupported SearchTaskAssignment variant",
+                ),
+                (bytes(foreign_digest), "different global state"),
+                (foreign_singleton, "unauthorized SearchTaskAssignment identity"),
+                (truncated_assignment, "payload has an invalid size"),
+                (trailing_assignment, "payload has an invalid size"),
+                (oversized_assignment, "payload has an invalid size"),
+            )
+
+            for attempt_id, (assignment_batch, expected_error) in enumerate(
+                assignments, start=10
+            ):
+                worker = _connect()
+                cursor = worker.cursor()
+                worker_plan = None
+                try:
+                    worker_plan = task.plan().clone(cursor)
+                    with pytest.raises(Exception, match=expected_error):
+                        _execute_captured_worker_task(
+                            task,
+                            cursor,
+                            worker_plan,
+                            node_id=node_id,
+                            assignment_batch=assignment_batch,
+                            attempt_id=attempt_id,
+                        )
+                finally:
+                    worker_plan = None
+                    cursor.close()
+                    worker.close()
     finally:
         connection.close()
 

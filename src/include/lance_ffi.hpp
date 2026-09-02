@@ -157,6 +157,12 @@ int32_t lance_vane_build_search_index_plan(
     void *dataset, const char *generation, uint8_t search_kind,
     const char *vector_column, const char *text_column,
     uint8_t use_vector_index, uint8_t **out_data, size_t *out_len);
+int32_t lance_vane_validate_search_index_plan(
+    const uint8_t *data, size_t len, uint64_t dataset_version,
+    const char *generation, uint8_t search_kind, const char *vector_column,
+    const char *text_column, uint8_t use_vector_index);
+int32_t lance_vane_validate_namespace_filter_plan(const uint8_t *data,
+                                                  size_t len);
 void *lance_vane_create_knn_stream_ir(
     void *dataset, const char *generation, const char *vector_column,
     const float *query_values, size_t query_len, uint64_t k, uint64_t nprobes,

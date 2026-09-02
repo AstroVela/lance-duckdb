@@ -6,7 +6,6 @@ use lance::index::DatasetIndexExt;
 use lance::Dataset;
 use lance_table::format::IndexMetadata;
 
-const MAGIC: &[u8; 4] = b"LSI1";
 const FORMAT_VERSION: u16 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchKind {
@@ -244,7 +243,6 @@ pub(crate) struct SearchIndexPlan {
 impl SearchIndexPlan {
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = Writer::default();
-        writer.raw(MAGIC);
         writer.u16(FORMAT_VERSION);
         writer.u64(self.dataset_version);
         writer.string(&self.generation)?;
@@ -259,12 +257,9 @@ impl SearchIndexPlan {
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(bytes);
-        if reader.raw(MAGIC.len())? != MAGIC {
-            bail!("LSI1 magic mismatch");
-        }
         let version = reader.u16()?;
         if version != FORMAT_VERSION {
-            bail!("unsupported LSI1 format version {version}");
+            bail!("unsupported SearchIndexPlan format version {version}");
         }
         let result = Self {
             dataset_version: reader.u64()?,
@@ -280,7 +275,10 @@ impl SearchIndexPlan {
 
     fn validate_shape(&self) -> Result<()> {
         if self.dataset_version == 0 || self.generation.is_empty() {
-            bail!("LSI1 is missing its fixed snapshot identity");
+            bail!("SearchIndexPlan is missing its fixed snapshot identity");
+        }
+        if self.vector.is_none() && self.fts.is_none() {
+            bail!("SearchIndexPlan has no search branch");
         }
         validate_sorted_unique(&self.fragments, "fragment ids")?;
         for (name, branch) in [("vector", &self.vector), ("fts", &self.fts)] {
@@ -288,7 +286,7 @@ impl SearchIndexPlan {
                 continue;
             };
             if branch.field_name.is_empty() {
-                bail!("LSI1 {name} branch has an empty field name");
+                bail!("SearchIndexPlan {name} branch has an empty field name");
             }
             validate_sorted_unique(&branch.covered_fragments, "covered fragments")?;
             validate_sorted_unique(&branch.uncovered_fragments, "uncovered fragments")?;
@@ -306,10 +304,10 @@ impl SearchIndexPlan {
                 || covered.union(&uncovered).copied().collect::<HashSet<_>>()
                     != self.fragments.iter().copied().collect::<HashSet<_>>()
             {
-                bail!("LSI1 {name} branch has invalid fragment coverage");
+                bail!("SearchIndexPlan {name} branch has invalid fragment coverage");
             }
             if branch.use_index != !branch.selected.is_empty() {
-                bail!("LSI1 {name} branch has an inconsistent index decision");
+                bail!("SearchIndexPlan {name} branch has an inconsistent index decision");
             }
             for metadata in &branch.selected {
                 if metadata.uuid == [0; 16]
@@ -318,18 +316,23 @@ impl SearchIndexPlan {
                     || metadata.dataset_version > self.dataset_version
                     || !metadata.fields.contains(&branch.field_id)
                 {
-                    bail!("LSI1 {name} branch has invalid index metadata");
+                    bail!("SearchIndexPlan {name} branch has invalid index metadata");
                 }
                 validate_sorted_unique(&metadata.fields, "index fields")?;
                 let fragment_ids = metadata.fragment_ids.as_ref().ok_or_else(|| {
-                    anyhow!("LSI1 {name} branch has unknown index fragment coverage")
+                    anyhow!("SearchIndexPlan {name} branch has unknown index fragment coverage")
                 })?;
                 validate_sorted_unique(fragment_ids, "index fragment ids")?;
                 if let Some(files) = &metadata.files {
                     if files.windows(2).any(|pair| pair[0] > pair[1]) {
-                        bail!("LSI1 {name} index files are not canonical");
+                        bail!("SearchIndexPlan {name} index files are not canonical");
                     }
                 }
+            }
+            if covered_fragments(&branch.selected, &self.fragments) != branch.covered_fragments {
+                bail!(
+                    "SearchIndexPlan {name} fragment coverage does not match its selected index segments"
+                );
             }
             let mut uuids = branch
                 .selected
@@ -340,8 +343,49 @@ impl SearchIndexPlan {
             uuids.sort_unstable();
             uuids.dedup();
             if uuids != original {
-                bail!("LSI1 {name} index segments are not canonical");
+                bail!("SearchIndexPlan {name} index segments are not canonical");
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_admission(
+        &self,
+        dataset_version: u64,
+        generation: &str,
+        kind: SearchKind,
+        vector_column: Option<&str>,
+        text_column: Option<&str>,
+        use_vector_index: bool,
+    ) -> Result<()> {
+        if self.dataset_version != dataset_version {
+            bail!("SearchIndexPlan dataset version does not match the admitted search");
+        }
+        if self.generation != generation {
+            bail!("SearchIndexPlan dataset generation does not match the admitted search");
+        }
+
+        match kind {
+            SearchKind::Vector if self.vector.is_none() || self.fts.is_some() => {
+                bail!("SearchIndexPlan branch set does not describe vector search")
+            }
+            SearchKind::Fts if self.vector.is_some() || self.fts.is_none() => {
+                bail!("SearchIndexPlan branch set does not describe FTS")
+            }
+            SearchKind::Hybrid if self.vector.is_none() || self.fts.is_none() => {
+                bail!("SearchIndexPlan branch set does not describe hybrid search")
+            }
+            _ => {}
+        }
+
+        if let Some(branch) = &self.vector {
+            validate_admitted_branch_name(branch, vector_column, "vector")?;
+            if branch.use_index && !use_vector_index {
+                bail!("SearchIndexPlan vector index decision differs from the search arguments");
+            }
+        }
+        if let Some(branch) = &self.fts {
+            validate_admitted_branch_name(branch, text_column, "FTS")?;
         }
         Ok(())
     }
@@ -352,7 +396,7 @@ impl SearchIndexPlan {
     ) -> Result<Vec<lance_table::format::Fragment>> {
         let actual = sorted_fragment_ids(dataset);
         if actual != self.fragments {
-            bail!("LSI1 fragment set does not match the fixed worker snapshot");
+            bail!("SearchIndexPlan fragment set does not match the fixed worker snapshot");
         }
         Ok(dataset.fragments().as_ref().clone())
     }
@@ -366,29 +410,18 @@ impl SearchIndexPlan {
         text_column: Option<&str>,
         use_vector_index: bool,
     ) -> Result<ValidatedSearchIndexPlan> {
-        if self.dataset_version != dataset.version_id() {
-            bail!("LSI1 dataset version does not match the worker snapshot");
-        }
-        if self.generation != generation {
-            bail!("LSI1 dataset generation does not match the worker snapshot");
-        }
+        self.validate_admission(
+            dataset.version_id(),
+            generation,
+            kind,
+            vector_column,
+            text_column,
+            use_vector_index,
+        )?;
         self.fragments(dataset)?;
 
-        match kind {
-            SearchKind::Vector if self.vector.is_none() || self.fts.is_some() => {
-                bail!("LSI1 branch set does not describe vector search")
-            }
-            SearchKind::Fts if self.vector.is_some() || self.fts.is_none() => {
-                bail!("LSI1 branch set does not describe FTS")
-            }
-            SearchKind::Hybrid if self.vector.is_none() || self.fts.is_none() => {
-                bail!("LSI1 branch set does not describe hybrid search")
-            }
-            _ => {}
-        }
-
         // `load_indices` can return only the current logical-index summary.
-        // LSI1 freezes individual segments, so re-read every frozen logical
+        // SearchIndexPlan freezes individual segments, so re-read every frozen logical
         // name through the segment-preserving API before comparing UUIDs and
         // metadata.  Newly-created unrelated names remain intentionally
         // ignored.
@@ -414,9 +447,6 @@ impl SearchIndexPlan {
         let vector_segments = match &self.vector {
             Some(branch) => {
                 validate_branch_identity(dataset, branch, vector_column, "vector")?;
-                if branch.use_index && !use_vector_index {
-                    bail!("LSI1 vector index decision differs from the search arguments");
-                }
                 validate_branch_metadata(branch, &by_uuid, &self.fragments)?
             }
             None => Vec::new(),
@@ -580,6 +610,19 @@ fn branch_from_metadata(
     Ok(result)
 }
 
+fn validate_admitted_branch_name(
+    branch: &BranchPlan,
+    expected_name: Option<&str>,
+    branch_name: &str,
+) -> Result<()> {
+    let expected_name =
+        expected_name.ok_or_else(|| anyhow!("missing admitted {branch_name} column"))?;
+    if branch.field_name != expected_name {
+        bail!("SearchIndexPlan {branch_name} field name does not match the admitted search");
+    }
+    Ok(())
+}
+
 fn validate_branch_identity(
     dataset: &Dataset,
     branch: &BranchPlan,
@@ -590,7 +633,7 @@ fn validate_branch_identity(
     if branch.field_name != expected_name
         || dataset.schema().field_id(expected_name)? != branch.field_id
     {
-        bail!("LSI1 {branch_name} field identity does not match the worker search");
+        bail!("SearchIndexPlan {branch_name} field identity does not match the worker search");
     }
     Ok(())
 }
@@ -659,7 +702,7 @@ fn covered_fragments(metadata: &[FrozenIndexMetadata], fragments: &[u64]) -> Vec
 
 fn validate_sorted_unique<T: Ord>(values: &[T], what: &str) -> Result<()> {
     if values.windows(2).any(|pair| pair[0] >= pair[1]) {
-        bail!("LSI1 {what} are not sorted and unique");
+        bail!("SearchIndexPlan {what} are not sorted and unique");
     }
     Ok(())
 }
@@ -713,7 +756,7 @@ impl Writer {
     }
 
     fn length(&mut self, value: usize) -> Result<()> {
-        let value = u32::try_from(value).context("LSI1 value is too large")?;
+        let value = u32::try_from(value).context("SearchIndexPlan value is too large")?;
         self.u32(value);
         Ok(())
     }
@@ -758,7 +801,7 @@ impl<'a> Reader<'a> {
 
     fn finish(&self) -> Result<()> {
         if self.offset != self.bytes.len() {
-            bail!("LSI1 contains trailing bytes");
+            bail!("SearchIndexPlan contains trailing bytes");
         }
         Ok(())
     }
@@ -768,7 +811,7 @@ impl<'a> Reader<'a> {
             .offset
             .checked_add(len)
             .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| anyhow!("truncated LSI1 payload"))?;
+            .ok_or_else(|| anyhow!("truncated SearchIndexPlan payload"))?;
         let result = &self.bytes[self.offset..end];
         self.offset = end;
         Ok(result)
@@ -782,7 +825,7 @@ impl<'a> Reader<'a> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
-            _ => bail!("invalid LSI1 boolean"),
+            _ => bail!("invalid SearchIndexPlan boolean"),
         }
     }
 
@@ -809,7 +852,7 @@ impl<'a> Reader<'a> {
     fn length(&mut self) -> Result<usize> {
         let len = self.u32()? as usize;
         if len > self.bytes.len().saturating_sub(self.offset) {
-            bail!("LSI1 collection length exceeds the remaining payload");
+            bail!("SearchIndexPlan collection length exceeds the remaining payload");
         }
         Ok(len)
     }
@@ -820,7 +863,7 @@ impl<'a> Reader<'a> {
     }
 
     fn string(&mut self) -> Result<String> {
-        String::from_utf8(self.bytes()?).context("LSI1 string is not UTF-8")
+        String::from_utf8(self.bytes()?).context("SearchIndexPlan string is not UTF-8")
     }
 
     fn vec<T, F>(&mut self, mut decode: F) -> Result<Vec<T>>
@@ -842,7 +885,7 @@ impl<'a> Reader<'a> {
         match self.u8()? {
             0 => Ok(None),
             1 => Ok(Some(decode(self)?)),
-            _ => bail!("invalid LSI1 option tag"),
+            _ => bail!("invalid SearchIndexPlan option tag"),
         }
     }
 }
@@ -895,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn lsi1_round_trip_is_canonical() {
+    fn search_index_plan_round_trip_is_canonical() {
         let plan = plan(Some(branch(4, "vector")), None);
         let first = plan.encode().unwrap();
         let decoded = SearchIndexPlan::decode(&first).unwrap();
@@ -904,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn lsi1_rejects_truncation_and_trailing_bytes() {
+    fn search_index_plan_rejects_truncation_and_trailing_bytes() {
         let plan = plan(None, Some(branch(5, "text")));
         let bytes = plan.encode().unwrap();
         for len in 0..bytes.len() {
@@ -916,14 +959,83 @@ mod tests {
     }
 
     #[test]
-    fn lsi1_rejects_noncanonical_fragment_sets() {
+    fn search_index_plan_rejects_noncanonical_fragment_sets() {
         let mut plan = plan(Some(branch(4, "vector")), None);
         plan.fragments = vec![3, 1];
         assert!(SearchIndexPlan::decode(&plan.encode().unwrap()).is_err());
     }
 
     #[test]
-    fn lsi1_hybrid_round_trip_keeps_independent_branches() {
+    fn search_index_plan_rejects_branchless_and_admission_mismatches() {
+        assert!(SearchIndexPlan::decode(&plan(None, None).encode().unwrap()).is_err());
+
+        let vector =
+            SearchIndexPlan::decode(&plan(Some(branch(4, "vector")), None).encode().unwrap())
+                .unwrap();
+        assert!(vector
+            .validate_admission(
+                7,
+                "generation",
+                SearchKind::Vector,
+                Some("vector"),
+                None,
+                false,
+            )
+            .is_ok());
+        assert!(vector
+            .validate_admission(
+                8,
+                "generation",
+                SearchKind::Vector,
+                Some("vector"),
+                None,
+                false,
+            )
+            .is_err());
+        assert!(vector
+            .validate_admission(
+                7,
+                "other-generation",
+                SearchKind::Vector,
+                Some("vector"),
+                None,
+                false,
+            )
+            .is_err());
+        assert!(vector
+            .validate_admission(7, "generation", SearchKind::Fts, None, Some("text"), false,)
+            .is_err());
+        assert!(vector
+            .validate_admission(
+                7,
+                "generation",
+                SearchKind::Vector,
+                Some("other-vector"),
+                None,
+                false,
+            )
+            .is_err());
+
+        let indexed = SearchIndexPlan::decode(
+            &plan(Some(indexed_branch(4, "vector", 1)), None)
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(indexed
+            .validate_admission(
+                7,
+                "generation",
+                SearchKind::Vector,
+                Some("vector"),
+                None,
+                false,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn search_index_plan_hybrid_round_trip_keeps_independent_branches() {
         let plan = plan(
             Some(indexed_branch(4, "vector", 1)),
             Some(indexed_branch(5, "text", 2)),
@@ -937,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn lsi1_rejects_contradictory_or_foreign_index_metadata() {
+    fn search_index_plan_rejects_contradictory_or_foreign_index_metadata() {
         let mut duplicate = indexed_branch(4, "vector", 1);
         duplicate.selected.push(duplicate.selected[0].clone());
         assert!(SearchIndexPlan::decode(&plan(Some(duplicate), None).encode().unwrap()).is_err());
@@ -963,16 +1075,23 @@ mod tests {
         let mut overlap = indexed_branch(4, "vector", 1);
         overlap.uncovered_fragments = vec![1, 3];
         assert!(SearchIndexPlan::decode(&plan(Some(overlap), None).encode().unwrap()).is_err());
+
+        let mut contradictory_coverage = indexed_branch(4, "vector", 1);
+        contradictory_coverage.covered_fragments = vec![3];
+        contradictory_coverage.uncovered_fragments = vec![1];
+        assert!(SearchIndexPlan::decode(
+            &plan(Some(contradictory_coverage), None).encode().unwrap()
+        )
+        .is_err());
     }
 
     #[test]
-    fn lsi1_rejects_unknown_versions_and_unbounded_lengths() {
+    fn search_index_plan_rejects_unknown_versions_and_unbounded_lengths() {
         let mut unknown_version = plan(Some(branch(4, "vector")), None).encode().unwrap();
-        unknown_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        unknown_version[..2].copy_from_slice(&2_u16.to_le_bytes());
         assert!(SearchIndexPlan::decode(&unknown_version).is_err());
 
         let mut oversized_generation = Vec::new();
-        oversized_generation.extend_from_slice(MAGIC);
         oversized_generation.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         oversized_generation.extend_from_slice(&7_u64.to_le_bytes());
         oversized_generation.extend_from_slice(&u32::MAX.to_le_bytes());
@@ -980,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn lsi1_arbitrary_bytes_fail_without_panicking() {
+    fn search_index_plan_arbitrary_bytes_fail_without_panicking() {
         let mut seed = 0x9e37_79b9_u32;
         for len in 0..256 {
             let bytes = (0..len)
