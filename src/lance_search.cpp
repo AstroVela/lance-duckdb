@@ -1458,6 +1458,7 @@ struct LanceVectorMaterializeBindData : public TableFunctionData {
   LanceVaneGlobalSearchState vane_state;
   vector<string> names;
   vector<LogicalType> types;
+  vector<string> take_columns;
   ArrowSchemaWrapper schema_root;
   ArrowTableSchema arrow_table;
 
@@ -1467,6 +1468,7 @@ struct LanceVectorMaterializeBindData : public TableFunctionData {
     result->vane_state = vane_state;
     result->names = names;
     result->types = types;
+    result->take_columns = take_columns;
     result->arrow_table = arrow_table;
     return result;
   }
@@ -1495,11 +1497,32 @@ LanceVectorMaterializeBind(ClientContext &, TableFunctionBindInput &,
 
 static vector<column_t>
 LanceVectorMaterializeColumnIds(const LanceVaneGlobalSearchState &state) {
+  if (state.output_names.empty() ||
+      state.output_names.size() != state.output_types.size() ||
+      state.output_names.back() != "_distance") {
+    throw SerializationException(
+        "Distributed Lance vector materialization schema is malformed");
+  }
+  auto append_column = [&](vector<column_t> &result,
+                           const ColumnIndex &column) {
+    if (!column.HasPrimaryIndex() || column.IsVirtualColumn()) {
+      throw SerializationException(
+          "Distributed Lance vector materialization cannot reference a "
+          "virtual or non-primary column");
+    }
+    auto column_id = column.GetPrimaryIndex();
+    if (column_id >= state.output_names.size()) {
+      throw SerializationException(
+          "Distributed Lance vector materialization column is malformed");
+    }
+    result.push_back(column_id);
+  };
+
   vector<column_t> result;
   if (state.projection_ids.empty()) {
     result.reserve(state.column_ids.size());
     for (auto &column : state.column_ids) {
-      result.push_back(column.GetPrimaryIndex());
+      append_column(result, column);
     }
     return result;
   }
@@ -1509,9 +1532,69 @@ LanceVectorMaterializeColumnIds(const LanceVaneGlobalSearchState &state) {
       throw SerializationException(
           "Distributed Lance vector materialization projection is malformed");
     }
-    result.push_back(state.column_ids[projection_id].GetPrimaryIndex());
+    append_column(result, state.column_ids[projection_id]);
   }
   return result;
+}
+
+struct LanceVectorMaterializeProjection {
+  vector<string> take_columns;
+  vector<string> arrow_names;
+  vector<LogicalType> arrow_types;
+  vector<column_t> arrow_column_ids;
+};
+
+static LanceVectorMaterializeProjection
+LanceBuildVectorMaterializeProjection(const LanceVaneGlobalSearchState &state) {
+  auto output_column_ids = LanceVectorMaterializeColumnIds(state);
+  auto distance_column_id = state.output_names.size() - 1;
+  LanceVectorMaterializeProjection result;
+  unordered_map<column_t, column_t> arrow_positions;
+  result.arrow_column_ids.reserve(output_column_ids.size());
+  for (auto column_id : output_column_ids) {
+    if (column_id == distance_column_id) {
+      continue;
+    }
+    if (column_id > distance_column_id) {
+      throw SerializationException(
+          "Distributed Lance vector materialization column is malformed");
+    }
+    if (arrow_positions.find(column_id) != arrow_positions.end()) {
+      continue;
+    }
+    auto arrow_position = NumericCast<column_t>(result.arrow_names.size());
+    arrow_positions.emplace(column_id, arrow_position);
+    result.take_columns.push_back(state.output_names[column_id]);
+    result.arrow_names.push_back(state.output_names[column_id]);
+    result.arrow_types.push_back(state.output_types[column_id]);
+  }
+  auto distance_arrow_position =
+      NumericCast<column_t>(result.arrow_names.size());
+  result.arrow_names.push_back(state.output_names[distance_column_id]);
+  result.arrow_types.push_back(state.output_types[distance_column_id]);
+  for (auto column_id : output_column_ids) {
+    if (column_id == distance_column_id) {
+      result.arrow_column_ids.push_back(distance_arrow_position);
+      continue;
+    }
+    auto position = arrow_positions.find(column_id);
+    if (position == arrow_positions.end()) {
+      throw InternalException(
+          "Missing distributed Lance vector materialization column mapping");
+    }
+    result.arrow_column_ids.push_back(position->second);
+  }
+  return result;
+}
+
+static void LancePrepareVectorMaterializeBindData(
+    ClientContext &context, LanceVectorMaterializeBindData &bind_data) {
+  auto projection = LanceBuildVectorMaterializeProjection(bind_data.vane_state);
+  bind_data.take_columns = std::move(projection.take_columns);
+  bind_data.names = std::move(projection.arrow_names);
+  bind_data.types = std::move(projection.arrow_types);
+  LanceVanePopulateSearchSchema(context, bind_data.names, bind_data.types,
+                                bind_data.schema_root, bind_data.arrow_table);
 }
 
 static vector<LogicalType>
@@ -1555,7 +1638,9 @@ LanceVectorMaterializeInitLocal(ExecutionContext &context,
   auto chunk = make_uniq<ArrowArrayWrapper>();
   auto result = make_uniq<LanceVectorMaterializeLocalState>(std::move(chunk),
                                                             context.client);
-  result->column_ids = LanceVectorMaterializeColumnIds(bind_data.vane_state);
+  result->column_ids =
+      LanceBuildVectorMaterializeProjection(bind_data.vane_state)
+          .arrow_column_ids;
   return result;
 }
 
@@ -1609,8 +1694,14 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &,
     distances.push_back(distance_data[distance_index]);
   }
 
-  auto *batch = lance_vane_take_vector_rows(global.dataset, row_ids.data(),
-                                            distances.data(), row_ids.size());
+  vector<const char *> take_columns;
+  take_columns.reserve(bind_data.take_columns.size());
+  for (auto &column : bind_data.take_columns) {
+    take_columns.push_back(column.c_str());
+  }
+  auto *batch = lance_vane_take_vector_rows(
+      global.dataset, row_ids.data(), distances.data(), row_ids.size(),
+      take_columns.data(), take_columns.size());
   if (!batch) {
     throw IOException(
         "Failed to materialize distributed Lance vector search rows" +
@@ -1702,11 +1793,8 @@ LanceVectorMaterializeDeserialize(Deserializer &deserializer, TableFunction &) {
   }
   auto result = make_uniq<LanceVectorMaterializeBindData>();
   result->vane_state = std::move(state);
-  result->names = result->vane_state.output_names;
-  result->types = result->vane_state.output_types;
   auto &context = deserializer.Get<ClientContext &>();
-  LanceVanePopulateSearchSchema(context, result->names, result->types,
-                                result->schema_root, result->arrow_table);
+  LancePrepareVectorMaterializeBindData(context, *result);
   return result;
 }
 
@@ -1857,11 +1945,7 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
 
   auto materialize_bind = make_uniq<LanceVectorMaterializeBindData>();
   materialize_bind->vane_state = state;
-  materialize_bind->names = state.output_names;
-  materialize_bind->types = state.output_types;
-  LanceVanePopulateSearchSchema(
-      context, materialize_bind->names, materialize_bind->types,
-      materialize_bind->schema_root, materialize_bind->arrow_table);
+  LancePrepareVectorMaterializeBindData(context, *materialize_bind);
   auto materialize_get = make_uniq<LogicalGet>(
       get.table_index, LanceVectorMaterializeFunction(),
       std::move(materialize_bind), state.output_types, state.output_names);

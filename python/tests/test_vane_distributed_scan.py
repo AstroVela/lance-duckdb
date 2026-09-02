@@ -2366,9 +2366,15 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
             ),
             (
                 "small-k",
-                "SELECT id, keep, _distance FROM lance_vector_search("
+                "SELECT _distance, id FROM lance_vector_search("
                 f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
                 "ORDER BY _distance, id",
+            ),
+            (
+                "distance-only",
+                "SELECT _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
+                "ORDER BY _distance",
             ),
             (
                 "prefilter",
@@ -2393,7 +2399,11 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
                     index * 8 for index in range(3, 36)
                 ]
             elif name == "small-k":
-                assert [row[0] for row in expected] == [24, 32, 40]
+                # Fragment zero alone has far more than k equal-distance rows;
+                # these are its deterministic (_distance, _rowid) local winners.
+                assert [row[1] for row in expected] == [24, 32, 40]
+            elif name == "distance-only":
+                assert expected == [(0.0,), (0.0,), (0.0,)]
             elif name == "empty-prefilter":
                 assert expected == []
 

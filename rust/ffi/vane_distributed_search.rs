@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -30,8 +30,8 @@ use super::dataset::{load_supported_raw_index_metadata, MAX_SERIALIZED_INDEX_SEC
 use super::projection;
 use super::types::{DatasetHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, dataset_handle, nonzero_u64_to_usize, parse_optional_filter_ir, slice_from_ptr,
-    FfiError, FfiResult,
+    cstr_to_str, dataset_handle, nonzero_u64_to_usize, optional_cstr_array,
+    parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult,
 };
 use super::vane_search_plan::{build_search_index_plan, SearchIndexPlan, SearchKind};
 
@@ -653,6 +653,11 @@ fn create_exact_vector_stream(
         scan.filter_expr(filter);
     }
     let query = Float32Array::from_iter_values(query_values.iter().copied());
+    // For exact flat search, Lance applies the fetch after sorting by
+    // (_distance ASC, _rowid ASC).  The distributed local-k/global-k
+    // equivalence relies on that upstream tie-break contract; the Ray
+    // regression test deliberately places more than k equal-distance rows in
+    // one fragment.
     scan.nearest(vector_column, &query, k).map_err(|err| {
         FfiError::new(
             ErrorCode::KnnStreamCreate,
@@ -1036,6 +1041,8 @@ pub unsafe extern "C" fn lance_vane_take_vector_rows(
     row_ids: *const u64,
     distances: *const f32,
     len: usize,
+    columns: *const *const c_char,
+    columns_len: usize,
 ) -> *mut c_void {
     let result = (|| -> FfiResult<RecordBatch> {
         // SAFETY: C++ passes a live dataset handle created by this FFI module.
@@ -1044,6 +1051,9 @@ pub unsafe extern "C" fn lance_vane_take_vector_rows(
         let row_ids = unsafe { slice_from_ptr(row_ids, len, "row_ids")? };
         // SAFETY: C++ passes len readable distances for the duration of this call.
         let distances = unsafe { slice_from_ptr(distances, len, "distances")? };
+        // SAFETY: C++ passes columns_len live NUL-terminated column names for this call.
+        let columns =
+            unsafe { optional_cstr_array(columns, columns_len, "vector materialization columns")? };
         if row_ids.is_empty() {
             return Err(FfiError::new(
                 ErrorCode::InvalidArgument,
@@ -1056,31 +1066,49 @@ pub unsafe extern "C" fn lance_vane_take_vector_rows(
                 "vector materialization received a non-finite distance",
             ));
         }
-
-        let projection = ProjectionRequest::from_columns(
-            handle.base_projection.as_ref(),
-            handle.dataset.schema(),
-        );
-        let rows = runtime_result(
-            runtime::block_on(handle.dataset.take_rows(row_ids, projection)),
-            "vector take_rows",
-        )?;
-        if rows.num_rows() != row_ids.len() {
-            return Err(FfiError::new(
-                ErrorCode::KnnStreamCreate,
-                "vector take_rows returned an unexpected row count",
-            ));
+        let mut unique_columns = HashSet::with_capacity(columns.len());
+        for column in &columns {
+            if column == DISTANCE_COLUMN
+                || !handle
+                    .base_projection
+                    .iter()
+                    .any(|candidate| candidate == column)
+                || !unique_columns.insert(column.as_str())
+            {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid vector materialization column: {column}"),
+                ));
+            }
         }
 
-        let mut columns = rows.columns().to_vec();
-        columns.push(Arc::new(Float32Array::from(distances.to_vec())) as Arc<dyn Array>);
-        let mut fields = rows.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let (mut arrays, mut fields) = if columns.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let projection = ProjectionRequest::from_columns(&columns, handle.dataset.schema());
+            let rows = runtime_result(
+                runtime::block_on(handle.dataset.take_rows(row_ids, projection)),
+                "vector take_rows",
+            )?;
+            if rows.num_rows() != row_ids.len() {
+                return Err(FfiError::new(
+                    ErrorCode::KnnStreamCreate,
+                    "vector take_rows returned an unexpected row count",
+                ));
+            }
+            (
+                rows.columns().to_vec(),
+                rows.schema().fields().iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+
+        arrays.push(Arc::new(Float32Array::from(distances.to_vec())) as Arc<dyn Array>);
         fields.push(Arc::new(Field::new(
             DISTANCE_COLUMN,
             DataType::Float32,
             false,
         )));
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|err| {
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|err| {
             FfiError::new(
                 ErrorCode::KnnStreamCreate,
                 format!("vector materialization batch: {err}"),
