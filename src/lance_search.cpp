@@ -1636,14 +1636,22 @@ LanceVectorMaterializeOutputTypes(const LanceVaneGlobalSearchState &state) {
   return result;
 }
 
-static Vector &LanceVectorMaterializeOutputVector(Vector &root,
-                                                  const ColumnIndex &column) {
+static void LanceVectorMaterializeOutputVector(Vector &root,
+                                               const ColumnIndex &column,
+                                               idx_t count, Vector &output) {
   if (!column.IsPushdownExtract()) {
     // Child indexes on a normal ColumnIndex are optional DuckDB pruning hints.
     // The projection above the scan still expects the complete root value.
-    return root;
+    if (root.GetType() != output.GetType()) {
+      throw SerializationException(
+          "Distributed Lance vector materialization output type changed");
+    }
+    output.Reference(root);
+    return;
   }
 
+  root.Flatten(count);
+  ValidityMask parent_validity;
   auto *current = &root;
   auto *path = &column;
   while (path->HasChildren()) {
@@ -1653,6 +1661,7 @@ static Vector &LanceVectorMaterializeOutputVector(Vector &root,
           "Distributed Lance vector materialization extract path is "
           "malformed");
     }
+    parent_validity.Combine(FlatVector::Validity(*current), count);
     auto &child = path->GetChildIndex(0);
     if (!child.HasPrimaryIndex() || child.IsVirtualColumn()) {
       throw SerializationException(
@@ -1669,11 +1678,16 @@ static Vector &LanceVectorMaterializeOutputVector(Vector &root,
     current = entries[child_id].get();
     path = &child;
   }
-  if (!column.HasType() || current->GetType() != column.GetScanType()) {
+  if (!column.HasType() || current->GetType() != column.GetScanType() ||
+      current->GetType() != output.GetType()) {
     throw SerializationException(
         "Distributed Lance vector materialization extract type is malformed");
   }
-  return *current;
+  output.Reference(*current);
+  // A pushed-down child becomes a top-level output vector, so retain the NULL
+  // semantics of every struct ancestor instead of exposing child storage from
+  // rows whose parent is NULL.
+  FlatVector::Validity(output).Combine(parent_validity, count);
 }
 
 static unique_ptr<GlobalTableFunctionState>
@@ -1820,13 +1834,8 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &,
           "Distributed Lance vector materialization output is out of range");
     }
     auto &source = local.materialized_columns.data[arrow_id];
-    auto &selected = LanceVectorMaterializeOutputVector(
-        source, local.output_columns[output_id]);
-    if (selected.GetType() != output.data[output_id].GetType()) {
-      throw SerializationException(
-          "Distributed Lance vector materialization output type changed");
-    }
-    output.data[output_id].Reference(selected);
+    LanceVectorMaterializeOutputVector(source, local.output_columns[output_id],
+                                       input.size(), output.data[output_id]);
   }
   output.Verify();
   return OperatorResultType::NEED_MORE_INPUT;
