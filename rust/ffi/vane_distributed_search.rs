@@ -1242,7 +1242,11 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
                 vector_column,
                 query_values,
                 k,
-                nprobes,
+                if selected_segment_metadata.is_empty() {
+                    0
+                } else {
+                    nprobes
+                },
                 0,
                 filter,
                 prefilter != 0,
