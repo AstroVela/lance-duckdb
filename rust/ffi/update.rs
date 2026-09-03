@@ -50,6 +50,7 @@ pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_and_storage
     out_rows_updated: *mut u64,
 ) -> i32 {
     match rewrite_rows_update_transaction_inner(
+        None,
         path,
         option_keys,
         option_values,
@@ -64,6 +65,60 @@ pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_and_storage
         max_rows_per_group,
         max_bytes_per_file,
         session,
+        out_transaction,
+        out_rows_updated,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_for_dataset(
+    dataset: *mut c_void,
+    predicate_ir: *const u8,
+    predicate_ir_len: usize,
+    set_columns: *const *const c_char,
+    set_expr_irs: *const *const u8,
+    set_expr_ir_lens: *const usize,
+    set_len: usize,
+    max_rows_per_file: u64,
+    max_rows_per_group: u64,
+    max_bytes_per_file: u64,
+    out_transaction: *mut *mut c_void,
+    out_rows_updated: *mut u64,
+) -> i32 {
+    // SAFETY: The caller supplies a live `DatasetHandle` allocated by this FFI
+    // library and retains ownership for the duration of this call.
+    let dataset = match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => handle.dataset.clone(),
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return -1;
+        }
+    };
+    match rewrite_rows_update_transaction_inner(
+        Some(dataset),
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+        0,
+        predicate_ir,
+        predicate_ir_len,
+        set_columns,
+        set_expr_irs,
+        set_expr_ir_lens,
+        set_len,
+        max_rows_per_file,
+        max_rows_per_group,
+        max_bytes_per_file,
+        std::ptr::null_mut(),
         out_transaction,
         out_rows_updated,
     ) {
@@ -117,6 +172,7 @@ impl CapturedRowIds {
 
 #[allow(clippy::too_many_arguments)]
 fn rewrite_rows_update_transaction_inner(
+    dataset_override: Option<Arc<lance::Dataset>>,
     path: *const c_char,
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
@@ -147,7 +203,11 @@ fn rewrite_rows_update_transaction_inner(
         ));
     }
 
-    let path = unsafe { cstr_to_str(path, "path")? }.to_string();
+    let path = if dataset_override.is_some() {
+        String::new()
+    } else {
+        unsafe { cstr_to_str(path, "path")? }.to_string()
+    };
     let predicate_ir = if predicate_ir.is_null() {
         if predicate_ir_len != 0 {
             return Err(FfiError::new(
@@ -271,13 +331,16 @@ fn rewrite_rows_update_transaction_inner(
     }
 
     let (maybe_txn, rows_updated) = match runtime::block_on(async {
-        let mut builder = lance::dataset::builder::DatasetBuilder::from_uri(path.as_str())
-            .with_storage_options(storage_options);
-        if let Some(session) = session.clone() {
-            builder = builder.with_session(session);
-        }
-        let dataset = builder.load().await.map_err(|e| e.to_string())?;
-        let dataset = Arc::new(dataset);
+        let dataset = if let Some(dataset) = dataset_override.clone() {
+            dataset
+        } else {
+            let mut builder = lance::dataset::builder::DatasetBuilder::from_uri(path.as_str())
+                .with_storage_options(storage_options);
+            if let Some(session) = session.clone() {
+                builder = builder.with_session(session);
+            }
+            Arc::new(builder.load().await.map_err(|e| e.to_string())?)
+        };
 
         let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(dataset.schema().into());
         let predicate_expr = if let Some(predicate_ir) = predicate_ir.as_deref() {

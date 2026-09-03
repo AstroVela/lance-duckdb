@@ -14,6 +14,7 @@ mod search;
 mod session;
 mod stream;
 mod take;
+mod transaction;
 mod types;
 mod update;
 mod util;

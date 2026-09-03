@@ -81,6 +81,21 @@ void *lance_open_dataset_in_namespace_with_session(
     void *session, const char **out_table_uri);
 void lance_close_dataset(void *dataset);
 
+void *lance_dataset_transaction_new(void *dataset);
+void *lance_dataset_transaction_open(void *dataset_transaction);
+int32_t lance_dataset_transaction_stage(void *dataset_transaction,
+                                        void *transaction);
+int32_t lance_dataset_transaction_add_columns(
+    void *dataset_transaction, const ArrowSchema *new_columns_schema,
+    const char **expressions, size_t expressions_len, uint32_t batch_size);
+int32_t lance_dataset_transaction_update_table_metadata(
+    void *dataset_transaction, const char *key, const char *value);
+int32_t lance_dataset_transaction_update_field_metadata(
+    void *dataset_transaction, const char *field_path, const char *key,
+    const char *value);
+int32_t lance_dataset_transaction_commit(void *dataset_transaction);
+void lance_dataset_transaction_free(void *dataset_transaction);
+
 void *lance_get_schema(void *dataset);
 void *lance_get_schema_for_scan(void *dataset);
 void lance_free_schema(void *schema);
@@ -226,6 +241,12 @@ int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(
     const char **set_columns, const uint8_t **set_expr_irs,
     const size_t *set_expr_ir_lens, size_t set_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file, void *session,
+    void **out_transaction, uint64_t *out_rows_updated);
+int32_t lance_overwrite_update_transaction_with_irs_for_dataset(
+    void *dataset, const uint8_t *predicate_ir, size_t predicate_ir_len,
+    const char **set_columns, const uint8_t **set_expr_irs,
+    const size_t *set_expr_ir_lens, size_t set_len, uint64_t max_rows_per_file,
+    uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
     void **out_transaction, uint64_t *out_rows_updated);
 
 int32_t lance_merge_begin_with_storage_options(

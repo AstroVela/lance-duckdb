@@ -206,11 +206,6 @@ public:
     ResolveLanceStorageOptionsForTable(context.client, table, open_path,
                                        option_keys, option_values, display_uri);
 
-    vector<const char *> key_ptrs;
-    vector<const char *> value_ptrs;
-    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                    value_ptrs);
-
     vector<const char *> set_col_ptrs;
     vector<const uint8_t *> set_expr_ir_ptrs;
     vector<size_t> set_expr_ir_lens;
@@ -230,14 +225,19 @@ public:
         predicate_ir.empty()
             ? nullptr
             : reinterpret_cast<const uint8_t *>(predicate_ir.data());
-    auto rc = lance_overwrite_update_transaction_with_irs_and_storage_options(
-        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        predicate_ptr, predicate_ir.size(), set_col_ptrs.data(),
+    string transaction_display_uri;
+    auto *dataset = LanceOpenDatasetForTable(context.client, table,
+                                             transaction_display_uri);
+    if (!dataset) {
+      throw IOException("Failed to open Lance dataset for UPDATE: " +
+                        transaction_display_uri + LanceFormatErrorSuffix());
+    }
+    auto rc = lance_overwrite_update_transaction_with_irs_for_dataset(
+        dataset, predicate_ptr, predicate_ir.size(), set_col_ptrs.data(),
         set_expr_ir_ptrs.data(), set_expr_ir_lens.data(), set_columns.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-        LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context.client),
-        &txn, &rows_updated);
+        LANCE_DEFAULT_MAX_BYTES_PER_FILE, &txn, &rows_updated);
+    lance_close_dataset(dataset);
     if (rc != 0) {
       throw IOException("Failed to create Lance UPDATE transaction for '" +
                         open_path + "'" + LanceFormatErrorSuffix());

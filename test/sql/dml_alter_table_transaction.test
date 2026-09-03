@@ -1,0 +1,105 @@
+# name: test/sql/dml_alter_table_transaction.test
+# description: transaction-local ALTER TABLE staging for attached Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO 'test/.tmp/lance_alter_transaction_seed.lance'
+(FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE alter_txn_ns.main.lance_alter_transaction AS
+SELECT range::BIGINT AS id FROM range(3);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE alter_txn_initial_versions AS
+SELECT count(*)::BIGINT AS c
+FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*');
+
+# DuckDB expands this ALTER into ADD COLUMN DEFAULT NULL, UPDATE, and
+# SET DEFAULT. The final default is invalid because defaults cannot reference
+# another column. All preceding Lance changes must remain invisible.
+statement ok
+BEGIN TRANSACTION;
+
+statement error
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN doubled BIGINT DEFAULT (id * 2);
+----
+Binder Error:
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*)
+FROM duckdb_columns()
+WHERE database_name = 'alter_txn_ns'
+  AND schema_name = 'main'
+  AND table_name = 'lance_alter_transaction'
+  AND column_name = 'doubled';
+----
+0
+
+query T
+SELECT (SELECT c FROM alter_txn_initial_versions) =
+       (SELECT count(*)::BIGINT
+        FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*'));
+----
+true
+
+# A valid non-literal default follows the same three-statement expansion.
+# The transaction reads its staged snapshot and publishes one attached Lance
+# version at commit.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN answer BIGINT DEFAULT (40 + 2);
+
+query I
+SELECT count(*) FROM alter_txn_ns.main.lance_alter_transaction
+WHERE answer = 42;
+----
+3
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM alter_txn_ns.main.lance_alter_transaction
+WHERE answer = 42;
+----
+3
+
+query T
+SELECT ((SELECT c FROM alter_txn_initial_versions) + 1) =
+       (SELECT count(*)::BIGINT
+        FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*'));
+----
+true
+
+# Defaults are stored in Lance field metadata and survive catalog discovery.
+statement ok
+DETACH alter_txn_ns;
+
+statement ok
+ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+statement ok
+INSERT INTO alter_txn_ns.main.lance_alter_transaction(id) VALUES (3);
+
+query I
+SELECT count(*) FROM alter_txn_ns.main.lance_alter_transaction
+WHERE id = 3 AND answer = 42;
+----
+1
+
+statement ok
+DETACH alter_txn_ns;

@@ -23,7 +23,7 @@ use super::util::{
     FfiResult,
 };
 
-fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
+pub(super) fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
     dataset
         .config()
         .get("lance.add_columns.batch_size")
@@ -157,7 +157,10 @@ fn write_metrics_json<T: Serialize>(
     Ok(())
 }
 
-fn parse_arrow_schema(schema: *const c_void, what: &'static str) -> FfiResult<Arc<ArrowSchema>> {
+pub(super) fn parse_arrow_schema(
+    schema: *const c_void,
+    what: &'static str,
+) -> FfiResult<Arc<ArrowSchema>> {
     if schema.is_null() {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,

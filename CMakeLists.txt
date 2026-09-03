@@ -143,6 +143,7 @@ set(RUST_FFI_DEPENDS
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/take.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/transaction.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/update.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs

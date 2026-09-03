@@ -4,6 +4,7 @@
 #include "lance_ffi.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
+#include "lance_transaction.hpp"
 
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/main/client_context_state.hpp"
@@ -309,6 +310,12 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
     ClientContext &context, const LanceTableEntry &table,
     string &out_display_uri, bool *out_cache_hit) {
   out_display_uri = table.DatasetUri();
+  if (auto *dataset = LanceTryOpenTransactionDataset(context, table)) {
+    if (out_cache_hit) {
+      *out_cache_hit = false;
+    }
+    return make_shared_ptr<LanceDatasetCacheEntry>(dataset, out_display_uri);
+  }
   if (!table.IsNamespaceBacked()) {
     auto entry =
         LanceGetOrOpenDatasetEntry(context, table.DatasetUri(), out_cache_hit);

@@ -9,6 +9,7 @@
 #include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
@@ -45,6 +47,7 @@
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
+#include "lance_transaction.hpp"
 #include "lance_update.hpp"
 
 #include <cstring>
@@ -160,7 +163,23 @@ static void PopulateColumnsFromArrowSchema(ClientContext &context,
         "Arrow table schema returned mismatched names/types sizes");
   }
   for (idx_t i = 0; i < names.size(); i++) {
-    out_columns.AddColumn(ColumnDefinition(names[i], types[i]));
+    ColumnDefinition column(names[i], types[i]);
+    auto *field_schema = arrow_schema.children[i];
+    if (field_schema && field_schema->metadata) {
+      ArrowSchemaMetadata metadata(field_schema->metadata);
+      auto default_expression = metadata.GetOption("duckdb_default_expr");
+      if (!default_expression.empty()) {
+        auto expressions = Parser::ParseExpressionList(
+            default_expression, context.GetParserOptions());
+        if (expressions.size() != 1 || !expressions[0]) {
+          throw IOException("Invalid DuckDB default expression in Lance field "
+                            "metadata for column '" +
+                            names[i] + "'");
+        }
+        column.SetDefaultValue(std::move(expressions[0]));
+      }
+    }
+    out_columns.AddColumn(std::move(column));
   }
 }
 
@@ -675,10 +694,7 @@ public:
     }
 
     auto &context = transaction.GetContext();
-    if (!context.transaction.IsAutoCommit()) {
-      throw NotImplementedException(
-          "Lance DDL does not support explicit transactions yet");
-    }
+    const bool transaction_local = !context.transaction.IsAutoCommit();
 
     // Allow altering internal entries for attached Lance catalogs.
     info.allow_internal = true;
@@ -700,14 +716,39 @@ public:
         throw IOException("Failed to open Lance dataset: " + display_uri +
                           LanceFormatErrorSuffix());
       }
-      auto rc =
-          lance_dataset_update_table_metadata(dataset, "comment", comment_ptr);
+      int32_t rc;
+      if (transaction_local) {
+        auto *dataset_transaction =
+            LanceGetOrCreateDatasetTransaction(context, *lance_entry, dataset);
+        rc = lance_dataset_transaction_update_table_metadata(
+            dataset_transaction, "comment", comment_ptr);
+      } else {
+        rc = lance_dataset_update_table_metadata(dataset, "comment",
+                                                 comment_ptr);
+      }
       lance_close_dataset(dataset);
       if (rc != 0) {
         throw IOException("Failed to update table comment in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
-      LanceInvalidateDatasetCacheForTable(context, *lance_entry);
+      if (!transaction_local) {
+        LanceInvalidateDatasetCacheForTable(context, *lance_entry);
+      }
+    }
+
+    if (transaction_local) {
+      if (info.type == AlterType::CHANGE_OWNERSHIP) {
+        if (!set.AlterOwnership(transaction,
+                                info.Cast<ChangeOwnershipInfo>())) {
+          throw CatalogException("Couldn't change ownership!");
+        }
+        return;
+      }
+      if (!set.AlterEntry(transaction, info.name, info)) {
+        throw CatalogException::MissingEntry(info.GetCatalogType(), info.name,
+                                             string());
+      }
+      return;
     }
 
     auto system_tx =
@@ -1836,6 +1877,11 @@ struct LancePendingAppend {
   void *transaction = nullptr;
 };
 
+struct LancePendingDatasetTransaction {
+  string cache_key;
+  void *transaction = nullptr;
+};
+
 class LanceTransactionManager final : public DuckTransactionManager {
 public:
   explicit LanceTransactionManager(AttachedDatabase &db)
@@ -1848,16 +1894,120 @@ public:
     pending_appends[transaction.transaction_id].push_back(std::move(pending));
   }
 
+  void *GetOrCreateDatasetTransaction(Transaction &transaction_p,
+                                      const string &cache_key, void *dataset) {
+    auto &transaction = transaction_p.Cast<DuckTransaction>();
+    lock_guard<mutex> guard(pending_lock);
+    auto &datasets = pending_datasets[transaction.transaction_id];
+    auto entry = datasets.find(cache_key);
+    if (entry != datasets.end()) {
+      return entry->second.transaction;
+    }
+
+    auto *dataset_transaction = lance_dataset_transaction_new(dataset);
+    if (!dataset_transaction) {
+      throw TransactionException(
+          "Failed to create transaction-local Lance snapshot" +
+          LanceFormatErrorSuffix());
+    }
+    LancePendingDatasetTransaction pending;
+    pending.cache_key = cache_key;
+    pending.transaction = dataset_transaction;
+    datasets.emplace(cache_key, std::move(pending));
+    return dataset_transaction;
+  }
+
+  void *TryOpenDataset(Transaction &transaction_p, const string &cache_key) {
+    auto &transaction = transaction_p.Cast<DuckTransaction>();
+    lock_guard<mutex> guard(pending_lock);
+    auto txn_it = pending_datasets.find(transaction.transaction_id);
+    if (txn_it == pending_datasets.end()) {
+      return nullptr;
+    }
+    auto dataset_it = txn_it->second.find(cache_key);
+    if (dataset_it == txn_it->second.end()) {
+      return nullptr;
+    }
+    return lance_dataset_transaction_open(dataset_it->second.transaction);
+  }
+
+  void StagePendingTransaction(ClientContext &context,
+                               Transaction &transaction_p,
+                               LancePendingAppend pending) {
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    BuildStorageOptionPointerArrays(pending.option_keys, pending.option_values,
+                                    key_ptrs, value_ptrs);
+    auto *dataset = lance_open_dataset_with_storage_options_and_session(
+        pending.path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(),
+        pending.option_keys.size(), LanceGetSessionHandle(context));
+    if (!dataset) {
+      lance_free_transaction(pending.transaction);
+      throw IOException("Failed to open Lance dataset: " + pending.path +
+                        LanceFormatErrorSuffix());
+    }
+
+    void *dataset_transaction = nullptr;
+    try {
+      dataset_transaction = GetOrCreateDatasetTransaction(
+          transaction_p, pending.cache_key, dataset);
+    } catch (...) {
+      lance_close_dataset(dataset);
+      lance_free_transaction(pending.transaction);
+      throw;
+    }
+    lance_close_dataset(dataset);
+
+    // The FFI consumes pending.transaction on both success and failure.
+    auto rc = lance_dataset_transaction_stage(dataset_transaction,
+                                              pending.transaction);
+    if (rc != 0) {
+      throw TransactionException(
+          "Failed to stage transaction-local Lance change for '" +
+          pending.path + "'" + LanceFormatErrorSuffix());
+    }
+  }
+
   ErrorData CommitTransaction(ClientContext &context,
                               Transaction &transaction_p) override {
     auto &transaction = transaction_p.Cast<DuckTransaction>();
     vector<LancePendingAppend> appends;
+    vector<LancePendingDatasetTransaction> datasets;
     {
       lock_guard<mutex> guard(pending_lock);
       auto it = pending_appends.find(transaction.transaction_id);
       if (it != pending_appends.end()) {
         appends = std::move(it->second);
         pending_appends.erase(it);
+      }
+      auto dataset_it = pending_datasets.find(transaction.transaction_id);
+      if (dataset_it != pending_datasets.end()) {
+        datasets.reserve(dataset_it->second.size());
+        for (auto &entry : dataset_it->second) {
+          datasets.push_back(std::move(entry.second));
+        }
+        pending_datasets.erase(dataset_it);
+      }
+    }
+
+    for (idx_t dataset_idx = 0; dataset_idx < datasets.size(); dataset_idx++) {
+      auto &pending = datasets[dataset_idx];
+      auto rc = lance_dataset_transaction_commit(pending.transaction);
+      lance_dataset_transaction_free(pending.transaction);
+      pending.transaction = nullptr;
+      if (rc != 0) {
+        for (idx_t cleanup_idx = dataset_idx + 1; cleanup_idx < datasets.size();
+             cleanup_idx++) {
+          lance_dataset_transaction_free(datasets[cleanup_idx].transaction);
+        }
+        for (auto &append : appends) {
+          lance_free_transaction(append.transaction);
+        }
+        DuckTransactionManager::RollbackTransaction(transaction_p);
+        return ErrorData(ExceptionType::TRANSACTION,
+                         "Failed to commit transaction-local Lance dataset" +
+                             LanceFormatErrorSuffix());
       }
     }
 
@@ -1890,8 +2040,11 @@ public:
 
     auto result =
         DuckTransactionManager::CommitTransaction(context, transaction_p);
-    if (!result.HasError() && !appends.empty()) {
+    if (!result.HasError()) {
       for (auto &pending : appends) {
+        LanceInvalidateDatasetCache(context, pending.cache_key);
+      }
+      for (auto &pending : datasets) {
         LanceInvalidateDatasetCache(context, pending.cache_key);
       }
     }
@@ -1901,6 +2054,7 @@ public:
   void RollbackTransaction(Transaction &transaction_p) override {
     auto &transaction = transaction_p.Cast<DuckTransaction>();
     vector<LancePendingAppend> appends;
+    vector<LancePendingDatasetTransaction> datasets;
     {
       lock_guard<mutex> guard(pending_lock);
       auto it = pending_appends.find(transaction.transaction_id);
@@ -1908,9 +2062,20 @@ public:
         appends = std::move(it->second);
         pending_appends.erase(it);
       }
+      auto dataset_it = pending_datasets.find(transaction.transaction_id);
+      if (dataset_it != pending_datasets.end()) {
+        datasets.reserve(dataset_it->second.size());
+        for (auto &entry : dataset_it->second) {
+          datasets.push_back(std::move(entry.second));
+        }
+        pending_datasets.erase(dataset_it);
+      }
     }
     for (auto &pending : appends) {
       lance_free_transaction(pending.transaction);
+    }
+    for (auto &pending : datasets) {
+      lance_dataset_transaction_free(pending.transaction);
     }
     DuckTransactionManager::RollbackTransaction(transaction_p);
   }
@@ -1918,6 +2083,9 @@ public:
 private:
   mutex pending_lock;
   unordered_map<transaction_t, vector<LancePendingAppend>> pending_appends;
+  unordered_map<transaction_t,
+                unordered_map<string, LancePendingDatasetTransaction>>
+      pending_datasets;
 };
 
 static unique_ptr<TransactionManager>
@@ -1950,7 +2118,39 @@ void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
   pending.option_values = std::move(option_values);
   pending.cache_key = std::move(cache_key);
   pending.transaction = lance_transaction;
-  tm->RegisterPendingAppend(txn, std::move(pending));
+  if (context.transaction.IsAutoCommit()) {
+    tm->RegisterPendingAppend(txn, std::move(pending));
+  } else {
+    tm->StagePendingTransaction(context, txn, std::move(pending));
+  }
+}
+
+void *LanceTryOpenTransactionDataset(ClientContext &context,
+                                     const LanceTableEntry &table) {
+  auto &txn = Transaction::Get(context, table.catalog);
+  auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
+  if (!tm) {
+    return nullptr;
+  }
+  auto cache_key = LanceBuildDatasetCacheKeyForTable(context, table);
+  return tm->TryOpenDataset(txn, cache_key);
+}
+
+void *LanceGetOrCreateDatasetTransaction(ClientContext &context,
+                                         const LanceTableEntry &table,
+                                         void *dataset) {
+  if (context.transaction.IsAutoCommit()) {
+    throw InternalException(
+        "Transaction-local Lance dataset requested in auto-commit mode");
+  }
+  auto &txn = Transaction::Get(context, table.catalog);
+  auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
+  if (!tm) {
+    throw InternalException("LanceGetOrCreateDatasetTransaction requires "
+                            "LanceTransactionManager");
+  }
+  auto cache_key = LanceBuildDatasetCacheKeyForTable(context, table);
+  return tm->GetOrCreateDatasetTransaction(txn, cache_key, dataset);
 }
 
 } // namespace duckdb

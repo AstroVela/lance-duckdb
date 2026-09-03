@@ -3,6 +3,7 @@
 #include "lance_ffi.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
+#include "lance_transaction.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -586,6 +587,9 @@ void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri) {
   out_display_uri = table.DatasetUri();
+  if (auto *dataset = LanceTryOpenTransactionDataset(context, table)) {
+    return dataset;
+  }
   if (!table.IsNamespaceBacked()) {
     return LanceOpenDataset(context, table.DatasetUri());
   }
