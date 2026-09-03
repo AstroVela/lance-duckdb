@@ -929,28 +929,38 @@ pub unsafe extern "C" fn lance_dataset_list_table_metadata(dataset: *mut c_void)
 pub unsafe extern "C" fn lance_dataset_get_table_metadata(
     dataset: *mut c_void,
     key: *const c_char,
-) -> *const c_char {
+    out_value: *mut *const c_char,
+) -> i32 {
+    if out_value.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "out_value must not be null");
+        return -1;
+    }
+    ptr::write_unaligned(out_value, ptr::null());
+
     match dataset_get_table_metadata_inner(dataset, key) {
-        Ok(value) => {
+        Ok(Some(value)) => {
+            ptr::write_unaligned(out_value, to_c_string(value).into_raw());
             clear_last_error();
-            to_c_string(value).into_raw()
+            1
+        }
+        Ok(None) => {
+            clear_last_error();
+            0
         }
         Err(err) => {
             set_last_error(err.code, err.message);
-            std::ptr::null()
+            -1
         }
     }
 }
 
-fn dataset_get_table_metadata_inner(dataset: *mut c_void, key: *const c_char) -> FfiResult<String> {
+fn dataset_get_table_metadata_inner(
+    dataset: *mut c_void,
+    key: *const c_char,
+) -> FfiResult<Option<String>> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let key = unsafe { cstr_to_str(key, "metadata key")? };
-    Ok(handle
-        .dataset
-        .metadata()
-        .get(key)
-        .cloned()
-        .unwrap_or_default())
+    Ok(handle.dataset.metadata().get(key).cloned())
 }
 
 #[no_mangle]

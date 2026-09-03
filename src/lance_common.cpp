@@ -47,6 +47,66 @@ string LanceFormatErrorSuffix() {
   return " (Lance error: " + err + ")";
 }
 
+bool TryGetLanceArrowMetadataOption(const char *metadata, const string &key,
+                                    string &out_value) {
+  out_value.clear();
+  if (!metadata) {
+    return false;
+  }
+
+  int32_t num_pairs;
+  memcpy(&num_pairs, metadata, sizeof(num_pairs));
+  metadata += sizeof(num_pairs);
+  if (num_pairs < 0) {
+    throw IOException("Invalid Arrow schema metadata pair count");
+  }
+
+  bool found = false;
+  for (int32_t i = 0; i < num_pairs; i++) {
+    int32_t key_length;
+    memcpy(&key_length, metadata, sizeof(key_length));
+    metadata += sizeof(key_length);
+    if (key_length < 0) {
+      throw IOException("Invalid Arrow schema metadata key length");
+    }
+    string metadata_key(metadata, NumericCast<idx_t>(key_length));
+    metadata += key_length;
+
+    int32_t value_length;
+    memcpy(&value_length, metadata, sizeof(value_length));
+    metadata += sizeof(value_length);
+    if (value_length < 0) {
+      throw IOException("Invalid Arrow schema metadata value length");
+    }
+    if (metadata_key == key) {
+      out_value.assign(metadata, NumericCast<idx_t>(value_length));
+      found = true;
+    }
+    metadata += value_length;
+  }
+  return found;
+}
+
+bool TryGetLanceTableMetadata(void *dataset, const string &key,
+                              string &out_value) {
+  out_value.clear();
+  const char *value = nullptr;
+  auto rc = lance_dataset_get_table_metadata(dataset, key.c_str(), &value);
+  if (rc < 0) {
+    throw IOException("Failed to read Lance table metadata" +
+                      LanceFormatErrorSuffix());
+  }
+  if (rc == 0) {
+    return false;
+  }
+  if (rc != 1 || !value) {
+    throw InternalException("Invalid Lance table metadata result");
+  }
+  out_value = value;
+  lance_free_string(value);
+  return true;
+}
+
 bool IsComputedSearchColumn(const string &name) {
   return name == "_distance" || name == "_score" || name == "_hybrid_score";
 }

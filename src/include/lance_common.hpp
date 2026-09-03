@@ -9,6 +9,11 @@ namespace duckdb {
 string LanceConsumeLastError();
 string LanceFormatErrorSuffix();
 
+bool TryGetLanceArrowMetadataOption(const char *metadata, const string &key,
+                                    string &out_value);
+bool TryGetLanceTableMetadata(void *dataset, const string &key,
+                              string &out_value);
+
 bool IsComputedSearchColumn(const string &name);
 
 void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,

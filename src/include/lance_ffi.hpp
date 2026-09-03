@@ -162,7 +162,8 @@ int32_t lance_dataset_cleanup_old_versions_with_options(
 
 const char *lance_dataset_list_config(void *dataset);
 const char *lance_dataset_list_table_metadata(void *dataset);
-const char *lance_dataset_get_table_metadata(void *dataset, const char *key);
+int32_t lance_dataset_get_table_metadata(void *dataset, const char *key,
+                                         const char **out_value);
 const char *lance_dataset_list_schema_metadata(void *dataset);
 const char *lance_dataset_list_field_metadata(void *dataset,
                                               const char *field_path);

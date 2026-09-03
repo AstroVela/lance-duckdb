@@ -10,7 +10,7 @@
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
-#include "duckdb/common/arrow/schema_metadata.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -20,6 +20,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -37,6 +38,7 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
 #include "lance_common.hpp"
@@ -167,13 +169,15 @@ static void PopulateColumnsFromArrowSchema(ClientContext &context,
     ColumnDefinition column(names[i], types[i]);
     auto *field_schema = arrow_schema.children[i];
     if (field_schema && field_schema->metadata) {
-      ArrowSchemaMetadata metadata(field_schema->metadata);
-      auto comment = metadata.GetOption("comment");
-      if (!comment.empty()) {
+      string comment;
+      if (TryGetLanceArrowMetadataOption(field_schema->metadata, "comment",
+                                         comment)) {
         column.SetComment(Value(comment));
       }
-      auto default_expression = metadata.GetOption("duckdb_default_expr");
-      if (!default_expression.empty()) {
+      string default_expression;
+      if (TryGetLanceArrowMetadataOption(field_schema->metadata,
+                                         "duckdb_default_expr",
+                                         default_expression)) {
         auto expressions = Parser::ParseExpressionList(
             default_expression, context.GetParserOptions());
         if (expressions.size() != 1 || !expressions[0]) {
@@ -216,14 +220,8 @@ static void PopulateLanceTableColumnsFromDataset(
 
 static void PopulateLanceTableCommentFromDataset(void *dataset,
                                                  CreateTableInfo &info) {
-  auto *comment = lance_dataset_get_table_metadata(dataset, "comment");
-  if (!comment) {
-    throw IOException("Failed to read table metadata from Lance dataset" +
-                      LanceFormatErrorSuffix());
-  }
-  string value = comment;
-  lance_free_string(comment);
-  if (!value.empty()) {
+  string value;
+  if (TryGetLanceTableMetadata(dataset, "comment", value)) {
     info.comment = Value(value);
   }
 }
@@ -717,35 +715,30 @@ public:
         table_default_generator->CreateDefaultEntry(context, table_name);
     auto &set = GetCatalogSet(CatalogType::TABLE_ENTRY);
     auto existing_entry = set.GetEntry(recovery_transaction, table_name);
-    optional_ptr<CatalogEntry> tombstone;
     if (existing_entry) {
       if (!dynamic_cast<LanceTableEntry *>(existing_entry.get())) {
         throw InternalException("Expected Lance table entry for '%s'",
                                 table_name);
       }
-      if (!set.DropEntry(recovery_transaction, table_name, false, true)) {
+      if (!refreshed_entry) {
+        refreshed_entry = existing_entry->Copy(context);
+        refreshed_entry->deleted = true;
+      }
+
+      LanceCatalogRefreshInfo refresh_info(catalog.GetName(), name, table_name,
+                                           std::move(refreshed_entry));
+      refresh_info.allow_internal = true;
+      if (!set.AlterEntry(recovery_transaction, table_name, refresh_info)) {
         throw InternalException("Failed to refresh Lance table entry '%s'",
                                 table_name);
       }
-      tombstone = &existing_entry->Parent();
-    }
-
-    if (refreshed_entry) {
+    } else if (refreshed_entry) {
       LogicalDependencyList dependencies;
       if (!set.CreateEntry(recovery_transaction, table_name,
                            std::move(refreshed_entry), dependencies)) {
         throw InternalException("Failed to install refreshed Lance table '%s'",
                                 table_name);
       }
-      if (tombstone) {
-        // Preserve older catalog versions for active readers, but unlink the
-        // deletion marker between them and the authoritative replacement.
-        set.CleanupEntry(*tombstone);
-      }
-    } else if (existing_entry) {
-      // Keep the deletion marker if Lance no longer has the table. Removing
-      // the superseded entry still preserves any older retained children.
-      set.CleanupEntry(*existing_entry);
     }
     InvalidateTableDefaults();
   }
@@ -2155,15 +2148,24 @@ public:
                          "Failed to commit transaction-local Lance dataset" +
                              lance_error);
         try {
-          // A normal system transaction has start_time=1 and cannot alter a
-          // catalog entry committed later by the just-finished transaction.
-          // Use the system transaction id with a latest-committed snapshot.
-          CatalogTransaction recovery_transaction(db.GetDatabase(), 1,
-                                                  TRANSACTION_ID_START);
-          auto &schema =
-              db.GetCatalog().GetSchema(recovery_transaction, DEFAULT_SCHEMA);
+          // Publish the authoritative replacement through a real DuckDB
+          // transaction. Its fresh start time can see the catalog change that
+          // just committed, and its fresh commit time keeps that replacement
+          // invisible to readers whose snapshots predate the failed publish.
+          Connection recovery_connection(db.GetDatabase());
+          auto &recovery_context = *recovery_connection.context;
+          recovery_context.transaction.BeginTransaction();
+          MetaTransaction::Get(recovery_context)
+              .ModifyDatabase(db, DatabaseModificationType::ALTER_TABLE);
+
+          auto recovery_catalog_transaction =
+              db.GetCatalog().GetCatalogTransaction(recovery_context);
+          auto &schema = db.GetCatalog().GetSchema(recovery_catalog_transaction,
+                                                   DEFAULT_SCHEMA);
           schema.Cast<LanceSchemaEntry>().RefreshTableEntry(
-              context, recovery_transaction, pending.table_name);
+              recovery_context, recovery_catalog_transaction,
+              pending.table_name);
+          recovery_context.transaction.Commit();
         } catch (std::exception &ex) {
           result.Merge(ErrorData(ex));
         }

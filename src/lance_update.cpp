@@ -1,7 +1,6 @@
 #include "duckdb.hpp"
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
-#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -71,11 +70,8 @@ static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
         !StringUtil::CIEquals(field->name, field_name)) {
       continue;
     }
-    if (field->metadata) {
-      out_default_expr =
-          ArrowSchemaMetadata(field->metadata).GetOption("duckdb_default_expr");
-    }
-    return !out_default_expr.empty();
+    return TryGetLanceArrowMetadataOption(
+        field->metadata, "duckdb_default_expr", out_default_expr);
   }
   return false;
 }

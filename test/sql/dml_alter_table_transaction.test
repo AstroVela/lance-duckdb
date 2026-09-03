@@ -16,6 +16,12 @@ statement ok
 CREATE OR REPLACE TABLE alter_txn_ns.main.lance_alter_transaction AS
 SELECT range::BIGINT AS id FROM range(3);
 
+# Create the second dataset before the catalog rediscovery exercised below so
+# the multi-dataset transaction test does not depend on an existing fixture.
+statement ok
+CREATE OR REPLACE TABLE alter_txn_ns.main.lance_alter_transaction_other AS
+SELECT range::BIGINT AS id FROM range(2);
+
 statement ok
 CREATE OR REPLACE TEMP TABLE alter_txn_initial_versions AS
 SELECT count(*)::BIGINT AS c
@@ -185,11 +191,57 @@ WHERE id IN (1, 2)
 ----
 2
 
+# Empty comments are present metadata values, not absent metadata. Preserve
+# that distinction in the transaction-local catalog and after rediscovery.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+COMMENT ON TABLE alter_txn_ns.main.delimited_default_transaction IS '';
+
+statement ok
+COMMENT ON COLUMN alter_txn_ns.main.delimited_default_transaction.note IS '';
+
+query TT
+SELECT
+  (SELECT comment = ''
+   FROM duckdb_tables()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'),
+  (SELECT comment = ''
+   FROM duckdb_columns()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'
+     AND column_name = 'note');
+----
+true	true
+
+statement ok
+COMMIT;
+
 statement ok
 DETACH alter_txn_ns;
 
 statement ok
 ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+query TT
+SELECT
+  (SELECT comment = ''
+   FROM duckdb_tables()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'),
+  (SELECT comment = ''
+   FROM duckdb_columns()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'
+     AND column_name = 'note');
+----
+true	true
 
 statement ok
 INSERT INTO alter_txn_ns.main.lance_alter_transaction(id) VALUES (3);
@@ -275,10 +327,6 @@ true
 
 # Lance has no atomic commit spanning multiple datasets. Reject such a
 # transaction before publishing either staged snapshot.
-statement ok
-CREATE OR REPLACE TABLE alter_txn_ns.main.lance_alter_transaction_other AS
-SELECT range::BIGINT AS id FROM range(2);
-
 statement ok
 CREATE OR REPLACE TEMP TABLE alter_multi_initial_versions AS
 SELECT

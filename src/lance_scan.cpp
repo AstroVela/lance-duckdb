@@ -1,7 +1,6 @@
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
-#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -3494,12 +3493,12 @@ static void PopulateLanceTableSchemaFromDataset(
     auto *child = schema_root.arrow_schema.children[i];
     string default_expression;
     if (child && child->metadata) {
-      ArrowSchemaMetadata metadata(child->metadata);
-      auto comment = metadata.GetOption("comment");
-      if (!comment.empty()) {
+      string comment;
+      if (TryGetLanceArrowMetadataOption(child->metadata, "comment", comment)) {
         col.SetComment(Value(comment));
       }
-      default_expression = metadata.GetOption("duckdb_default_expr");
+      TryGetLanceArrowMetadataOption(child->metadata, "duckdb_default_expr",
+                                     default_expression);
     }
     if (!default_expression.empty()) {
       auto expressions = Parser::ParseExpressionList(
@@ -3556,16 +3555,14 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   }
   entry->SetCoercedColumnNames(std::move(coerced));
 
-  auto *table_comment = lance_dataset_get_table_metadata(dataset, "comment");
-  if (!table_comment) {
+  string table_comment;
+  try {
+    if (TryGetLanceTableMetadata(dataset, "comment", table_comment)) {
+      entry->comment = Value(table_comment);
+    }
+  } catch (...) {
     lance_close_dataset(dataset);
-    throw IOException("Failed to read table metadata from Lance dataset" +
-                      LanceFormatErrorSuffix());
-  }
-  string table_comment_value = table_comment;
-  lance_free_string(table_comment);
-  if (!table_comment_value.empty()) {
-    entry->comment = Value(table_comment_value);
+    throw;
   }
 
   lance_close_dataset(dataset);
@@ -3681,6 +3678,10 @@ LanceTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
 
 unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                                                      AlterInfo &info) {
+  if (auto *refresh = dynamic_cast<LanceCatalogRefreshInfo *>(&info)) {
+    return std::move(refresh->replacement);
+  }
+
   const bool transaction_local = !context.transaction.IsAutoCommit();
 
   string display_uri;
