@@ -133,21 +133,27 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/filter_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/arrow_export.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dataset.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dir_namespace.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/exec.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/index.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/knn.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/merge.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/mod.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/namespace.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/projection.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/query_table.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/scan.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/take.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/update.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/schema_evolution.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/session.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/take.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/transaction.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/update.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/expr_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)

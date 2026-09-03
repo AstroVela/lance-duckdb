@@ -1,0 +1,199 @@
+# name: test/sql/dml_search_transaction.test
+# description: transaction-local search for attached Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/.tmp' AS search_txn_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE search_txn_ns.main.search_transaction AS
+SELECT *
+FROM (
+  VALUES
+    (1::BIGINT, 'old document'::VARCHAR, 1::BIGINT,
+     [10.0, 10.0]::FLOAT[2]),
+    (2::BIGINT, 'another document'::VARCHAR, 2::BIGINT,
+     [20.0, 20.0]::FLOAT[2])
+) AS rows(id, text, label, vec);
+
+# Prepared searches are bound before the transaction-local workspace exists.
+# Every execution must choose between namespace query_table and the current
+# staged Dataset instead of retaining the bind-time choice.
+statement ok
+PREPARE prepared_vector_search AS
+SELECT id, _distance >= 0 AS metric_ok
+FROM lance_vector_search(
+  'search_txn_ns.main.search_transaction',
+  'vec',
+  [0.0, 0.0]::FLOAT[2],
+  k = 1,
+  use_index = false
+);
+
+statement ok
+PREPARE prepared_fts_search AS
+SELECT id, _score > 0 AS metric_ok
+FROM lance_fts(
+  'search_txn_ns.main.search_transaction',
+  'text',
+  'staged',
+  k = 10
+);
+
+statement ok
+PREPARE prepared_hybrid_search AS
+SELECT id, _hybrid_score >= 0 AS metric_ok
+FROM lance_hybrid_search(
+  'search_txn_ns.main.search_transaction',
+  'vec',
+  [0.0, 0.0]::FLOAT[2],
+  'text',
+  'staged',
+  k = 1,
+  use_index = false
+);
+
+statement ok
+PREPARE prepared_table_scan AS
+SELECT id
+FROM search_txn_ns.main.search_transaction
+ORDER BY id;
+
+statement ok
+PREPARE prepared_table_aggregate AS
+SELECT count(*), sum(id)
+FROM search_txn_ns.main.search_transaction;
+
+statement ok
+BEGIN TRANSACTION;
+
+# Adding a field after PREPARE must not shift the search metric columns in the
+# runtime Arrow batches.
+statement ok
+ALTER TABLE search_txn_ns.main.search_transaction
+ADD COLUMN prepared_marker BIGINT DEFAULT -1;
+
+statement ok
+INSERT INTO search_txn_ns.main.search_transaction
+  (id, text, label, vec)
+VALUES (3, 'staged needle', 3, [0.0, 0.0]);
+
+query II
+EXECUTE prepared_vector_search;
+----
+3	true
+
+query II
+EXECUTE prepared_fts_search;
+----
+3	true
+
+query II
+EXECUTE prepared_hybrid_search;
+----
+3	true
+
+query I
+EXECUTE prepared_table_scan;
+----
+1
+2
+3
+
+query II
+EXECUTE prepared_table_aggregate;
+----
+3	6
+
+statement ok
+ROLLBACK;
+
+# A later execution has no workspace and must return to namespace query_table
+# instead of retaining the previously opened detached snapshot.
+query II
+EXECUTE prepared_vector_search;
+----
+1	true
+
+query II
+EXECUTE prepared_hybrid_search;
+----
+1	true
+
+query I
+EXECUTE prepared_table_scan;
+----
+1
+2
+
+query II
+EXECUTE prepared_table_aggregate;
+----
+2	3
+
+# Namespace query_table only sees published versions. Once the transaction has
+# a detached snapshot, vector and FTS searches must use that dataset handle.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE search_txn_ns.main.search_transaction
+ADD COLUMN marker BIGINT DEFAULT 7;
+
+statement ok
+INSERT INTO search_txn_ns.main.search_transaction(id, text, label, vec)
+VALUES (3, 'staged needle', 3, [0.0, 0.0]);
+
+# Exercise both the namespace-specific filter argument and an outer DuckDB
+# filter. The direct staged-snapshot path combines both filters before search.
+query II
+SELECT id, marker
+FROM lance_vector_search(
+  'search_txn_ns.main.search_transaction',
+  'vec',
+  [0.0, 0.0]::FLOAT[2],
+  k = 1,
+  prefilter = true,
+  use_index = false,
+  filter = 'label = 3'
+)
+WHERE marker = 7;
+----
+3	7
+
+query II
+SELECT id, marker
+FROM lance_fts(
+  'search_txn_ns.main.search_transaction',
+  'text',
+  'staged',
+  k = 10,
+  prefilter = true,
+  filter = 'label = 3'
+)
+WHERE marker = 7;
+----
+3	7
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM search_txn_ns.main.search_transaction;
+----
+2
+
+query I
+SELECT count(*)
+FROM duckdb_columns()
+WHERE database_name = 'search_txn_ns'
+  AND schema_name = 'main'
+  AND table_name = 'search_transaction'
+  AND column_name = 'marker';
+----
+0
+
+statement ok
+DETACH search_txn_ns;

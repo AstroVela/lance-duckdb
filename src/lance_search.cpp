@@ -31,6 +31,7 @@
 #include "lance_arrow_compat.hpp"
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
+#include "lance_transaction.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -45,6 +46,7 @@ namespace duckdb {
 static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
                                const vector<float> &query, uint64_t k,
                                uint64_t nprobes, uint64_t refine_factor,
+                               const string *filter_sql,
                                const string *filter_ir, bool prefilter,
                                bool use_index, bool verbose, string &out_plan,
                                string &out_error) {
@@ -69,8 +71,9 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
 
   auto *plan_ptr = lance_explain_knn_scan_ir(
       dataset, vector_column.c_str(), query.data(), query.size(), k, nprobes,
-      refine_factor, filter_ptr, NumericCast<size_t>(filter_len),
-      prefilter ? 1 : 0, use_index ? 1 : 0, verbose ? 1 : 0);
+      refine_factor, filter_sql ? filter_sql->c_str() : nullptr, filter_ptr,
+      NumericCast<size_t>(filter_len), prefilter ? 1 : 0, use_index ? 1 : 0,
+      verbose ? 1 : 0);
   if (!plan_ptr) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -205,6 +208,12 @@ TryResolveNamespaceBackedSearchTable(ClientContext &context,
   return table;
 }
 
+static string CanonicalLanceSearchTableName(const LanceTableEntry &table) {
+  return QualifiedName{table.catalog.GetName(), table.ParentSchema().name,
+                       table.name}
+      .ToString();
+}
+
 static string RequireNamespaceSearchColumn(const LanceTableEntry &table,
                                            const string &column,
                                            const string &function_name,
@@ -249,6 +258,28 @@ static void PopulateNamespaceSearchSchema(
   return_types = result_types;
 }
 
+static vector<string>
+BoundSearchBaseColumns(const vector<string> &bound_names) {
+  vector<string> result;
+  result.reserve(bound_names.size());
+  for (auto &name : bound_names) {
+    if (!IsComputedSearchColumn(name)) {
+      result.push_back(name);
+    }
+  }
+  return result;
+}
+
+static vector<const char *>
+SearchColumnPointers(const vector<string> &columns) {
+  vector<const char *> result;
+  result.reserve(columns.size());
+  for (auto &column : columns) {
+    result.push_back(column.c_str());
+  }
+  return result;
+}
+
 struct LanceKnnBindData : public TableFunctionData {
   string file_path;
   string vector_column;
@@ -260,6 +291,7 @@ struct LanceKnnBindData : public TableFunctionData {
   bool use_index = true;
   bool explain_verbose = false;
   bool namespace_backed = false;
+  string namespace_table_name;
   LanceNamespaceTableConfig namespace_config;
   string namespace_filter;
 
@@ -284,7 +316,10 @@ struct LanceKnnGlobalState : public GlobalTableFunctionState {
 
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
-  vector<string> namespace_columns;
+  vector<string> bound_base_columns;
+  bool use_namespace_query = false;
+  shared_ptr<LanceDatasetCacheEntry> runtime_dataset_entry;
+  void *dataset = nullptr;
 
   std::atomic<bool> explain_computed{false};
   string explain_plan;
@@ -476,15 +511,11 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   if (auto *table =
           TryResolveNamespaceBackedSearchTable(context, input.inputs[0])) {
     result->namespace_backed = true;
+    result->namespace_table_name = CanonicalLanceSearchTableName(*table);
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");
-    if (result->prefilter && result->namespace_filter.empty()) {
-      throw InvalidInputException(
-          "lance_vector_search requires explicit filter when prefilter=true "
-          "on namespace-backed tables");
-    }
     PopulateNamespaceSearchSchema(
         context, *table, "_distance", result->schema_root, result->arrow_table,
         result->names, result->types, names, return_types);
@@ -539,12 +570,33 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
 }
 
 static unique_ptr<GlobalTableFunctionState>
-LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
   auto state = make_uniq_base<GlobalTableFunctionState, LanceKnnGlobalState>();
   auto &global = state->Cast<LanceKnnGlobalState>();
 
+  // A prepared statement may be bound before the transaction stages a write.
+  // Choose the namespace or transaction-local dataset on every execution.
+  global.use_namespace_query = bind_data.namespace_backed;
+  global.dataset = bind_data.dataset;
+  if (bind_data.namespace_backed) {
+    auto *table =
+        TryResolveLanceTableEntry(context, bind_data.namespace_table_name);
+    if (!table || !table->IsNamespaceBacked()) {
+      throw CatalogException("Lance namespace table no longer exists: " +
+                             bind_data.namespace_table_name);
+    }
+    if (auto *transaction_dataset =
+            LanceTryOpenTransactionDataset(context, *table)) {
+      global.runtime_dataset_entry = make_shared_ptr<LanceDatasetCacheEntry>(
+          transaction_dataset, table->DatasetUri());
+      global.dataset = global.runtime_dataset_entry->Handle();
+      global.use_namespace_query = false;
+    }
+  }
+
   global.projection_ids = input.projection_ids;
+  global.bound_base_columns = BoundSearchBaseColumns(bind_data.names);
   if (!input.projection_ids.empty()) {
     global.scanned_types.reserve(input.column_ids.size());
     for (auto col_id : input.column_ids) {
@@ -555,8 +607,16 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
-  if (bind_data.namespace_backed) {
+  if (global.use_namespace_query) {
+    if (bind_data.prefilter && bind_data.namespace_filter.empty()) {
+      throw InvalidInputException(
+          "lance_vector_search requires explicit filter when prefilter=true "
+          "on namespace-backed tables");
+    }
     return state;
+  }
+  if (!global.dataset) {
+    throw IOException("Failed to open Lance dataset: " + bind_data.file_path);
   }
 
   auto table_filters = BuildLanceTableFilterIRParts(
@@ -609,7 +669,9 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     result->all_columns.Initialize(context.client, global.scanned_types);
   }
 
-  if (bind_data.namespace_backed) {
+  auto bound_column_ptrs = SearchColumnPointers(global.bound_base_columns);
+
+  if (global.use_namespace_query) {
     vector<const char *> option_key_ptrs;
     vector<const char *> option_value_ptrs;
     vector<const char *> column_ptrs;
@@ -619,7 +681,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     FillLanceNamespaceQueryConfig(
         context.client, bind_data.namespace_config, bind_data.k,
         bind_data.prefilter, bind_data.namespace_filter,
-        global.namespace_columns, option_key_ptrs, option_value_ptrs,
+        global.bound_base_columns, option_key_ptrs, option_value_ptrs,
         column_ptrs, bearer_token, api_key, config);
     LanceNamespaceVectorSearchOptions options;
     options.vector_column = bind_data.vector_column.c_str();
@@ -644,10 +706,15 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
           : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
   auto filter_ir_len = global.lance_filter_ir.size();
   result->stream = lance_create_knn_stream_ir(
-      bind_data.dataset, bind_data.vector_column.c_str(),
-      bind_data.query.data(), bind_data.query.size(), bind_data.k,
-      bind_data.nprobes, bind_data.refine_factor, filter_ir, filter_ir_len,
-      bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
+      global.dataset, bind_data.vector_column.c_str(), bind_data.query.data(),
+      bind_data.query.size(), bind_data.k, bind_data.nprobes,
+      bind_data.refine_factor,
+      bind_data.namespace_filter.empty() ? nullptr
+                                         : bind_data.namespace_filter.c_str(),
+      filter_ir, filter_ir_len, bind_data.prefilter ? 1 : 0,
+      bind_data.use_index ? 1 : 0,
+      bound_column_ptrs.empty() ? nullptr : bound_column_ptrs.data(),
+      bound_column_ptrs.size());
   if (!result->stream && filter_ir && !bind_data.prefilter) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
@@ -655,10 +722,14 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     global.filter_pushed_down = false;
     result->filter_pushed_down = false;
     result->stream = lance_create_knn_stream_ir(
-        bind_data.dataset, bind_data.vector_column.c_str(),
-        bind_data.query.data(), bind_data.query.size(), bind_data.k,
-        bind_data.nprobes, bind_data.refine_factor, nullptr, 0,
-        bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
+        global.dataset, bind_data.vector_column.c_str(), bind_data.query.data(),
+        bind_data.query.size(), bind_data.k, bind_data.nprobes,
+        bind_data.refine_factor,
+        bind_data.namespace_filter.empty() ? nullptr
+                                           : bind_data.namespace_filter.c_str(),
+        nullptr, 0, bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0,
+        bound_column_ptrs.empty() ? nullptr : bound_column_ptrs.data(),
+        bound_column_ptrs.size());
   }
   if (!result->stream) {
     throw IOException("Failed to create Lance KNN stream" +
@@ -814,6 +885,8 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   if (TryLanceExplainKnn(
           bind_data.dataset, bind_data.vector_column, bind_data.query,
           bind_data.k, bind_data.nprobes, bind_data.refine_factor,
+          bind_data.namespace_filter.empty() ? nullptr
+                                             : &bind_data.namespace_filter,
           filter_ir_msg.empty() ? nullptr : &filter_ir_msg, bind_data.prefilter,
           bind_data.use_index, bind_data.explain_verbose, plan, error)) {
     result["Lance Plan (Bind)"] = plan;
@@ -831,8 +904,9 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
   auto &global_state = input.global_state->Cast<LanceKnnGlobalState>();
 
   result["Lance Path"] = bind_data.file_path;
-  result["Lance Search Backend"] =
-      bind_data.namespace_backed ? "namespace_query_table" : "dataset_scan";
+  result["Lance Search Backend"] = global_state.use_namespace_query
+                                       ? "namespace_query_table"
+                                       : "dataset_scan";
   result["Lance Vector Column"] = bind_data.vector_column;
   result["Lance K"] = to_string(bind_data.k);
   result["Lance Nprobes"] = to_string(bind_data.nprobes);
@@ -861,7 +935,7 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
       to_string(global_state.record_batch_rows.load());
   result["Lance Rows Out"] = to_string(global_state.lines_read.load());
 
-  if (bind_data.namespace_backed) {
+  if (global_state.use_namespace_query) {
     return result;
   }
 
@@ -871,8 +945,10 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
       string plan;
       string error;
       auto ok = TryLanceExplainKnn(
-          bind_data.dataset, bind_data.vector_column, bind_data.query,
+          global_state.dataset, bind_data.vector_column, bind_data.query,
           bind_data.k, bind_data.nprobes, bind_data.refine_factor,
+          bind_data.namespace_filter.empty() ? nullptr
+                                             : &bind_data.namespace_filter,
           global_state.lance_filter_ir.empty() ? nullptr
                                                : &global_state.lance_filter_ir,
           bind_data.prefilter, bind_data.use_index, bind_data.explain_verbose,
@@ -940,6 +1016,7 @@ struct LanceSearchBindData : public TableFunctionData {
   string file_path;
   bool prefilter = false;
   bool namespace_backed = false;
+  string namespace_table_name;
   LanceNamespaceTableConfig namespace_config;
   string namespace_filter;
 
@@ -978,7 +1055,10 @@ struct LanceSearchGlobalState : public GlobalTableFunctionState {
 
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
-  vector<string> namespace_columns;
+  vector<string> bound_base_columns;
+  bool use_namespace_query = false;
+  shared_ptr<LanceDatasetCacheEntry> runtime_dataset_entry;
+  void *dataset = nullptr;
 
   idx_t MaxThreads() const override { return 1; }
   bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
@@ -1007,7 +1087,8 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                                      const LanceSearchBindData &bind_data,
                                      LanceSearchGlobalState &global) {
   if (!local_state.stream) {
-    if (bind_data.namespace_backed) {
+    auto bound_column_ptrs = SearchColumnPointers(global.bound_base_columns);
+    if (global.use_namespace_query) {
       vector<const char *> option_key_ptrs;
       vector<const char *> option_value_ptrs;
       vector<const char *> column_ptrs;
@@ -1016,8 +1097,9 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
       LanceNamespaceQueryConfig config;
       FillLanceNamespaceQueryConfig(
           context, bind_data.namespace_config, bind_data.k, bind_data.prefilter,
-          bind_data.namespace_filter, global.namespace_columns, option_key_ptrs,
-          option_value_ptrs, column_ptrs, bearer_token, api_key, config);
+          bind_data.namespace_filter, global.bound_base_columns,
+          option_key_ptrs, option_value_ptrs, column_ptrs, bearer_token,
+          api_key, config);
       LanceNamespaceFtsSearchOptions options;
       options.text_column = bind_data.text_column.c_str();
       options.query = bind_data.query.c_str();
@@ -1037,18 +1119,25 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
       auto create_stream = [&](const uint8_t *ir, idx_t ir_len) -> void * {
         if (bind_data.mode == LanceSearchMode::Fts) {
           return lance_create_fts_stream_ir(
-              bind_data.dataset, bind_data.text_column.c_str(),
-              bind_data.query.c_str(), bind_data.k, ir,
-              NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0);
+              global.dataset, bind_data.text_column.c_str(),
+              bind_data.query.c_str(), bind_data.k,
+              bind_data.namespace_filter.empty()
+                  ? nullptr
+                  : bind_data.namespace_filter.c_str(),
+              ir, NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0,
+              bound_column_ptrs.empty() ? nullptr : bound_column_ptrs.data(),
+              bound_column_ptrs.size());
         }
         return lance_create_hybrid_stream_ir(
-            bind_data.dataset, bind_data.vector_column.c_str(),
+            global.dataset, bind_data.vector_column.c_str(),
             bind_data.vector_query.data(), bind_data.vector_query.size(),
             bind_data.text_column.c_str(), bind_data.text_query.c_str(),
             bind_data.k, bind_data.nprobes, bind_data.refine_factor, ir,
             NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0,
             bind_data.use_index ? 1 : 0, bind_data.alpha,
-            bind_data.oversample_factor);
+            bind_data.oversample_factor,
+            bound_column_ptrs.empty() ? nullptr : bound_column_ptrs.data(),
+            bound_column_ptrs.size());
       };
 
       local_state.stream = create_stream(filter_ir, filter_ir_len);
@@ -1154,15 +1243,11 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   if (auto *table =
           TryResolveNamespaceBackedSearchTable(context, input.inputs[0])) {
     result->namespace_backed = true;
+    result->namespace_table_name = CanonicalLanceSearchTableName(*table);
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
     result->text_column = RequireNamespaceSearchColumn(
         *table, result->text_column, "lance_fts", "text_column");
-    if (result->prefilter && result->namespace_filter.empty()) {
-      throw InvalidInputException(
-          "lance_fts requires explicit filter when prefilter=true on "
-          "namespace-backed tables");
-    }
     PopulateNamespaceSearchSchema(
         context, *table, "_score", result->schema_root, result->arrow_table,
         result->names, result->types, names, return_types);
@@ -1245,6 +1330,10 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
 
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
+  if (auto *table = TryResolveLanceTableEntry(
+          context, input.inputs[0].GetValue<string>())) {
+    result->namespace_table_name = CanonicalLanceSearchTableName(*table);
+  }
   result->file_path.clear();
   result->dataset_entry =
       OpenSearchDatasetEntry(context, input.inputs[0], "lance_hybrid_search",
@@ -1362,13 +1451,43 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
 }
 
 static unique_ptr<GlobalTableFunctionState>
-LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+LanceSearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
   auto state =
       make_uniq_base<GlobalTableFunctionState, LanceSearchGlobalState>();
   auto &global = state->Cast<LanceSearchGlobalState>();
 
+  // Bind data outlives individual prepared-statement executions. Resolve the
+  // current transaction snapshot into execution-local global state.
+  global.use_namespace_query = bind_data.namespace_backed;
+  global.dataset = bind_data.dataset;
+  if (!bind_data.namespace_table_name.empty()) {
+    auto *table =
+        TryResolveLanceTableEntry(context, bind_data.namespace_table_name);
+    if (!table || !table->IsNamespaceBacked()) {
+      throw CatalogException("Lance namespace table no longer exists: " +
+                             bind_data.namespace_table_name);
+    }
+    if (bind_data.namespace_backed) {
+      if (auto *transaction_dataset =
+              LanceTryOpenTransactionDataset(context, *table)) {
+        global.runtime_dataset_entry = make_shared_ptr<LanceDatasetCacheEntry>(
+            transaction_dataset, table->DatasetUri());
+        global.dataset = global.runtime_dataset_entry->Handle();
+        global.use_namespace_query = false;
+      }
+    } else {
+      string display_uri;
+      global.runtime_dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+          context, *table, display_uri, nullptr);
+      global.dataset = global.runtime_dataset_entry
+                           ? global.runtime_dataset_entry->Handle()
+                           : nullptr;
+    }
+  }
+
   global.projection_ids = input.projection_ids;
+  global.bound_base_columns = BoundSearchBaseColumns(bind_data.names);
   if (!input.projection_ids.empty()) {
     global.scanned_types.reserve(input.column_ids.size());
     for (auto col_id : input.column_ids) {
@@ -1379,8 +1498,16 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
-  if (bind_data.namespace_backed) {
+  if (global.use_namespace_query) {
+    if (bind_data.prefilter && bind_data.namespace_filter.empty()) {
+      throw InvalidInputException(
+          "lance_fts requires explicit filter when prefilter=true on "
+          "namespace-backed tables");
+    }
     return state;
+  }
+  if (!global.dataset) {
+    throw IOException("Failed to open Lance dataset: " + bind_data.file_path);
   }
 
   auto table_filters = BuildLanceTableFilterIRParts(
@@ -1531,6 +1658,10 @@ LanceSearchDynamicToString(TableFunctionDynamicToStringInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
   auto result = LanceSearchBindToString(bind_data);
   auto &global_state = input.global_state->Cast<LanceSearchGlobalState>();
+
+  result["Lance Search Backend"] = global_state.use_namespace_query
+                                       ? "namespace_query_table"
+                                       : "dataset_scan";
 
   result["Lance Filter Pushed Down"] =
       global_state.filter_pushed_down ? "true" : "false";

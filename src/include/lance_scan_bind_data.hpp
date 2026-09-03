@@ -28,7 +28,9 @@ struct LanceScanBindData : public TableFunctionData {
   vector<string> lance_pushed_filter_ir_parts;
   vector<string> duckdb_pushed_filter_sql_parts;
   optional_ptr<TableCatalogEntry> table_entry = nullptr;
+  string attached_table_name;
   unique_ptr<LanceNamespaceTableConfig> namespace_query_config;
+  bool use_namespace_query_at_bind = false;
 
   bool sampling_pushed_down = false;
   double sample_percentage = 0.0;

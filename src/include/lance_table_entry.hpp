@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
 namespace duckdb {
@@ -11,6 +12,21 @@ class CatalogEntry;
 class ClientContext;
 
 enum class LanceNamespaceKind { Directory, Rest };
+
+// Internal metadata-only catalog alteration used to replace a stale Lance
+// mirror entry without invoking DuckDB's physical-table DROP path. The base
+// SetColumnCommentInfo is serializable by DuckDB's undo buffer and has no
+// physical column payload; LanceTableEntry consumes replacement directly.
+struct LanceCatalogRefreshInfo final : public SetColumnCommentInfo {
+  LanceCatalogRefreshInfo(string catalog, string schema, string table,
+                          unique_ptr<CatalogEntry> replacement_p)
+      : SetColumnCommentInfo(std::move(catalog), std::move(schema),
+                             std::move(table), "", Value(),
+                             OnEntryNotFound::THROW_EXCEPTION),
+        replacement(std::move(replacement_p)) {}
+
+  unique_ptr<CatalogEntry> replacement;
+};
 
 struct LanceNamespaceTableConfig {
   LanceNamespaceKind kind = LanceNamespaceKind::Rest;

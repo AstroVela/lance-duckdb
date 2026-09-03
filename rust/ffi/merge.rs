@@ -23,6 +23,7 @@ use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError
 struct MergeHandle {
     input_schema: Arc<arrow_schema::Schema>,
     data_type: DataType,
+    dataset: Option<Arc<lance::Dataset>>,
     path: String,
     session: Option<Arc<lance::session::Session>>,
     storage_options: HashMap<String, String>,
@@ -59,7 +60,8 @@ pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
     session: *mut c_void,
     out_merge_handle: *mut *mut c_void,
 ) -> i32 {
-    match merge_begin_with_storage_options_inner(
+    match merge_begin_inner(
+        None,
         path,
         option_keys,
         option_values,
@@ -81,8 +83,49 @@ pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lance_merge_begin_for_dataset(
+    dataset: *mut c_void,
+    max_rows_per_file: u64,
+    max_rows_per_group: u64,
+    max_bytes_per_file: u64,
+    out_merge_handle: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: The caller supplies a live `DatasetHandle` allocated by this FFI
+    // library and retains ownership for the duration of this call.
+    let dataset = match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => handle.dataset.clone(),
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return -1;
+        }
+    };
+    match merge_begin_inner(
+        Some(dataset),
+        ptr::null(),
+        ptr::null(),
+        ptr::null(),
+        0,
+        max_rows_per_file,
+        max_rows_per_group,
+        max_bytes_per_file,
+        ptr::null_mut(),
+        out_merge_handle,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn merge_begin_with_storage_options_inner(
+fn merge_begin_inner(
+    dataset_override: Option<Arc<lance::Dataset>>,
     path: *const c_char,
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
@@ -100,7 +143,11 @@ fn merge_begin_with_storage_options_inner(
         ));
     }
 
-    let path = unsafe { cstr_to_str(path, "path")? }.to_string();
+    let path = if dataset_override.is_some() {
+        String::new()
+    } else {
+        unsafe { cstr_to_str(path, "path")? }.to_string()
+    };
 
     if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
         return Err(FfiError::new(
@@ -157,26 +204,30 @@ fn merge_begin_with_storage_options_inner(
     })?;
     let session = unsafe { optional_session_handle(session)? };
 
-    let input_schema: Arc<arrow_schema::Schema> = match runtime::block_on(async {
-        let mut builder =
-            DatasetBuilder::from_uri(path.as_str()).with_storage_options(storage_options.clone());
-        if let Some(session) = session.clone() {
-            builder = builder.with_session(session);
-        }
-        builder.load().await.map_err(|e| e.to_string())
-    }) {
-        Ok(Ok(dataset)) => Arc::new(dataset.schema().into()),
-        Ok(Err(message)) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetMerge,
-                format!("open dataset: {message}"),
-            ))
-        }
-        Err(err) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetMerge,
-                format!("runtime: {err}"),
-            ))
+    let input_schema: Arc<arrow_schema::Schema> = if let Some(dataset) = &dataset_override {
+        Arc::new(dataset.schema().into())
+    } else {
+        match runtime::block_on(async {
+            let mut builder = DatasetBuilder::from_uri(path.as_str())
+                .with_storage_options(storage_options.clone());
+            if let Some(session) = session.clone() {
+                builder = builder.with_session(session);
+            }
+            builder.load().await.map_err(|e| e.to_string())
+        }) {
+            Ok(Ok(dataset)) => Arc::new(dataset.schema().into()),
+            Ok(Err(message)) => {
+                return Err(FfiError::new(
+                    ErrorCode::DatasetMerge,
+                    format!("open dataset: {message}"),
+                ))
+            }
+            Err(err) => {
+                return Err(FfiError::new(
+                    ErrorCode::DatasetMerge,
+                    format!("runtime: {err}"),
+                ))
+            }
         }
     };
 
@@ -184,6 +235,7 @@ fn merge_begin_with_storage_options_inner(
     let handle = Box::new(MergeHandle {
         input_schema,
         data_type,
+        dataset: dataset_override,
         path,
         session,
         storage_options,
@@ -342,13 +394,16 @@ fn merge_finish_uncommitted_inner(
     let handle = unsafe { Box::from_raw(merge_handle as *mut MergeHandle) };
 
     let maybe_txn = match runtime::block_on(async move {
-        let mut builder = DatasetBuilder::from_uri(handle.path.as_str())
-            .with_storage_options(handle.storage_options.clone());
-        if let Some(session) = handle.session.clone() {
-            builder = builder.with_session(session);
-        }
-        let dataset = builder.load().await.map_err(|e| e.to_string())?;
-        let dataset = Arc::new(dataset);
+        let dataset = if let Some(dataset) = handle.dataset.clone() {
+            dataset
+        } else {
+            let mut builder = DatasetBuilder::from_uri(handle.path.as_str())
+                .with_storage_options(handle.storage_options.clone());
+            if let Some(session) = handle.session.clone() {
+                builder = builder.with_session(session);
+            }
+            Arc::new(builder.load().await.map_err(|e| e.to_string())?)
+        };
 
         let mut new_fragments = Vec::new();
         if !handle.insert_batches.is_empty() {

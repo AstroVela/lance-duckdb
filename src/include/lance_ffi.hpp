@@ -81,6 +81,21 @@ void *lance_open_dataset_in_namespace_with_session(
     void *session, const char **out_table_uri);
 void lance_close_dataset(void *dataset);
 
+void *lance_dataset_transaction_new(void *dataset);
+void *lance_dataset_transaction_open(void *dataset_transaction);
+int32_t lance_dataset_transaction_stage(void *dataset_transaction,
+                                        void *transaction);
+int32_t lance_dataset_transaction_add_columns(
+    void *dataset_transaction, const ArrowSchema *new_columns_schema,
+    const char **expressions, size_t expressions_len, uint32_t batch_size);
+int32_t lance_dataset_transaction_update_table_metadata(
+    void *dataset_transaction, const char *key, const char *value);
+int32_t lance_dataset_transaction_update_field_metadata(
+    void *dataset_transaction, const char *field_path, const char *key,
+    const char *value);
+int32_t lance_dataset_transaction_commit(void *dataset_transaction);
+void lance_dataset_transaction_free(void *dataset_transaction);
+
 void *lance_get_schema(void *dataset);
 void *lance_get_schema_for_scan(void *dataset);
 void lance_free_schema(void *schema);
@@ -105,6 +120,11 @@ int32_t lance_delete_transaction_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const uint8_t *filter_ir, size_t filter_ir_len,
     void *session, void **out_transaction, int64_t *out_deleted_rows);
+int32_t lance_delete_transaction_for_dataset(void *dataset,
+                                             const uint8_t *filter_ir,
+                                             size_t filter_ir_len,
+                                             void **out_transaction,
+                                             int64_t *out_deleted_rows);
 
 int32_t lance_dataset_add_columns(void *dataset,
                                   const ArrowSchema *new_columns_schema,
@@ -142,6 +162,8 @@ int32_t lance_dataset_cleanup_old_versions_with_options(
 
 const char *lance_dataset_list_config(void *dataset);
 const char *lance_dataset_list_table_metadata(void *dataset);
+int32_t lance_dataset_get_table_metadata(void *dataset, const char *key,
+                                         const char **out_value);
 const char *lance_dataset_list_schema_metadata(void *dataset);
 const char *lance_dataset_list_field_metadata(void *dataset,
                                               const char *field_path);
@@ -210,6 +232,11 @@ void *lance_open_uncommitted_writer_with_storage_options(
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
     const char *data_storage_version, void *session, const ArrowSchema *schema);
+void *lance_open_uncommitted_writer_for_dataset(void *dataset,
+                                                uint64_t max_rows_per_file,
+                                                uint64_t max_rows_per_group,
+                                                uint64_t max_bytes_per_file,
+                                                const ArrowSchema *schema);
 int32_t lance_writer_write_batch(void *writer, ArrowArray *array);
 int32_t lance_writer_finish(void *writer);
 int32_t lance_writer_finish_uncommitted(void *writer, void **out_transaction);
@@ -227,11 +254,21 @@ int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(
     const size_t *set_expr_ir_lens, size_t set_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file, void *session,
     void **out_transaction, uint64_t *out_rows_updated);
+int32_t lance_overwrite_update_transaction_with_irs_for_dataset(
+    void *dataset, const uint8_t *predicate_ir, size_t predicate_ir_len,
+    const char **set_columns, const uint8_t **set_expr_irs,
+    const size_t *set_expr_ir_lens, size_t set_len, uint64_t max_rows_per_file,
+    uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
+    void **out_transaction, uint64_t *out_rows_updated);
 
 int32_t lance_merge_begin_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, uint64_t max_rows_per_file, uint64_t max_rows_per_group,
     uint64_t max_bytes_per_file, void *session, void **out_merge_handle);
+int32_t lance_merge_begin_for_dataset(void *dataset, uint64_t max_rows_per_file,
+                                      uint64_t max_rows_per_group,
+                                      uint64_t max_bytes_per_file,
+                                      void **out_merge_handle);
 int32_t lance_merge_add_delete_rowids(void *merge_handle,
                                       const uint64_t *row_ids,
                                       size_t row_ids_len);
@@ -253,24 +290,25 @@ void *lance_get_knn_schema(void *dataset, const char *vector_column,
 void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  const float *query_values, size_t query_len,
                                  uint64_t k, uint64_t nprobes,
-                                 uint64_t refine_factor,
+                                 uint64_t refine_factor, const char *filter_sql,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
-                                 uint8_t prefilter, uint8_t use_index);
+                                 uint8_t prefilter, uint8_t use_index,
+                                 const char **columns, size_t columns_len);
 
-const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
-                                      const float *query_values,
-                                      size_t query_len, uint64_t k,
-                                      uint64_t nprobes, uint64_t refine_factor,
-                                      const uint8_t *filter_ir,
-                                      size_t filter_ir_len, uint8_t prefilter,
-                                      uint8_t use_index, uint8_t verbose);
+const char *lance_explain_knn_scan_ir(
+    void *dataset, const char *vector_column, const float *query_values,
+    size_t query_len, uint64_t k, uint64_t nprobes, uint64_t refine_factor,
+    const char *filter_sql, const uint8_t *filter_ir, size_t filter_ir_len,
+    uint8_t prefilter, uint8_t use_index, uint8_t verbose);
 
 void *lance_get_fts_schema(void *dataset, const char *text_column,
                            const char *query, uint64_t k, uint8_t prefilter);
 void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
                                  const char *query, uint64_t k,
+                                 const char *filter_sql,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
-                                 uint8_t prefilter);
+                                 uint8_t prefilter, const char **columns,
+                                 size_t columns_len);
 
 typedef struct LanceNamespaceQueryConfig {
   uint8_t namespace_kind;
@@ -321,7 +359,8 @@ void *lance_create_hybrid_stream_ir(
     size_t query_len, const char *text_column, const char *text_query,
     uint64_t k, uint64_t nprobes, uint64_t refine_factor,
     const uint8_t *filter_ir, size_t filter_ir_len, uint8_t prefilter,
-    uint8_t use_index, float alpha, uint32_t oversample_factor);
+    uint8_t use_index, float alpha, uint32_t oversample_factor,
+    const char **columns, size_t columns_len);
 
 // Index DDL / metadata
 int32_t lance_dataset_create_index(void *dataset, const char *index_name,

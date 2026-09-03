@@ -1,5 +1,6 @@
 #include "duckdb.hpp"
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -28,31 +29,9 @@
 #include "lance_update.hpp"
 
 #include <cstdint>
+#include <cstring>
 
 namespace duckdb {
-
-static vector<pair<string, string>> ParseLanceMetadataRows(const char *ptr) {
-  if (!ptr) {
-    throw IOException("Failed to read Lance field metadata" +
-                      LanceFormatErrorSuffix());
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<pair<string, string>> out;
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out.emplace_back(std::move(parts[0]), std::move(parts[1]));
-  }
-  return out;
-}
 
 static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
                                         LanceTableEntry &table,
@@ -67,15 +46,32 @@ static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
                       display_uri + LanceFormatErrorSuffix());
   }
 
-  auto rows = ParseLanceMetadataRows(
-      lance_dataset_list_field_metadata(dataset, field_name.c_str()));
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    lance_close_dataset(dataset);
+    throw IOException("Failed to read Lance schema for UPDATE planning" +
+                      LanceFormatErrorSuffix());
+  }
+
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    lance_close_dataset(dataset);
+    throw IOException("Failed to export Lance schema for UPDATE planning" +
+                      LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
   lance_close_dataset(dataset);
 
-  for (auto &entry : rows) {
-    if (entry.first == "duckdb_default_expr") {
-      out_default_expr = std::move(entry.second);
-      return true;
+  for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
+    auto *field = schema_root.arrow_schema.children[i];
+    if (!field || !field->name ||
+        !StringUtil::CIEquals(field->name, field_name)) {
+      continue;
     }
+    return TryGetLanceArrowMetadataOption(
+        field->metadata, "duckdb_default_expr", out_default_expr);
   }
   return false;
 }
@@ -206,11 +202,6 @@ public:
     ResolveLanceStorageOptionsForTable(context.client, table, open_path,
                                        option_keys, option_values, display_uri);
 
-    vector<const char *> key_ptrs;
-    vector<const char *> value_ptrs;
-    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                    value_ptrs);
-
     vector<const char *> set_col_ptrs;
     vector<const uint8_t *> set_expr_ir_ptrs;
     vector<size_t> set_expr_ir_lens;
@@ -230,14 +221,19 @@ public:
         predicate_ir.empty()
             ? nullptr
             : reinterpret_cast<const uint8_t *>(predicate_ir.data());
-    auto rc = lance_overwrite_update_transaction_with_irs_and_storage_options(
-        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        predicate_ptr, predicate_ir.size(), set_col_ptrs.data(),
+    string transaction_display_uri;
+    auto *dataset = LanceOpenDatasetForTable(context.client, table,
+                                             transaction_display_uri);
+    if (!dataset) {
+      throw IOException("Failed to open Lance dataset for UPDATE: " +
+                        transaction_display_uri + LanceFormatErrorSuffix());
+    }
+    auto rc = lance_overwrite_update_transaction_with_irs_for_dataset(
+        dataset, predicate_ptr, predicate_ir.size(), set_col_ptrs.data(),
         set_expr_ir_ptrs.data(), set_expr_ir_lens.data(), set_columns.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-        LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context.client),
-        &txn, &rows_updated);
+        LANCE_DEFAULT_MAX_BYTES_PER_FILE, &txn, &rows_updated);
+    lance_close_dataset(dataset);
     if (rc != 0) {
       throw IOException("Failed to create Lance UPDATE transaction for '" +
                         open_path + "'" + LanceFormatErrorSuffix());
@@ -258,7 +254,8 @@ public:
     RegisterLancePendingAppend(
         context.client, table.catalog, std::move(open_path),
         std::move(option_keys), std::move(option_values),
-        LanceBuildDatasetCacheKeyForTable(context.client, table), txn);
+        LanceBuildDatasetCacheKeyForTable(context.client, table), table.name,
+        txn);
 
     state.rows_updated = rows_updated;
 

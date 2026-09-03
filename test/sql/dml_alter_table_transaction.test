@@ -1,0 +1,375 @@
+# name: test/sql/dml_alter_table_transaction.test
+# description: transaction-local ALTER TABLE staging for attached Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO 'test/.tmp/lance_alter_transaction_seed.lance'
+(FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE alter_txn_ns.main.lance_alter_transaction AS
+SELECT range::BIGINT AS id FROM range(3);
+
+# Create the second dataset before the catalog rediscovery exercised below so
+# the multi-dataset transaction test does not depend on an existing fixture.
+statement ok
+CREATE OR REPLACE TABLE alter_txn_ns.main.lance_alter_transaction_other AS
+SELECT range::BIGINT AS id FROM range(2);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE alter_txn_initial_versions AS
+SELECT count(*)::BIGINT AS c
+FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*');
+
+# DuckDB expands this ALTER into ADD COLUMN DEFAULT NULL, UPDATE, and
+# SET DEFAULT. The final default is invalid because defaults cannot reference
+# another column. All preceding Lance changes must remain invisible.
+statement ok
+BEGIN TRANSACTION;
+
+statement error
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN doubled BIGINT DEFAULT (id * 2);
+----
+Binder Error:
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*)
+FROM duckdb_columns()
+WHERE database_name = 'alter_txn_ns'
+  AND schema_name = 'main'
+  AND table_name = 'lance_alter_transaction'
+  AND column_name = 'doubled';
+----
+0
+
+query T
+SELECT (SELECT c FROM alter_txn_initial_versions) =
+       (SELECT count(*)::BIGINT
+        FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*'));
+----
+true
+
+# A valid non-literal default follows the same three-statement expansion.
+# The transaction reads its staged snapshot and publishes one attached Lance
+# version at commit.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN answer BIGINT DEFAULT (40 + 2);
+
+query I
+SELECT count(*) FROM alter_txn_ns.main.lance_alter_transaction
+WHERE answer = 42;
+----
+3
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM alter_txn_ns.main.lance_alter_transaction
+WHERE answer = 42;
+----
+3
+
+query T
+SELECT ((SELECT c FROM alter_txn_initial_versions) + 1) =
+       (SELECT count(*)::BIGINT
+        FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*'));
+----
+true
+
+# Defaults are stored in Lance field metadata and survive catalog discovery.
+statement ok
+DETACH alter_txn_ns;
+
+# Metadata containing tabs and newlines must not pass through lossy TSV
+# framing. Defaults and comments must remain intact in the staged catalog and
+# after catalog rediscovery.
+statement ok
+ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE alter_txn_ns.main.delimited_default_transaction AS
+SELECT 0::BIGINT AS id;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.delimited_default_transaction
+ADD COLUMN note VARCHAR DEFAULT 'first
+second	third';
+
+statement ok
+COMMENT ON TABLE alter_txn_ns.main.delimited_default_transaction IS 'table
+comment	value';
+
+statement ok
+COMMENT ON COLUMN alter_txn_ns.main.delimited_default_transaction.note IS 'column
+comment	value';
+
+query TT
+SELECT
+  (SELECT comment = ('table' || chr(10) || 'comment' || chr(9) || 'value')
+   FROM duckdb_tables()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'),
+  (SELECT comment = ('column' || chr(10) || 'comment' || chr(9) || 'value')
+   FROM duckdb_columns()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'
+     AND column_name = 'note');
+----
+true	true
+
+statement ok
+INSERT INTO alter_txn_ns.main.delimited_default_transaction(id) VALUES (1);
+
+query T
+SELECT note = ('first' || chr(10) || 'second' || chr(9) || 'third')
+FROM alter_txn_ns.main.delimited_default_transaction
+WHERE id = 1;
+----
+true
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH alter_txn_ns;
+
+statement ok
+ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+query TT
+SELECT
+  (SELECT comment = ('table' || chr(10) || 'comment' || chr(9) || 'value')
+   FROM duckdb_tables()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'),
+  (SELECT comment = ('column' || chr(10) || 'comment' || chr(9) || 'value')
+   FROM duckdb_columns()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'
+     AND column_name = 'note');
+----
+true	true
+
+statement ok
+INSERT INTO alter_txn_ns.main.delimited_default_transaction(id) VALUES (2);
+
+statement ok
+UPDATE alter_txn_ns.main.delimited_default_transaction
+SET note = 'changed' WHERE id = 2;
+
+statement ok
+UPDATE alter_txn_ns.main.delimited_default_transaction
+SET note = DEFAULT WHERE id = 2;
+
+query I
+SELECT count(*)
+FROM alter_txn_ns.main.delimited_default_transaction
+WHERE id IN (1, 2)
+  AND note = ('first' || chr(10) || 'second' || chr(9) || 'third');
+----
+2
+
+# Empty comments are present metadata values, not absent metadata. Preserve
+# that distinction in the transaction-local catalog and after rediscovery.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+COMMENT ON TABLE alter_txn_ns.main.delimited_default_transaction IS '';
+
+statement ok
+COMMENT ON COLUMN alter_txn_ns.main.delimited_default_transaction.note IS '';
+
+query TT
+SELECT
+  (SELECT comment = ''
+   FROM duckdb_tables()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'),
+  (SELECT comment = ''
+   FROM duckdb_columns()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'
+     AND column_name = 'note');
+----
+true	true
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH alter_txn_ns;
+
+statement ok
+ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+query TT
+SELECT
+  (SELECT comment = ''
+   FROM duckdb_tables()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'),
+  (SELECT comment = ''
+   FROM duckdb_columns()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'
+     AND column_name = 'note');
+----
+true	true
+
+statement ok
+INSERT INTO alter_txn_ns.main.lance_alter_transaction(id) VALUES (3);
+
+query I
+SELECT count(*) FROM alter_txn_ns.main.lance_alter_transaction
+WHERE id = 3 AND answer = 42;
+----
+1
+
+# DELETE must build from the staged snapshot so it can compose with ALTER and
+# the default-filling UPDATE in the same transaction.
+statement ok
+CREATE OR REPLACE TEMP TABLE alter_delete_initial_versions AS
+SELECT count(*)::BIGINT AS c
+FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN delete_marker BIGINT DEFAULT (3 + 4);
+
+statement ok
+DELETE FROM alter_txn_ns.main.lance_alter_transaction
+WHERE id = 1 AND delete_marker = 7;
+
+query II
+SELECT id, delete_marker
+FROM alter_txn_ns.main.lance_alter_transaction
+ORDER BY id;
+----
+0	7
+2	7
+3	7
+
+statement ok
+COMMIT;
+
+query T
+SELECT ((SELECT c FROM alter_delete_initial_versions) + 1) =
+       (SELECT count(*)::BIGINT
+        FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*'));
+----
+true
+
+# INSERT must create its uncommitted writer from the staged schema after ALTER.
+statement ok
+CREATE OR REPLACE TEMP TABLE alter_insert_initial_versions AS
+SELECT count(*)::BIGINT AS c
+FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN insert_marker BIGINT DEFAULT (6 + 7);
+
+statement ok
+INSERT INTO alter_txn_ns.main.lance_alter_transaction(id) VALUES (4);
+
+query I
+SELECT count(*)
+FROM alter_txn_ns.main.lance_alter_transaction
+WHERE id = 4
+  AND answer = 42
+  AND delete_marker = 7
+  AND insert_marker = 13;
+----
+1
+
+statement ok
+COMMIT;
+
+query T
+SELECT ((SELECT c FROM alter_insert_initial_versions) + 1) =
+       (SELECT count(*)::BIGINT
+        FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*'));
+----
+true
+
+# Lance has no atomic commit spanning multiple datasets. Reject such a
+# transaction before publishing either staged snapshot.
+statement ok
+CREATE OR REPLACE TEMP TABLE alter_multi_initial_versions AS
+SELECT
+  (SELECT count(*)::BIGINT
+   FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*')) AS first_c,
+  (SELECT count(*)::BIGINT
+   FROM glob('test/.tmp/lance_alter_transaction_other.lance/_versions/*')) AS second_c;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN staged_first BIGINT DEFAULT 11;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction_other
+ADD COLUMN staged_second BIGINT DEFAULT 22;
+
+statement error
+COMMIT;
+----
+TransactionContext Error:
+
+query I
+SELECT count(*)
+FROM duckdb_columns()
+WHERE database_name = 'alter_txn_ns'
+  AND schema_name = 'main'
+  AND column_name IN ('staged_first', 'staged_second');
+----
+0
+
+query TT
+SELECT
+  (SELECT first_c FROM alter_multi_initial_versions) =
+    (SELECT count(*)::BIGINT
+     FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*')),
+  (SELECT second_c FROM alter_multi_initial_versions) =
+    (SELECT count(*)::BIGINT
+     FROM glob('test/.tmp/lance_alter_transaction_other.lance/_versions/*'));
+----
+true	true
+
+statement ok
+DETACH alter_txn_ns;

@@ -438,12 +438,28 @@ void LanceMergeGlobalState::EnsureMergeHandle(ClientContext &context) {
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                   value_ptrs);
 
-  auto rc = lance_merge_begin_with_storage_options(
-      open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context),
-      &merge_handle);
+  int32_t rc;
+  if (context.transaction.IsAutoCommit()) {
+    rc = lance_merge_begin_with_storage_options(
+        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+        LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
+        LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context),
+        &merge_handle);
+  } else {
+    string transaction_display_uri;
+    auto *dataset =
+        LanceOpenDatasetForTable(context, op.table, transaction_display_uri);
+    if (!dataset) {
+      throw IOException("Failed to open Lance dataset for MERGE: " +
+                        transaction_display_uri + LanceFormatErrorSuffix());
+    }
+    rc = lance_merge_begin_for_dataset(dataset, LANCE_DEFAULT_MAX_ROWS_PER_FILE,
+                                       LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
+                                       LANCE_DEFAULT_MAX_BYTES_PER_FILE,
+                                       &merge_handle);
+    lance_close_dataset(dataset);
+  }
   if (rc != 0 || !merge_handle) {
     throw IOException("Failed to start Lance MERGE transaction for '" +
                       open_path + "'" + LanceFormatErrorSuffix());
@@ -973,7 +989,7 @@ PhysicalLanceMergeInto::Finalize(Pipeline &, Event &, ClientContext &context,
   RegisterLancePendingAppend(
       context, table.catalog, std::move(gstate.open_path),
       std::move(gstate.option_keys), std::move(gstate.option_values),
-      LanceBuildDatasetCacheKeyForTable(context, table), txn);
+      LanceBuildDatasetCacheKeyForTable(context, table), table.name, txn);
   return SinkFinalizeType::READY;
 }
 

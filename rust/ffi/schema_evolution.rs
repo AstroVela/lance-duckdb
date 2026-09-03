@@ -23,7 +23,7 @@ use super::util::{
     FfiResult,
 };
 
-fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
+pub(super) fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
     dataset
         .config()
         .get("lance.add_columns.batch_size")
@@ -157,7 +157,10 @@ fn write_metrics_json<T: Serialize>(
     Ok(())
 }
 
-fn parse_arrow_schema(schema: *const c_void, what: &'static str) -> FfiResult<Arc<ArrowSchema>> {
+pub(super) fn parse_arrow_schema(
+    schema: *const c_void,
+    what: &'static str,
+) -> FfiResult<Arc<ArrowSchema>> {
     if schema.is_null() {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
@@ -920,6 +923,44 @@ pub unsafe extern "C" fn lance_dataset_list_table_metadata(dataset: *mut c_void)
             std::ptr::null()
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_get_table_metadata(
+    dataset: *mut c_void,
+    key: *const c_char,
+    out_value: *mut *const c_char,
+) -> i32 {
+    if out_value.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "out_value must not be null");
+        return -1;
+    }
+    ptr::write_unaligned(out_value, ptr::null());
+
+    match dataset_get_table_metadata_inner(dataset, key) {
+        Ok(Some(value)) => {
+            ptr::write_unaligned(out_value, to_c_string(value).into_raw());
+            clear_last_error();
+            1
+        }
+        Ok(None) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn dataset_get_table_metadata_inner(
+    dataset: *mut c_void,
+    key: *const c_char,
+) -> FfiResult<Option<String>> {
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let key = unsafe { cstr_to_str(key, "metadata key")? };
+    Ok(handle.dataset.metadata().get(key).cloned())
 }
 
 #[no_mangle]

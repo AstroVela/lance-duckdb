@@ -22,6 +22,7 @@ panic = "abort"
 lance = { version = "9.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
 lance-arrow = "9.0.0"
 lance-core = "9.0.0"
+lance-datafusion = "9.0.0"
 lance-index = "9.0.0"
 lance-linalg = "9.0.0"
 lance-namespace = "9.0.0"

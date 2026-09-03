@@ -108,14 +108,29 @@ public:
       BuildStorageOptionPointerArrays(gstate.option_keys, gstate.option_values,
                                       key_ptrs, value_ptrs);
 
-      gstate.writer = lance_open_uncommitted_writer_with_storage_options(
-          gstate.open_path.c_str(), "append",
-          key_ptrs.empty() ? nullptr : key_ptrs.data(),
-          value_ptrs.empty() ? nullptr : value_ptrs.data(),
-          gstate.option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
-          LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
-          nullptr, LanceGetSessionHandle(context.client),
-          &gstate.schema_root.arrow_schema);
+      if (context.client.transaction.IsAutoCommit()) {
+        gstate.writer = lance_open_uncommitted_writer_with_storage_options(
+            gstate.open_path.c_str(), "append",
+            key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(),
+            gstate.option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
+            LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
+            nullptr, LanceGetSessionHandle(context.client),
+            &gstate.schema_root.arrow_schema);
+      } else {
+        string transaction_display_uri;
+        auto *dataset = LanceOpenDatasetForTable(context.client, *gstate.table,
+                                                 transaction_display_uri);
+        if (!dataset) {
+          throw IOException("Failed to open Lance dataset for INSERT: " +
+                            transaction_display_uri + LanceFormatErrorSuffix());
+        }
+        gstate.writer = lance_open_uncommitted_writer_for_dataset(
+            dataset, LANCE_DEFAULT_MAX_ROWS_PER_FILE,
+            LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
+            &gstate.schema_root.arrow_schema);
+        lance_close_dataset(dataset);
+      }
       if (!gstate.writer) {
         throw IOException("Failed to open Lance writer: " + gstate.open_path +
                           LanceFormatErrorSuffix());
@@ -169,7 +184,7 @@ public:
     RegisterLancePendingAppend(
         context, table.catalog, std::move(gstate.open_path),
         std::move(gstate.option_keys), std::move(gstate.option_values),
-        LanceBuildDatasetCacheKeyForTable(context, table), txn);
+        LanceBuildDatasetCacheKeyForTable(context, table), table.name, txn);
     return SinkFinalizeType::READY;
   }
 

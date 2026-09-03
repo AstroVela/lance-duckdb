@@ -1,0 +1,155 @@
+# name: test/sql/dml_transaction_conflict.test
+# description: cache consistency after transaction commit conflicts
+# group: [sql]
+
+require lance
+
+statement ok con1
+COPY (SELECT 1::BIGINT AS id)
+TO 'test/.tmp/transaction_conflict.lance'
+(FORMAT lance, mode 'overwrite');
+
+statement ok con1
+ATTACH 'test/.tmp' AS conflict_ns (TYPE LANCE);
+
+# Use a second attached catalog as an independent external writer for the same
+# Lance dataset. This lets the winning publication change the schema without
+# sharing conflict_ns's transaction-local catalog chain.
+statement ok con1
+ATTACH 'test/.tmp' AS conflict_winner_ns (TYPE LANCE);
+
+# Seed con2's connection-local dataset cache with the base snapshot.
+query I con2
+SELECT id FROM conflict_ns.main.transaction_conflict;
+----
+1
+
+statement ok con2
+BEGIN TRANSACTION;
+
+# Keep an older catalog snapshot alive while the losing connection commits.
+# Conflict recovery must not leave a tombstone at the head of that version
+# chain while this reader still retains the previous entry.
+statement ok con3
+BEGIN TRANSACTION;
+
+query I con3
+SELECT count(*) FROM conflict_ns.main.transaction_conflict;
+----
+1
+
+statement ok con2
+INSERT INTO conflict_ns.main.transaction_conflict VALUES (2);
+
+# Include a catalog change so a publish conflict happens after DuckDB has
+# committed its ephemeral schema mirror. The failure path must replace that
+# mirror from the winning Lance snapshot.
+statement ok con2
+ALTER TABLE conflict_ns.main.transaction_conflict
+ADD COLUMN losing_marker BIGINT DEFAULT 2;
+
+# A different attached catalog wins the optimistic commit race with a schema
+# change of its own.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+ALTER TABLE conflict_winner_ns.main.transaction_conflict
+ADD COLUMN winner_marker BIGINT DEFAULT 3;
+
+statement ok con1
+INSERT INTO conflict_winner_ns.main.transaction_conflict(id) VALUES (3);
+
+statement ok con1
+COMMIT;
+
+statement error con2
+COMMIT;
+----
+TransactionContext Error:
+
+# The failed connection must invalidate its base-version cache entry and open
+# the winner's published snapshot. Its detached row remains invisible.
+query II con2
+SELECT id, winner_marker
+FROM conflict_ns.main.transaction_conflict ORDER BY id;
+----
+1	3
+3	3
+
+query I con2
+SELECT count(*)
+FROM duckdb_columns()
+WHERE database_name = 'conflict_ns'
+  AND schema_name = 'main'
+  AND table_name = 'transaction_conflict'
+  AND column_name = 'losing_marker';
+----
+0
+
+# The recovery entry must have a normal, fresh commit timestamp. This reader
+# started before either schema change, so it must retain the original catalog
+# snapshot even after recovery replaces the losing connection's entry.
+query T con3
+SELECT column_name
+FROM duckdb_columns()
+WHERE database_name = 'conflict_ns'
+  AND schema_name = 'main'
+  AND table_name = 'transaction_conflict'
+ORDER BY column_index;
+----
+id
+
+statement ok con3
+ROLLBACK;
+
+statement ok con1
+DETACH conflict_winner_ns;
+
+statement ok con1
+DETACH conflict_ns;
+
+# Each ATTACH owns a separate transaction manager. DuckDB must reject a second
+# attached-database writer before either manager reaches its commit callback.
+statement ok
+ATTACH 'test/.tmp' AS conflict_alias_a (TYPE LANCE);
+
+statement ok
+ATTACH 'test/.tmp' AS conflict_alias_b (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE conflict_alias_a.main.cross_manager_conflict AS
+SELECT 1::BIGINT AS id;
+
+# Materialize an independent catalog entry through the second attachment.
+query I
+SELECT id FROM conflict_alias_b.main.cross_manager_conflict;
+----
+1
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO conflict_alias_a.main.cross_manager_conflict VALUES (2);
+
+statement error
+INSERT INTO conflict_alias_b.main.cross_manager_conflict VALUES (3);
+----
+TransactionContext Error: Attempting to write to database
+
+statement ok
+ROLLBACK;
+
+# DuckDB rejects the second attached-database writer before either transaction
+# manager can publish, so rolling back leaves the base snapshot unchanged.
+query I
+SELECT id FROM conflict_alias_a.main.cross_manager_conflict ORDER BY id;
+----
+1
+
+statement ok
+DETACH conflict_alias_b;
+
+statement ok
+DETACH conflict_alias_a;

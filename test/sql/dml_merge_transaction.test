@@ -85,6 +85,62 @@ SELECT ((SELECT c FROM merge_txn_versions) + 1) =
 ----
 true
 
+# Each follow-up write must build from the staged snapshot. This composes an
+# INSERT with two MERGEs and still publishes one mainline version at commit.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO merge_txn_ns.main.lance_merge_txn VALUES (4, 'd');
+
+query I
+MERGE INTO merge_txn_ns.main.lance_merge_txn AS t
+USING (
+  SELECT 4::BIGINT AS id, 'dd'::VARCHAR AS s
+  UNION ALL
+  SELECT 5::BIGINT AS id, 'e'::VARCHAR AS s
+) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+WHEN NOT MATCHED THEN INSERT (id, s) VALUES (src.id, src.s);
+----
+2
+
+query I
+MERGE INTO merge_txn_ns.main.lance_merge_txn AS t
+USING (SELECT 5::BIGINT AS id, 'ee'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s;
+----
+1
+
+query IT
+SELECT id, s FROM merge_txn_ns.main.lance_merge_txn ORDER BY id;
+----
+1	a
+2	bb
+3	c
+4	dd
+5	ee
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, s FROM merge_txn_ns.main.lance_merge_txn ORDER BY id;
+----
+1	a
+2	bb
+3	c
+4	dd
+5	ee
+
+query T
+SELECT ((SELECT c FROM merge_txn_versions) + 2) =
+       (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
+----
+true
+
 statement ok
 BEGIN TRANSACTION;
 
@@ -100,7 +156,7 @@ statement ok
 COMMIT;
 
 query T
-SELECT ((SELECT c FROM merge_txn_versions) + 1) =
+SELECT ((SELECT c FROM merge_txn_versions) + 2) =
        (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
 ----
 true

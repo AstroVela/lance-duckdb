@@ -13,11 +13,14 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/sample_options.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -36,17 +39,19 @@
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_exec_ir.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_logical_exec.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
+#include "lance_transaction.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -461,6 +466,8 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   vector<string> scan_column_names;
   string lance_filter_ir;
   bool filter_pushed_down = false;
+  shared_ptr<LanceDatasetCacheEntry> runtime_dataset_entry;
+  void *dataset = nullptr;
 
   bool count_only = false;
   idx_t count_only_total_rows = 0;
@@ -506,6 +513,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
 
 struct LanceExecBindData : public TableFunctionData {
   string file_path;
+  string attached_table_name;
   string exec_ir;
 
   shared_ptr<LanceDatasetCacheEntry> dataset_entry;
@@ -1064,6 +1072,43 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto state = make_uniq_base<GlobalTableFunctionState, LanceScanGlobalState>();
   auto &scan_state = state->Cast<LanceScanGlobalState>();
 
+  // Bind data can outlive the transaction-local workspace used by an
+  // individual prepared-statement execution. Resolve the table on every
+  // execution so the scan chooses the current staged snapshot, then returns
+  // to the published namespace path after COMMIT or ROLLBACK.
+  scan_state.dataset = bind_data.dataset;
+  scan_state.use_namespace_query = bind_data.use_namespace_query_at_bind;
+  if (!bind_data.attached_table_name.empty()) {
+    auto *table =
+        TryResolveLanceTableEntry(context, bind_data.attached_table_name);
+    if (!table) {
+      throw CatalogException("Lance table no longer exists: " +
+                             bind_data.attached_table_name);
+    }
+    if (auto *transaction_dataset =
+            LanceTryOpenTransactionDataset(context, *table)) {
+      scan_state.runtime_dataset_entry =
+          make_shared_ptr<LanceDatasetCacheEntry>(transaction_dataset,
+                                                  table->DatasetUri());
+      scan_state.dataset = scan_state.runtime_dataset_entry->Handle();
+      scan_state.use_namespace_query = false;
+    } else if (bind_data.namespace_query_config) {
+      scan_state.use_namespace_query = true;
+    } else {
+      string display_uri;
+      scan_state.runtime_dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+          context, *table, display_uri, nullptr);
+      scan_state.dataset = scan_state.runtime_dataset_entry
+                               ? scan_state.runtime_dataset_entry->Handle()
+                               : nullptr;
+      scan_state.use_namespace_query = false;
+    }
+  }
+  if (!scan_state.use_namespace_query && !scan_state.dataset) {
+    throw IOException("Failed to open Lance dataset: " + bind_data.file_path +
+                      LanceFormatErrorSuffix());
+  }
+
   scan_state.limit_offset_pushed_down = bind_data.limit_offset_pushed_down;
   scan_state.pushed_limit = bind_data.pushed_limit;
   scan_state.pushed_offset = bind_data.pushed_offset;
@@ -1180,7 +1225,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
         table_filters.all_filters_pushed && !scan_state.lance_filter_ir.empty();
   }
 
-  if (bind_data.UsesNamespaceQuery()) {
+  if (scan_state.use_namespace_query) {
     if (scan_state.sampling_pushed_down) {
       throw InternalException(
           "Lance namespace query_table scan does not support sampling");
@@ -1263,7 +1308,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   if (scan_state.scan_column_names.empty() &&
       (!input.filters || input.filters->filters.empty()) &&
       scan_state.lance_filter_ir.empty()) {
-    auto rows = lance_dataset_count_rows(bind_data.dataset);
+    auto rows = lance_dataset_count_rows(scan_state.dataset);
     if (rows < 0) {
       throw IOException("Failed to count Lance rows" +
                         LanceFormatErrorSuffix());
@@ -1317,11 +1362,11 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 
     // Detect heavy columns: stats-based with type-based fallback.
     unordered_set<string> heavy_columns;
-    auto total_rows = lance_dataset_count_rows(bind_data.dataset);
+    auto total_rows = lance_dataset_count_rows(scan_state.dataset);
     if (total_rows > 0) {
       size_t stats_len = 0;
       auto stats =
-          lance_dataset_list_named_field_stats(bind_data.dataset, &stats_len);
+          lance_dataset_list_named_field_stats(scan_state.dataset, &stats_len);
       unordered_set<string> stats_covered;
       if (stats) {
         for (size_t i = 0; i < stats_len; i++) {
@@ -1482,7 +1527,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     if (!filtered_columns.empty()) {
       size_t indexed_cols_len = 0;
       auto indexed_cols_ptr = lance_dataset_list_scalar_indexed_columns(
-          bind_data.dataset, &indexed_cols_len);
+          scan_state.dataset, &indexed_cols_len);
       bool has_indexed_filter = false;
       for (size_t i = 0; i < indexed_cols_len; i++) {
         if (indexed_cols_ptr[i] &&
@@ -1502,7 +1547,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 
   size_t ffi_fragment_count = 0;
   auto fragments_ptr =
-      lance_dataset_list_fragments(bind_data.dataset, &ffi_fragment_count);
+      lance_dataset_list_fragments(scan_state.dataset, &ffi_fragment_count);
   if (!fragments_ptr) {
     throw IOException("Failed to list Lance fragments" +
                       LanceFormatErrorSuffix());
@@ -1619,14 +1664,14 @@ static bool LanceScanOpenStream(ClientContext &context,
   } else if (global_state.sampling_pushed_down) {
     local_state.filter_pushed_down = false;
     stream = lance_create_dataset_sample_stream_ir(
-        bind_data.dataset, columns.data(), columns.size(),
+        global_state.dataset, columns.data(), columns.size(),
         global_state.sample_percentage, global_state.sample_seed,
         global_state.sample_repeatable ? 1 : 0);
   } else if (global_state.use_dataset_take) {
     auto row_ids_ptr = global_state.take_row_ids.empty()
                            ? nullptr
                            : global_state.take_row_ids.data();
-    stream = lance_create_dataset_take_stream(bind_data.dataset, row_ids_ptr,
+    stream = lance_create_dataset_take_stream(global_state.dataset, row_ids_ptr,
                                               global_state.take_row_ids.size(),
                                               columns.data(), columns.size());
   } else if (global_state.use_dataset_scanner) {
@@ -1636,7 +1681,7 @@ static bool LanceScanOpenStream(ClientContext &context,
             : int64_t(-1);
     auto offset_i64 = NumericCast<int64_t>(global_state.pushed_offset);
     stream = lance_create_dataset_stream_ir(
-        bind_data.dataset, columns.data(), columns.size(), filter_ir,
+        global_state.dataset, columns.data(), columns.size(), filter_ir,
         filter_ir_len, limit_i64, offset_i64);
     if (!stream && filter_ir) {
       if (global_state.limit_offset_pushed_down &&
@@ -1648,9 +1693,9 @@ static bool LanceScanOpenStream(ClientContext &context,
       // DuckDB-side filter execution for correctness.
       global_state.filter_pushdown_fallbacks.fetch_add(1);
       local_state.filter_pushed_down = false;
-      stream = lance_create_dataset_stream_ir(bind_data.dataset, columns.data(),
-                                              columns.size(), nullptr, 0,
-                                              limit_i64, offset_i64);
+      stream = lance_create_dataset_stream_ir(
+          global_state.dataset, columns.data(), columns.size(), nullptr, 0,
+          limit_i64, offset_i64);
     }
   } else {
     if (local_state.fragment_pos >= global_state.fragment_ids.size()) {
@@ -1658,7 +1703,7 @@ static bool LanceScanOpenStream(ClientContext &context,
     }
     auto fragment_id = global_state.fragment_ids[local_state.fragment_pos];
 
-    stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
+    stream = lance_create_fragment_stream_ir(global_state.dataset, fragment_id,
                                              columns.data(), columns.size(),
                                              filter_ir, filter_ir_len);
     if (!stream && filter_ir) {
@@ -1666,9 +1711,9 @@ static bool LanceScanOpenStream(ClientContext &context,
       // DuckDB-side filter execution for correctness.
       global_state.filter_pushdown_fallbacks.fetch_add(1);
       local_state.filter_pushed_down = false;
-      stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
-                                               columns.data(), columns.size(),
-                                               nullptr, 0);
+      stream = lance_create_fragment_stream_ir(global_state.dataset,
+                                               fragment_id, columns.data(),
+                                               columns.size(), nullptr, 0);
     }
   }
   if (!stream) {
@@ -1793,7 +1838,7 @@ static void LanceFillDeferredColumns(ClientContext &context,
     col_ptrs.push_back(name.c_str());
   }
   auto take_stream = lance_create_dataset_take_stream_unfiltered(
-      bind_data.dataset, row_ids.data(), row_ids.size(), col_ptrs.data(),
+      global_state.dataset, row_ids.data(), row_ids.size(), col_ptrs.data(),
       col_ptrs.size());
   if (!take_stream) {
     throw IOException("Failed to create deferred take stream" +
@@ -2154,7 +2199,7 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
       string plan;
       string error;
       auto ok = TryLanceExplainDatasetScan(
-          bind_data.dataset, &global_state.scan_column_names,
+          global_state.dataset, &global_state.scan_column_names,
           global_state.lance_filter_ir.empty() ? nullptr
                                                : &global_state.lance_filter_ir,
           global_state.pushed_limit, global_state.pushed_offset,
@@ -2812,9 +2857,23 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
     try {
       exec_bind = make_uniq<LanceExecBindData>();
       exec_bind->file_path = scan_bind.file_path;
+      exec_bind->attached_table_name = scan_bind.attached_table_name;
       exec_bind->exec_ir = exec_ir;
-      exec_bind->dataset_entry = LanceGetOrOpenDatasetEntry(
-          context, exec_bind->file_path, &exec_bind->dataset_cache_hit);
+      if (!exec_bind->attached_table_name.empty()) {
+        auto *table =
+            TryResolveLanceTableEntry(context, exec_bind->attached_table_name);
+        if (!table) {
+          throw CatalogException("Lance table no longer exists: " +
+                                 exec_bind->attached_table_name);
+        }
+        string display_uri;
+        exec_bind->dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+            context, *table, display_uri, &exec_bind->dataset_cache_hit);
+        exec_bind->file_path = display_uri;
+      } else {
+        exec_bind->dataset_entry = LanceGetOrOpenDatasetEntry(
+            context, exec_bind->file_path, &exec_bind->dataset_cache_hit);
+      }
       exec_bind->dataset = exec_bind->dataset_entry
                                ? exec_bind->dataset_entry->Handle()
                                : nullptr;
@@ -3092,6 +3151,8 @@ struct LanceExecGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> record_batch_rows{0};
 
   vector<idx_t> projection_ids;
+  shared_ptr<LanceDatasetCacheEntry> runtime_dataset_entry;
+  void *dataset = nullptr;
 
   idx_t MaxThreads() const override { return 1; }
 };
@@ -3167,9 +3228,29 @@ static unique_ptr<FunctionData> LanceExecBind(ClientContext &context,
 }
 
 static unique_ptr<GlobalTableFunctionState>
-LanceExecInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+LanceExecInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+  auto &bind_data = input.bind_data->Cast<LanceExecBindData>();
   auto state = make_uniq_base<GlobalTableFunctionState, LanceExecGlobalState>();
   auto &global = state->Cast<LanceExecGlobalState>();
+  global.dataset = bind_data.dataset;
+  if (!bind_data.attached_table_name.empty()) {
+    auto *table =
+        TryResolveLanceTableEntry(context, bind_data.attached_table_name);
+    if (!table) {
+      throw CatalogException("Lance table no longer exists: " +
+                             bind_data.attached_table_name);
+    }
+    string display_uri;
+    global.runtime_dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+        context, *table, display_uri, nullptr);
+    global.dataset = global.runtime_dataset_entry
+                         ? global.runtime_dataset_entry->Handle()
+                         : nullptr;
+  }
+  if (!global.dataset) {
+    throw IOException("Failed to open Lance dataset for exec pushdown: " +
+                      bind_data.file_path + LanceFormatErrorSuffix());
+  }
   global.projection_ids = input.projection_ids;
   return state;
 }
@@ -3185,7 +3266,7 @@ LanceExecLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
       make_uniq<LanceExecLocalState>(std::move(chunk), context.client);
   result->global_state = &global;
   result->stream = lance_create_dataset_exec_stream_ir(
-      bind_data.dataset,
+      global.dataset,
       bind_data.exec_ir.empty()
           ? nullptr
           : reinterpret_cast<const uint8_t *>(bind_data.exec_ir.data()),
@@ -3371,28 +3452,6 @@ LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
       namespace_config(
           make_uniq<LanceNamespaceTableConfig>(std::move(config))) {}
 
-static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
-  unordered_map<string, string> out;
-  if (!ptr) {
-    return out;
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out[std::move(parts[0])] = std::move(parts[1]);
-  }
-  return out;
-}
-
 static void PopulateLanceTableSchemaFromDataset(
     ClientContext &context, void *dataset, ColumnList &out_columns,
     vector<unique_ptr<Constraint>> &out_constraints,
@@ -3431,21 +3490,29 @@ static void PopulateLanceTableSchemaFromDataset(
   out_constraints.clear();
   for (idx_t i = 0; i < names.size(); i++) {
     ColumnDefinition col(names[i], types[i]);
-    auto *field_md =
-        lance_dataset_list_field_metadata(dataset, names[i].c_str());
-    if (!field_md) {
-      throw IOException("Failed to list field metadata from Lance dataset" +
-                        LanceFormatErrorSuffix());
+    auto *child = schema_root.arrow_schema.children[i];
+    string default_expression;
+    if (child && child->metadata) {
+      string comment;
+      if (TryGetLanceArrowMetadataOption(child->metadata, "comment", comment)) {
+        col.SetComment(Value(comment));
+      }
+      TryGetLanceArrowMetadataOption(child->metadata, "duckdb_default_expr",
+                                     default_expression);
     }
-    auto kvs = ParseTsvKvs(field_md);
-    auto it = kvs.find("comment");
-    if (it != kvs.end()) {
-      col.SetComment(Value(it->second));
+    if (!default_expression.empty()) {
+      auto expressions = Parser::ParseExpressionList(
+          default_expression, context.GetParserOptions());
+      if (expressions.size() != 1 || !expressions[0]) {
+        throw IOException("Invalid DuckDB default expression in Lance field "
+                          "metadata for column '" +
+                          names[i] + "'");
+      }
+      col.SetDefaultValue(std::move(expressions[0]));
     }
     out_columns.AddColumn(std::move(col));
 
     // Reflect not-null constraints for better DuckDB-side UX.
-    auto *child = schema_root.arrow_schema.children[i];
     if (child && (child->flags & ARROW_FLAG_NULLABLE) == 0) {
       out_constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(i)));
     }
@@ -3488,16 +3555,14 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   }
   entry->SetCoercedColumnNames(std::move(coerced));
 
-  auto *table_md = lance_dataset_list_table_metadata(dataset);
-  if (!table_md) {
+  string table_comment;
+  try {
+    if (TryGetLanceTableMetadata(dataset, "comment", table_comment)) {
+      entry->comment = Value(table_comment);
+    }
+  } catch (...) {
     lance_close_dataset(dataset);
-    throw IOException("Failed to list table metadata from Lance dataset" +
-                      LanceFormatErrorSuffix());
-  }
-  auto table_kvs = ParseTsvKvs(table_md);
-  auto it = table_kvs.find("comment");
-  if (it != table_kvs.end()) {
-    entry->comment = Value(it->second);
+    throw;
   }
 
   lance_close_dataset(dataset);
@@ -3566,6 +3631,42 @@ static bool IsImplicitCastUsingExpression(const ParsedExpression &expr,
   return StringUtil::CIEquals(col_ref.column_names.back(), column_name);
 }
 
+static unique_ptr<CatalogEntry> BuildSetDefaultLanceTableEntry(
+    ClientContext &context, const LanceTableEntry &base, SetDefaultInfo &info) {
+  auto default_idx = base.GetColumnIndex(info.column_name);
+  if (default_idx.index == COLUMN_IDENTIFIER_ROW_ID) {
+    throw CatalogException("Cannot SET DEFAULT for rowid column");
+  }
+
+  auto create_info = base.GetInfo();
+  auto &table_info = create_info->Cast<CreateTableInfo>();
+  auto &column = table_info.columns.GetColumnMutable(default_idx);
+  if (column.Generated()) {
+    throw BinderException("Cannot SET DEFAULT for generated column \"%s\"",
+                          column.Name());
+  }
+  column.SetDefaultValue(info.expression ? info.expression->Copy() : nullptr);
+
+  // Use DuckDB's native default binder. In particular, this rejects defaults
+  // that reference another column (for example DEFAULT (id * 2)).
+  auto binder = Binder::CreateBinder(context);
+  auto bound_create_info =
+      binder->BindCreateTableInfo(std::move(create_info), base.schema);
+
+  unique_ptr<LanceTableEntry> entry;
+  if (base.IsNamespaceBacked()) {
+    entry = make_uniq<LanceTableEntry>(base.catalog, base.schema,
+                                       bound_create_info->Base(),
+                                       base.NamespaceConfig());
+  } else {
+    entry = make_uniq<LanceTableEntry>(base.catalog, base.schema,
+                                       bound_create_info->Base(),
+                                       base.DatasetUri());
+  }
+  entry->SetCoercedColumnNames(base.CoercedColumnNames());
+  return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
+}
+
 unique_ptr<CatalogEntry>
 LanceTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
   if (!transaction.context) {
@@ -3577,10 +3678,11 @@ LanceTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
 
 unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                                                      AlterInfo &info) {
-  if (!context.transaction.IsAutoCommit()) {
-    throw NotImplementedException(
-        "Lance DDL does not support explicit transactions yet");
+  if (auto *refresh = dynamic_cast<LanceCatalogRefreshInfo *>(&info)) {
+    return std::move(refresh->replacement);
   }
+
+  const bool transaction_local = !context.transaction.IsAutoCommit();
 
   string display_uri;
   void *dataset = LanceOpenDatasetForTable(context, *this, display_uri);
@@ -3608,7 +3710,13 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
 
       vector<string> expressions;
       if (add.new_column.HasDefaultValue()) {
-        expressions.push_back(add.new_column.DefaultValue().ToString());
+        auto &default_value = add.new_column.DefaultValue();
+        const bool is_null =
+            default_value.GetExpressionClass() == ExpressionClass::CONSTANT &&
+            default_value.Cast<ConstantExpression>().value.IsNull();
+        if (!is_null) {
+          expressions.push_back(default_value.ToString());
+        }
       }
       vector<const char *> expr_ptrs;
       expr_ptrs.reserve(expressions.size());
@@ -3616,39 +3724,103 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
         expr_ptrs.push_back(e.c_str());
       }
 
-      auto rc = lance_dataset_add_columns(
-          dataset, &new_schema_root.arrow_schema,
-          expr_ptrs.empty() ? nullptr : expr_ptrs.data(), expr_ptrs.size(), 0);
+      void *dataset_transaction = nullptr;
+      int32_t rc;
+      if (transaction_local) {
+        dataset_transaction =
+            LanceGetOrCreateDatasetTransaction(context, *this, dataset);
+        rc = lance_dataset_transaction_add_columns(
+            dataset_transaction, &new_schema_root.arrow_schema,
+            expr_ptrs.empty() ? nullptr : expr_ptrs.data(), expr_ptrs.size(),
+            0);
+      } else {
+        rc = lance_dataset_add_columns(dataset, &new_schema_root.arrow_schema,
+                                       expr_ptrs.empty() ? nullptr
+                                                         : expr_ptrs.data(),
+                                       expr_ptrs.size(), 0);
+      }
       if (rc != 0) {
         lance_close_dataset(dataset);
         throw IOException("Failed to add column to Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
 
-      // Best-effort persistence of DuckDB column defaults in Lance field
-      // metadata. Re-open the dataset after schema evolution so the new field
-      // is visible to the metadata updater.
-      lance_close_dataset(dataset);
-      dataset = nullptr;
+      // Persist DuckDB column defaults in Lance field metadata. In a DuckDB
+      // transaction this becomes another detached commit on the same snapshot.
       if (add.new_column.HasDefaultValue()) {
-        string reopen_uri;
-        dataset = LanceOpenDatasetForTable(context, *this, reopen_uri);
-        if (dataset) {
-          auto default_expr = add.new_column.DefaultValue().ToString();
-          (void)lance_dataset_update_field_metadata(
-              dataset, add.new_column.Name().c_str(), "duckdb_default_expr",
-              default_expr.c_str());
+        auto default_expr = add.new_column.DefaultValue().ToString();
+        if (transaction_local) {
+          rc = lance_dataset_transaction_update_field_metadata(
+              dataset_transaction, add.new_column.Name().c_str(),
+              "duckdb_default_expr", default_expr.c_str());
+        } else {
           lance_close_dataset(dataset);
           dataset = nullptr;
+          string reopen_uri;
+          dataset = LanceOpenDatasetForTable(context, *this, reopen_uri);
+          if (!dataset) {
+            throw IOException("Failed to re-open Lance dataset: " + reopen_uri +
+                              LanceFormatErrorSuffix());
+          }
+          rc = lance_dataset_update_field_metadata(
+              dataset, add.new_column.Name().c_str(), "duckdb_default_expr",
+              default_expr.c_str());
         }
-      } else {
-        // The dataset was already closed above, keep going.
+        if (rc != 0 && transaction_local) {
+          if (dataset) {
+            lance_close_dataset(dataset);
+          }
+          throw IOException(
+              "Failed to persist Lance column default metadata: " +
+              display_uri + LanceFormatErrorSuffix());
+        }
       }
-      LanceInvalidateDatasetCacheForTable(context, *this);
+      if (dataset) {
+        lance_close_dataset(dataset);
+      }
+      if (!transaction_local) {
+        LanceInvalidateDatasetCacheForTable(context, *this);
+      }
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
+    case AlterTableType::SET_DEFAULT: {
+      auto &set_default = info.Cast<SetDefaultInfo>();
+      auto updated_entry =
+          BuildSetDefaultLanceTableEntry(context, *this, set_default);
+      auto default_expr = set_default.expression
+                              ? set_default.expression->ToString()
+                              : string();
+      auto *default_ptr =
+          set_default.expression ? default_expr.c_str() : nullptr;
+      int32_t rc;
+      if (transaction_local) {
+        auto *dataset_transaction =
+            LanceGetOrCreateDatasetTransaction(context, *this, dataset);
+        rc = lance_dataset_transaction_update_field_metadata(
+            dataset_transaction, set_default.column_name.c_str(),
+            "duckdb_default_expr", default_ptr);
+      } else {
+        rc = lance_dataset_update_field_metadata(
+            dataset, set_default.column_name.c_str(), "duckdb_default_expr",
+            default_ptr);
+      }
+      lance_close_dataset(dataset);
+      if (rc != 0) {
+        throw IOException("Failed to update Lance column default: " +
+                          display_uri + LanceFormatErrorSuffix());
+      }
+      if (!transaction_local) {
+        LanceInvalidateDatasetCacheForTable(context, *this);
+      }
+      return updated_entry;
+    }
     case AlterTableType::REMOVE_COLUMN: {
+      if (transaction_local) {
+        lance_close_dataset(dataset);
+        throw NotImplementedException(
+            "Lance explicit transactions do not yet support DROP COLUMN");
+      }
       auto &drop = info.Cast<RemoveColumnInfo>();
       if (drop.if_column_exists && !ColumnExists(drop.removed_column)) {
         lance_close_dataset(dataset);
@@ -3668,6 +3840,11 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       break;
     }
     case AlterTableType::RENAME_COLUMN: {
+      if (transaction_local) {
+        lance_close_dataset(dataset);
+        throw NotImplementedException(
+            "Lance explicit transactions do not yet support RENAME COLUMN");
+      }
       auto &rename = info.Cast<RenameColumnInfo>();
       auto rc = lance_dataset_alter_columns_rename(
           dataset, rename.old_name.c_str(), rename.new_name.c_str());
@@ -3682,6 +3859,12 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       break;
     }
     case AlterTableType::ALTER_COLUMN_TYPE: {
+      if (transaction_local) {
+        lance_close_dataset(dataset);
+        throw NotImplementedException(
+            "Lance explicit transactions do not yet support ALTER COLUMN "
+            "TYPE");
+      }
       auto &cast = info.Cast<ChangeColumnTypeInfo>();
       ValidateAlterColumnTypeTarget(cast.target_type);
       if (!cast.expression ||
@@ -3714,6 +3897,11 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       break;
     }
     case AlterTableType::SET_NOT_NULL: {
+      if (transaction_local) {
+        lance_close_dataset(dataset);
+        throw NotImplementedException(
+            "Lance explicit transactions do not yet support SET NOT NULL");
+      }
       auto &nn = info.Cast<SetNotNullInfo>();
       auto rc = lance_dataset_alter_columns_set_nullable(
           dataset, nn.column_name.c_str(), 0);
@@ -3728,6 +3916,11 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       break;
     }
     case AlterTableType::DROP_NOT_NULL: {
+      if (transaction_local) {
+        lance_close_dataset(dataset);
+        throw NotImplementedException(
+            "Lance explicit transactions do not yet support DROP NOT NULL");
+      }
       auto &nn = info.Cast<DropNotNullInfo>();
       auto rc = lance_dataset_alter_columns_set_nullable(
           dataset, nn.column_name.c_str(), 1);
@@ -3757,15 +3950,26 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                         .GetValue<string>();
       comment_ptr = comment_str.c_str();
     }
-    auto rc = lance_dataset_update_field_metadata(
-        dataset, comment.column_name.c_str(), "comment", comment_ptr);
+    int32_t rc;
+    if (transaction_local) {
+      auto *dataset_transaction =
+          LanceGetOrCreateDatasetTransaction(context, *this, dataset);
+      rc = lance_dataset_transaction_update_field_metadata(
+          dataset_transaction, comment.column_name.c_str(), "comment",
+          comment_ptr);
+    } else {
+      rc = lance_dataset_update_field_metadata(
+          dataset, comment.column_name.c_str(), "comment", comment_ptr);
+    }
     if (rc != 0) {
       lance_close_dataset(dataset);
       throw IOException("Failed to update column comment in Lance dataset: " +
                         display_uri + LanceFormatErrorSuffix());
     }
     lance_close_dataset(dataset);
-    LanceInvalidateDatasetCacheForTable(context, *this);
+    if (!transaction_local) {
+      LanceInvalidateDatasetCacheForTable(context, *this);
+    }
     return BuildUpdatedLanceTableEntry(context, *this, internal);
     break;
   }
@@ -3841,11 +4045,23 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
                                  unique_ptr<FunctionData> &bind_data) {
   auto result = make_uniq<LanceScanBindData>();
   result->table_entry = this;
+  result->attached_table_name =
+      QualifiedName{catalog.GetName(), ParentSchema().name, name}.ToString();
   result->file_path = dataset_uri;
 
+  // Namespace query APIs can only see published versions. Once this DuckDB
+  // transaction has staged a detached Lance snapshot, scan it directly to
+  // provide read-your-writes semantics.
+  void *transaction_dataset = nullptr;
+  if (IsNamespaceBacked() && NamespaceConfig().IsRest()) {
+    transaction_dataset = LanceTryOpenTransactionDataset(context, *this);
+  }
   if (IsNamespaceBacked() && NamespaceConfig().IsRest()) {
     result->namespace_query_config =
         make_uniq<LanceNamespaceTableConfig>(NamespaceConfig());
+  }
+  if (result->namespace_query_config && !transaction_dataset) {
+    result->use_namespace_query_at_bind = true;
     PopulateNamespaceQueryScanSchema(context, *this, *result);
     bind_data = std::move(result);
     auto function = LanceTableScanFunction();
@@ -3854,8 +4070,15 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   }
 
   string display_uri;
-  result->dataset_entry = LanceGetOrOpenDatasetEntryForTable(
-      context, *this, display_uri, &result->dataset_cache_hit);
+  if (transaction_dataset) {
+    result->dataset_entry = make_shared_ptr<LanceDatasetCacheEntry>(
+        transaction_dataset, DatasetUri());
+    result->dataset_cache_hit = false;
+    display_uri = DatasetUri();
+  } else {
+    result->dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+        context, *this, display_uri, &result->dataset_cache_hit);
+  }
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->file_path = display_uri;
@@ -3905,8 +4128,13 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
 
+  auto disable_sampling = result->namespace_query_config != nullptr;
   bind_data = std::move(result);
-  return LanceTableScanFunction();
+  auto function = LanceTableScanFunction();
+  if (disable_sampling) {
+    function.sampling_pushdown = false;
+  }
+  return function;
 }
 
 void RegisterLanceScan(ExtensionLoader &loader) {

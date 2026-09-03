@@ -7,6 +7,7 @@ use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
 use lance::session::Session;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_datafusion::planner::Planner;
 
 use crate::error::ErrorCode;
 
@@ -147,6 +148,35 @@ pub(crate) unsafe fn parse_optional_filter_ir(
     crate::filter_ir::parse_filter_ir(bytes)
         .map(Some)
         .map_err(|err| FfiError::new(code, format!("{what} parse: {err}")))
+}
+
+pub(crate) unsafe fn parse_optional_search_filter(
+    filter_sql: *const c_char,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    schema: &LanceSchema,
+    code: ErrorCode,
+    what: &'static str,
+) -> FfiResult<Option<Expr>> {
+    let ir_filter = unsafe { parse_optional_filter_ir(filter_ir, filter_ir_len, code, what)? };
+    if filter_sql.is_null() {
+        return Ok(ir_filter);
+    }
+
+    // SAFETY: The caller guarantees that a non-null filter_sql points to a
+    // NUL-terminated string that remains valid for this synchronous call.
+    let filter_sql = unsafe { cstr_to_str(filter_sql, "search filter_sql")? };
+    if filter_sql.trim().is_empty() {
+        return Ok(ir_filter);
+    }
+    let arrow_schema = Arc::new(Schema::from(schema));
+    let sql_filter = Planner::new(arrow_schema)
+        .parse_filter(filter_sql)
+        .map_err(|err| FfiError::new(code, format!("{what} SQL parse: {err}")))?;
+    Ok(Some(match ir_filter {
+        Some(ir_filter) => sql_filter.and(ir_filter),
+        None => sql_filter,
+    }))
 }
 
 pub(crate) fn u64_to_usize(v: u64, what: &'static str) -> FfiResult<usize> {
