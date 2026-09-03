@@ -1196,7 +1196,9 @@ static bool TryPlanIndexedVectorWork(const LanceVaneGlobalSearchState &state,
 static void
 FreezeVectorFragmentStats(const LanceVanePhysicalCandidate &candidate,
                           LanceVaneGlobalSearchState &state) {
-  if (state.arguments.kind != LanceVaneSearchKind::VECTOR) {
+  if (state.arguments.kind != LanceVaneSearchKind::VECTOR ||
+      (state.arguments.use_index &&
+       (state.arguments.nprobes == 0 || state.arguments.refine_factor != 0))) {
     return;
   }
   size_t stats_len = 0;
