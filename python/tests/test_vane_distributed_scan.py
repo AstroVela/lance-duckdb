@@ -2482,6 +2482,68 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
         connection.close()
 
 
+def test_namespace_vector_outer_filter_remains_after_top_k(
+    tmp_path: Path, ray_runner
+) -> None:
+    connection = _connect()
+    path = tmp_path / "namespace_vector_candidates.lance"
+    query = _zero_vector_sql()
+    source = _sql_literal("namespace_candidate_ns.main.namespace_vector_candidates")
+    try:
+        _write_vector_candidate_dataset(connection, path)
+        connection.execute(
+            f"ATTACH {_sql_literal(tmp_path)} AS namespace_candidate_ns " "(TYPE LANCE)"
+        )
+        candidate_call = (
+            "lance_vector_search("
+            f"{source}, 'vec', {query}, k = 3, prefilter = true, "
+            "use_index = false, filter = 'id >= 0')"
+        )
+        native_call = candidate_call.replace("use_index = false", "use_index = true")
+
+        eligible = connection.sql(
+            f"SELECT id FROM {candidate_call} ORDER BY _distance, id"
+        )
+        eligible_details = [
+            detail
+            for batches in _split_batches(connection, eligible).values()
+            for batch in batches
+            for detail in _vector_candidate_assignment_details(batch)
+        ]
+        assert (
+            len(eligible_details)
+            == (VECTOR_CANDIDATE_ROWS + VECTOR_CANDIDATE_ROWS_PER_FRAGMENT - 1)
+            // VECTOR_CANDIDATE_ROWS_PER_FRAGMENT
+        )
+
+        top = connection.execute(
+            f"SELECT id FROM {native_call} ORDER BY _distance, id LIMIT 1"
+        ).fetchone()
+        assert top == (0,)
+        sql = (
+            f"SELECT id FROM {candidate_call} WHERE id <> {top[0]} "
+            "ORDER BY _distance, id"
+        )
+        expected = connection.execute(
+            f"SELECT id FROM {native_call} WHERE id <> {top[0]} "
+            "ORDER BY _distance, id"
+        ).fetchall()
+        assert expected == [(8,), (16,)]
+
+        relation = connection.sql(sql)
+        flattened = [
+            batch
+            for batches in _split_batches(connection, relation).values()
+            for batch in batches
+        ]
+        assert len(flattened) == 1
+        _, singleton, variant_offset, _ = _search_task_assignment_details(flattened[0])
+        assert singleton[variant_offset] == 0
+        assert _run(ray_runner, relation) == expected
+    finally:
+        connection.close()
+
+
 def test_large_vector_searches_outside_phase_one_remain_final_search(
     tmp_path: Path,
 ) -> None:

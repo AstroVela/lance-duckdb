@@ -1997,12 +1997,15 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
       distributed_input, bind_data.vane_state,
       bind_data.lance_pushed_filter_ir_parts,
       bind_data.complex_filter_pushdown_failed);
-  auto has_postfilter = !state.arguments.prefilter && has_base_filter_ancestor;
-  if (!state.arguments.prefilter) {
-    has_postfilter = has_postfilter || !get.table_filters.filters.empty() ||
-                     !bind_data.lance_pushed_filter_ir_parts.empty() ||
-                     bind_data.complex_filter_pushdown_failed ||
-                     !bind_data.namespace_filter.empty();
+  auto has_outer_filter = has_base_filter_ancestor ||
+                          !get.table_filters.filters.empty() ||
+                          !bind_data.lance_pushed_filter_ir_parts.empty() ||
+                          bind_data.complex_filter_pushdown_failed;
+  auto has_postfilter =
+      (state.arguments.namespace_backed || !state.arguments.prefilter) &&
+      has_outer_filter;
+  if (!state.arguments.prefilter && !bind_data.namespace_filter.empty()) {
+    has_postfilter = true;
   }
   if (!LanceVaneTryEnableExactVectorCandidates(state, has_postfilter)) {
     return op;
