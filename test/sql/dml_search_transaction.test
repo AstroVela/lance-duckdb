@@ -18,6 +18,80 @@ FROM (
      [20.0, 20.0]::FLOAT[2])
 ) AS rows(id, text, label, vec);
 
+# Prepared searches are bound before the transaction-local workspace exists.
+# Every execution must choose between namespace query_table and the current
+# staged Dataset instead of retaining the bind-time choice.
+statement ok
+PREPARE prepared_vector_search AS
+SELECT id
+FROM lance_vector_search(
+  'search_txn_ns.main.search_transaction',
+  'vec',
+  [0.0, 0.0]::FLOAT[2],
+  k = 1,
+  use_index = false
+);
+
+statement ok
+PREPARE prepared_fts_search AS
+SELECT id
+FROM lance_fts(
+  'search_txn_ns.main.search_transaction',
+  'text',
+  'staged',
+  k = 10
+);
+
+statement ok
+PREPARE prepared_hybrid_search AS
+SELECT id
+FROM lance_hybrid_search(
+  'search_txn_ns.main.search_transaction',
+  'vec',
+  [0.0, 0.0]::FLOAT[2],
+  'text',
+  'staged',
+  k = 1,
+  use_index = false
+);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO search_txn_ns.main.search_transaction
+VALUES (3, 'staged needle', 3, [0.0, 0.0]);
+
+query I
+EXECUTE prepared_vector_search;
+----
+3
+
+query I
+EXECUTE prepared_fts_search;
+----
+3
+
+query I
+EXECUTE prepared_hybrid_search;
+----
+3
+
+statement ok
+ROLLBACK;
+
+# A later execution has no workspace and must return to namespace query_table
+# instead of retaining the previously opened detached snapshot.
+query I
+EXECUTE prepared_vector_search;
+----
+1
+
+query I
+EXECUTE prepared_hybrid_search;
+----
+1
+
 # Namespace query_table only sees published versions. Once the transaction has
 # a detached snapshot, vector and FTS searches must use that dataset handle.
 statement ok
