@@ -94,7 +94,6 @@ int32_t lance_dataset_transaction_update_field_metadata(
     void *dataset_transaction, const char *field_path, const char *key,
     const char *value);
 int32_t lance_dataset_transaction_commit(void *dataset_transaction);
-int32_t lance_dataset_transaction_compensate(void *dataset_transaction);
 void lance_dataset_transaction_free(void *dataset_transaction);
 
 void *lance_get_schema(void *dataset);

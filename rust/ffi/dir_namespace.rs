@@ -17,7 +17,6 @@ use super::types::DatasetHandle;
 use super::util::{
     cstr_to_str, optional_session_handle, slice_from_ptr, to_c_string, FfiError, FfiResult,
 };
-use super::write_guard::acquire_shared_write_guard;
 
 fn parse_storage_options(
     option_keys: *const *const c_char,
@@ -279,7 +278,6 @@ fn dir_namespace_drop_table_inner(
     let table_name = unsafe { cstr_to_str(table_name, "table_name")? };
     let storage_options = parse_storage_options(option_keys, option_values, options_len)?;
 
-    let _write_guard = acquire_shared_write_guard();
     runtime::block_on(async move {
         let mut builder = DirectoryNamespaceBuilder::new(root).manifest_enabled(false);
         if !storage_options.is_empty() {

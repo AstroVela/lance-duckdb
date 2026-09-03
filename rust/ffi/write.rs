@@ -21,7 +21,6 @@ use crate::runtime;
 
 use super::session::record_commit;
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
-use super::write_guard::acquire_shared_write_guard;
 
 #[repr(C)]
 struct RawArrowArray {
@@ -507,7 +506,6 @@ fn spawn_writer_thread(
                 let WriterTarget::Path(path) = target else {
                     return Err("committed writer requires a path target".to_string());
                 };
-                let _write_guard = acquire_shared_write_guard();
                 let fut = Dataset::write(reader, &path, Some(params));
                 match runtime::block_on(fut) {
                     Ok(Ok(_)) => Ok(WriterResult::Committed),
@@ -1479,7 +1477,6 @@ fn commit_transaction_inner(
     if let Some(session) = session {
         builder = builder.with_session(session);
     }
-    let _write_guard = acquire_shared_write_guard();
     let fut = builder.execute(*txn);
     match runtime::block_on(fut) {
         Ok(Ok(_)) => {

@@ -22,7 +22,6 @@ use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
     canonicalize_lance_field_path, cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult,
 };
-use super::write_guard::acquire_shared_write_guard;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -380,7 +379,6 @@ fn dataset_create_index_inner(
     let train = train != 0;
 
     run_with_large_stack(move || {
-        let _write_guard = acquire_shared_write_guard();
         match runtime::block_on(async {
             let cols: [&str; 1] = [canonical_columns[0].as_str()];
             let mut builder = ds.create_index_builder(&cols, lance_index_type, params.as_ref());
@@ -427,7 +425,6 @@ fn dataset_drop_index_inner(dataset: *mut c_void, index_name: *const c_char) -> 
     }
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
-    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(async { ds.drop_index(index_name).await }) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -585,7 +582,6 @@ fn dataset_optimize_index_with_options_inner(
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
     let metrics = run_with_large_stack(move || {
-        let _write_guard = acquire_shared_write_guard();
         match runtime::block_on(async { ds.optimize_indices(&options).await }) {
             Ok(Ok(())) => Ok(OptimizeIndexMetricsOutput {
                 index_name: index_name_owned,

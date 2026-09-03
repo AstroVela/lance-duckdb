@@ -22,7 +22,6 @@ use super::util::{
     cstr_to_str, optional_session_handle, schema_to_ffi_arrow_schema, to_c_string, FfiError,
     FfiResult,
 };
-use super::write_guard::acquire_shared_write_guard;
 
 unsafe fn optional_cstr_to_string(
     ptr: *const c_char,
@@ -316,7 +315,6 @@ fn create_empty_table_inner(
         .split(delimiter.as_str())
         .map(|s| s.to_string())
         .collect();
-    let _write_guard = acquire_shared_write_guard();
     let (location, storage_options_tsv) = runtime::block_on(async move {
         let mut req = DeclareTableRequest::new();
         req.id = Some(table_id_segments);
@@ -426,7 +424,6 @@ fn drop_table_inner(
         .split(delimiter.as_str())
         .map(|s| s.to_string())
         .collect();
-    let _write_guard = acquire_shared_write_guard();
     runtime::block_on(async move {
         let mut req = DropTableRequest::new();
         req.id = Some(table_id_segments);

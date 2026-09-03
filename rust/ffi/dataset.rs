@@ -27,7 +27,6 @@ use super::util::{
     cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
     FfiResult,
 };
-use super::write_guard::acquire_shared_write_guard;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -916,7 +915,6 @@ fn dataset_delete_inner(
 
     let mut ds = (*handle.dataset).clone();
 
-    let _write_guard = acquire_shared_write_guard();
     let deleted_rows = match runtime::block_on(ds.delete(&predicate)) {
         Ok(Ok(result)) => result.num_deleted_rows,
         Ok(Err(err)) => {

@@ -220,7 +220,7 @@ public:
       RegisterLancePendingAppend(context.client, table.catalog,
                                  std::move(open_path), std::move(option_keys),
                                  std::move(option_values), std::move(cache_key),
-                                 txn);
+                                 table.name, txn);
     }
 
     chunk.SetCardinality(1);

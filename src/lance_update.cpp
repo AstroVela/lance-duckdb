@@ -258,7 +258,8 @@ public:
     RegisterLancePendingAppend(
         context.client, table.catalog, std::move(open_path),
         std::move(option_keys), std::move(option_values),
-        LanceBuildDatasetCacheKeyForTable(context.client, table), txn);
+        LanceBuildDatasetCacheKeyForTable(context.client, table), table.name,
+        txn);
 
     state.rows_updated = rows_updated;
 

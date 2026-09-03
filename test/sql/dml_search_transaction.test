@@ -56,6 +56,17 @@ FROM lance_hybrid_search(
 );
 
 statement ok
+PREPARE prepared_table_scan AS
+SELECT id
+FROM search_txn_ns.main.search_transaction
+ORDER BY id;
+
+statement ok
+PREPARE prepared_table_aggregate AS
+SELECT count(*), sum(id)
+FROM search_txn_ns.main.search_transaction;
+
+statement ok
 BEGIN TRANSACTION;
 
 statement ok
@@ -77,6 +88,18 @@ EXECUTE prepared_hybrid_search;
 ----
 3
 
+query I
+EXECUTE prepared_table_scan;
+----
+1
+2
+3
+
+query II
+EXECUTE prepared_table_aggregate;
+----
+3	6
+
 statement ok
 ROLLBACK;
 
@@ -91,6 +114,17 @@ query I
 EXECUTE prepared_hybrid_search;
 ----
 1
+
+query I
+EXECUTE prepared_table_scan;
+----
+1
+2
+
+query II
+EXECUTE prepared_table_aggregate;
+----
+2	3
 
 # Namespace query_table only sees published versions. Once the transaction has
 # a detached snapshot, vector and FTS searches must use that dataset handle.

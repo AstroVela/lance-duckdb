@@ -184,7 +184,7 @@ public:
     RegisterLancePendingAppend(
         context, table.catalog, std::move(gstate.open_path),
         std::move(gstate.option_keys), std::move(gstate.option_values),
-        LanceBuildDatasetCacheKeyForTable(context, table), txn);
+        LanceBuildDatasetCacheKeyForTable(context, table), table.name, txn);
     return SinkFinalizeType::READY;
   }
 
