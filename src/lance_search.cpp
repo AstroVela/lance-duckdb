@@ -1459,8 +1459,6 @@ struct LanceVectorMaterializeBindData : public TableFunctionData {
   vector<string> names;
   vector<LogicalType> types;
   vector<string> take_columns;
-  ArrowSchemaWrapper schema_root;
-  ArrowTableSchema arrow_table;
 
   unique_ptr<FunctionData> Copy() const override {
     auto result = make_uniq<LanceVectorMaterializeBindData>();
@@ -1469,7 +1467,6 @@ struct LanceVectorMaterializeBindData : public TableFunctionData {
     result->names = names;
     result->types = types;
     result->take_columns = take_columns;
-    result->arrow_table = arrow_table;
     return result;
   }
 };
@@ -1603,13 +1600,11 @@ LanceBuildVectorMaterializeProjection(const LanceVaneGlobalSearchState &state) {
 }
 
 static void LancePrepareVectorMaterializeBindData(
-    ClientContext &context, LanceVectorMaterializeBindData &bind_data) {
+    LanceVectorMaterializeBindData &bind_data) {
   auto projection = LanceBuildVectorMaterializeProjection(bind_data.vane_state);
   bind_data.take_columns = std::move(projection.take_columns);
   bind_data.names = std::move(projection.arrow_names);
   bind_data.types = std::move(projection.arrow_types);
-  LanceVanePopulateSearchSchema(context, bind_data.names, bind_data.types,
-                                bind_data.schema_root, bind_data.arrow_table);
 }
 
 static vector<LogicalType>
@@ -1729,7 +1724,7 @@ LanceVectorMaterializeInitLocal(ExecutionContext &context,
   return result;
 }
 
-static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &,
+static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &context,
                                                      TableFunctionInput &data,
                                                      DataChunk &input,
                                                      DataChunk &output) {
@@ -1797,10 +1792,10 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &,
   }
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
   memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema batch_schema;
-  memset(&batch_schema, 0, sizeof(batch_schema));
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &batch_schema) !=
-      0) {
+  ArrowSchemaWrapper batch_schema;
+  memset(&batch_schema.arrow_schema, 0, sizeof(batch_schema.arrow_schema));
+  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array,
+                           &batch_schema.arrow_schema) != 0) {
     lance_free_batch(batch);
     throw IOException(
         "Failed to export distributed Lance vector materialization batch" +
@@ -1809,16 +1804,23 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &,
             bind_data.vane_state.private_uri_diagnostics));
   }
   lance_free_batch(batch);
-  LanceCoerceArrowArrayForDuckDB(&batch_schema, &new_chunk->arrow_array);
-  if (batch_schema.release) {
-    batch_schema.release(&batch_schema);
+  LanceCoerceArrowArrayForDuckDB(&batch_schema.arrow_schema,
+                                 &new_chunk->arrow_array);
+  LanceCoerceArrowSchemaForDuckDB(&batch_schema.arrow_schema);
+  ArrowTableSchema batch_arrow_table;
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context.client, batch_arrow_table, batch_schema.arrow_schema);
+  if (batch_arrow_table.GetNames() != bind_data.names ||
+      batch_arrow_table.GetTypes() != bind_data.types) {
+    throw SerializationException(
+        "Distributed Lance vector materialization schema changed");
   }
 
   local.chunk = std::move(new_chunk);
   local.Reset();
   local.materialized_columns.Reset();
   local.materialized_columns.SetCardinality(input.size());
-  ArrowTableFunction::ArrowToDuckDB(local, bind_data.arrow_table.GetColumns(),
+  ArrowTableFunction::ArrowToDuckDB(local, batch_arrow_table.GetColumns(),
                                     local.materialized_columns, false);
   local.chunk_offset += input.size();
 
@@ -1897,8 +1899,7 @@ LanceVectorMaterializeDeserialize(Deserializer &deserializer, TableFunction &) {
   }
   auto result = make_uniq<LanceVectorMaterializeBindData>();
   result->vane_state = std::move(state);
-  auto &context = deserializer.Get<ClientContext &>();
-  LancePrepareVectorMaterializeBindData(context, *result);
+  LancePrepareVectorMaterializeBindData(*result);
   return result;
 }
 
@@ -2059,7 +2060,7 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
 
   auto materialize_bind = make_uniq<LanceVectorMaterializeBindData>();
   materialize_bind->vane_state = state;
-  LancePrepareVectorMaterializeBindData(context, *materialize_bind);
+  LancePrepareVectorMaterializeBindData(*materialize_bind);
   auto materialize_get = make_uniq<LogicalGet>(
       get.table_index, LanceVectorMaterializeFunction(),
       std::move(materialize_bind), state.output_types, state.output_names);

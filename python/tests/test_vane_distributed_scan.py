@@ -1415,18 +1415,27 @@ def _write_dataset(
 
 
 def _write_vector_candidate_dataset(connection, path: str | Path) -> None:
-    connection.execute(
-        "COPY (SELECT i::BIGINT AS id, (i % 3 = 1) AS keep, "
-        "CASE WHEN i = 24 THEN NULL ELSE "
-        "struct_pack(label := i::BIGINT, even := (i % 2 = 0)) END AS payload, "
-        f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> "
-        "CASE WHEN x = 0 THEN (i % 8)::FLOAT ELSE 0.0::FLOAT END)"
-        f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}] AS vec "
-        f"FROM range({VECTOR_CANDIDATE_ROWS}) AS source(i)) "
-        f"TO {_sql_literal(path)} "
-        "(FORMAT LANCE, MODE 'create', "
-        f"MAX_ROWS_PER_FILE {VECTOR_CANDIDATE_ROWS_PER_FRAGMENT})"
-    )
+    # Persist the label as Arrow LargeUtf8, then restore the regular-offset
+    # setting before search. This keeps the physical Lance layout different
+    # from a schema synthesized from DuckDB's VARCHAR logical type.
+    connection.execute("SET arrow_output_version = '1.0'")
+    connection.execute("SET arrow_large_buffer_size = true")
+    try:
+        connection.execute(
+            "COPY (SELECT i::BIGINT AS id, (i % 3 = 1) AS keep, "
+            "('label-' || i::VARCHAR)::VARCHAR AS label, "
+            "CASE WHEN i = 24 THEN NULL ELSE "
+            "struct_pack(label := i::BIGINT, even := (i % 2 = 0)) END AS payload, "
+            f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> "
+            "CASE WHEN x = 0 THEN (i % 8)::FLOAT ELSE 0.0::FLOAT END)"
+            f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}] AS vec "
+            f"FROM range({VECTOR_CANDIDATE_ROWS}) AS source(i)) "
+            f"TO {_sql_literal(path)} "
+            "(FORMAT LANCE, MODE 'create', "
+            f"MAX_ROWS_PER_FILE {VECTOR_CANDIDATE_ROWS_PER_FRAGMENT})"
+        )
+    finally:
+        connection.execute("SET arrow_large_buffer_size = false")
 
 
 def _zero_vector_sql() -> str:
@@ -2388,6 +2397,12 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
                 "ORDER BY _distance",
             ),
             (
+                "large-string",
+                "SELECT id, label, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
+                "ORDER BY _distance, id",
+            ),
+            (
                 "count-only",
                 "SELECT count(*) FROM lance_vector_search("
                 f"{path_sql}, 'vec', {query}, k = 3, use_index = false)",
@@ -2437,6 +2452,12 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
                 assert [row[1] for row in expected] == [24, 32, 40]
             elif name == "distance-only":
                 assert expected == [(0.0,), (0.0,), (0.0,)]
+            elif name == "large-string":
+                assert expected == [
+                    (24, "label-24", 0.0),
+                    (32, "label-32", 0.0),
+                    (40, "label-40", 0.0),
+                ]
             elif name == "count-only":
                 assert expected == [(3,)]
             elif name == "constant-only":
