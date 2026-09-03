@@ -1,5 +1,7 @@
 #include "duckdb.hpp"
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -28,31 +30,9 @@
 #include "lance_update.hpp"
 
 #include <cstdint>
+#include <cstring>
 
 namespace duckdb {
-
-static vector<pair<string, string>> ParseLanceMetadataRows(const char *ptr) {
-  if (!ptr) {
-    throw IOException("Failed to read Lance field metadata" +
-                      LanceFormatErrorSuffix());
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<pair<string, string>> out;
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out.emplace_back(std::move(parts[0]), std::move(parts[1]));
-  }
-  return out;
-}
 
 static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
                                         LanceTableEntry &table,
@@ -67,15 +47,35 @@ static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
                       display_uri + LanceFormatErrorSuffix());
   }
 
-  auto rows = ParseLanceMetadataRows(
-      lance_dataset_list_field_metadata(dataset, field_name.c_str()));
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    lance_close_dataset(dataset);
+    throw IOException("Failed to read Lance schema for UPDATE planning" +
+                      LanceFormatErrorSuffix());
+  }
+
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    lance_close_dataset(dataset);
+    throw IOException("Failed to export Lance schema for UPDATE planning" +
+                      LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
   lance_close_dataset(dataset);
 
-  for (auto &entry : rows) {
-    if (entry.first == "duckdb_default_expr") {
-      out_default_expr = std::move(entry.second);
-      return true;
+  for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
+    auto *field = schema_root.arrow_schema.children[i];
+    if (!field || !field->name ||
+        !StringUtil::CIEquals(field->name, field_name)) {
+      continue;
     }
+    if (field->metadata) {
+      out_default_expr =
+          ArrowSchemaMetadata(field->metadata).GetOption("duckdb_default_expr");
+    }
+    return !out_default_expr.empty();
   }
   return false;
 }

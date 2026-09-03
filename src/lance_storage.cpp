@@ -168,6 +168,10 @@ static void PopulateColumnsFromArrowSchema(ClientContext &context,
     auto *field_schema = arrow_schema.children[i];
     if (field_schema && field_schema->metadata) {
       ArrowSchemaMetadata metadata(field_schema->metadata);
+      auto comment = metadata.GetOption("comment");
+      if (!comment.empty()) {
+        column.SetComment(Value(comment));
+      }
       auto default_expression = metadata.GetOption("duckdb_default_expr");
       if (!default_expression.empty()) {
         auto expressions = Parser::ParseExpressionList(
@@ -208,6 +212,20 @@ static void PopulateLanceTableColumnsFromDataset(
   }
   PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
                                  out_columns);
+}
+
+static void PopulateLanceTableCommentFromDataset(void *dataset,
+                                                 CreateTableInfo &info) {
+  auto *comment = lance_dataset_get_table_metadata(dataset, "comment");
+  if (!comment) {
+    throw IOException("Failed to read table metadata from Lance dataset" +
+                      LanceFormatErrorSuffix());
+  }
+  string value = comment;
+  lance_free_string(comment);
+  if (!value.empty()) {
+    info.comment = Value(value);
+  }
 }
 
 static string JoinNamespacePath(const string &root, const string &child) {
@@ -334,6 +352,7 @@ public:
     try {
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
                                            &coerced);
+      PopulateLanceTableCommentFromDataset(dataset, info);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -525,6 +544,7 @@ public:
       try {
         PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
                                              &coerced);
+        PopulateLanceTableCommentFromDataset(dataset, info);
       } catch (...) {
         lance_close_dataset(dataset);
         continue;

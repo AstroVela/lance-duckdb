@@ -89,6 +89,105 @@ true
 statement ok
 DETACH alter_txn_ns;
 
+# Metadata containing tabs and newlines must not pass through lossy TSV
+# framing. Defaults and comments must remain intact in the staged catalog and
+# after catalog rediscovery.
+statement ok
+ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE alter_txn_ns.main.delimited_default_transaction AS
+SELECT 0::BIGINT AS id;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.delimited_default_transaction
+ADD COLUMN note VARCHAR DEFAULT 'first
+second	third';
+
+statement ok
+COMMENT ON TABLE alter_txn_ns.main.delimited_default_transaction IS 'table
+comment	value';
+
+statement ok
+COMMENT ON COLUMN alter_txn_ns.main.delimited_default_transaction.note IS 'column
+comment	value';
+
+query TT
+SELECT
+  (SELECT comment = ('table' || chr(10) || 'comment' || chr(9) || 'value')
+   FROM duckdb_tables()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'),
+  (SELECT comment = ('column' || chr(10) || 'comment' || chr(9) || 'value')
+   FROM duckdb_columns()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'
+     AND column_name = 'note');
+----
+true	true
+
+statement ok
+INSERT INTO alter_txn_ns.main.delimited_default_transaction(id) VALUES (1);
+
+query T
+SELECT note = ('first' || chr(10) || 'second' || chr(9) || 'third')
+FROM alter_txn_ns.main.delimited_default_transaction
+WHERE id = 1;
+----
+true
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH alter_txn_ns;
+
+statement ok
+ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
+
+query TT
+SELECT
+  (SELECT comment = ('table' || chr(10) || 'comment' || chr(9) || 'value')
+   FROM duckdb_tables()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'),
+  (SELECT comment = ('column' || chr(10) || 'comment' || chr(9) || 'value')
+   FROM duckdb_columns()
+   WHERE database_name = 'alter_txn_ns'
+     AND schema_name = 'main'
+     AND table_name = 'delimited_default_transaction'
+     AND column_name = 'note');
+----
+true	true
+
+statement ok
+INSERT INTO alter_txn_ns.main.delimited_default_transaction(id) VALUES (2);
+
+statement ok
+UPDATE alter_txn_ns.main.delimited_default_transaction
+SET note = 'changed' WHERE id = 2;
+
+statement ok
+UPDATE alter_txn_ns.main.delimited_default_transaction
+SET note = DEFAULT WHERE id = 2;
+
+query I
+SELECT count(*)
+FROM alter_txn_ns.main.delimited_default_transaction
+WHERE id IN (1, 2)
+  AND note = ('first' || chr(10) || 'second' || chr(9) || 'third');
+----
+2
+
+statement ok
+DETACH alter_txn_ns;
+
 statement ok
 ATTACH 'test/.tmp' AS alter_txn_ns (TYPE LANCE);
 

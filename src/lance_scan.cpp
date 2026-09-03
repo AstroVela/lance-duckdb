@@ -1,6 +1,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -3452,28 +3453,6 @@ LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
       namespace_config(
           make_uniq<LanceNamespaceTableConfig>(std::move(config))) {}
 
-static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
-  unordered_map<string, string> out;
-  if (!ptr) {
-    return out;
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out[std::move(parts[0])] = std::move(parts[1]);
-  }
-  return out;
-}
-
 static void PopulateLanceTableSchemaFromDataset(
     ClientContext &context, void *dataset, ColumnList &out_columns,
     vector<unique_ptr<Constraint>> &out_constraints,
@@ -3512,21 +3491,19 @@ static void PopulateLanceTableSchemaFromDataset(
   out_constraints.clear();
   for (idx_t i = 0; i < names.size(); i++) {
     ColumnDefinition col(names[i], types[i]);
-    auto *field_md =
-        lance_dataset_list_field_metadata(dataset, names[i].c_str());
-    if (!field_md) {
-      throw IOException("Failed to list field metadata from Lance dataset" +
-                        LanceFormatErrorSuffix());
+    auto *child = schema_root.arrow_schema.children[i];
+    string default_expression;
+    if (child && child->metadata) {
+      ArrowSchemaMetadata metadata(child->metadata);
+      auto comment = metadata.GetOption("comment");
+      if (!comment.empty()) {
+        col.SetComment(Value(comment));
+      }
+      default_expression = metadata.GetOption("duckdb_default_expr");
     }
-    auto kvs = ParseTsvKvs(field_md);
-    auto it = kvs.find("comment");
-    if (it != kvs.end()) {
-      col.SetComment(Value(it->second));
-    }
-    auto default_it = kvs.find("duckdb_default_expr");
-    if (default_it != kvs.end()) {
+    if (!default_expression.empty()) {
       auto expressions = Parser::ParseExpressionList(
-          default_it->second, context.GetParserOptions());
+          default_expression, context.GetParserOptions());
       if (expressions.size() != 1 || !expressions[0]) {
         throw IOException("Invalid DuckDB default expression in Lance field "
                           "metadata for column '" +
@@ -3537,7 +3514,6 @@ static void PopulateLanceTableSchemaFromDataset(
     out_columns.AddColumn(std::move(col));
 
     // Reflect not-null constraints for better DuckDB-side UX.
-    auto *child = schema_root.arrow_schema.children[i];
     if (child && (child->flags & ARROW_FLAG_NULLABLE) == 0) {
       out_constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(i)));
     }
@@ -3580,16 +3556,16 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   }
   entry->SetCoercedColumnNames(std::move(coerced));
 
-  auto *table_md = lance_dataset_list_table_metadata(dataset);
-  if (!table_md) {
+  auto *table_comment = lance_dataset_get_table_metadata(dataset, "comment");
+  if (!table_comment) {
     lance_close_dataset(dataset);
-    throw IOException("Failed to list table metadata from Lance dataset" +
+    throw IOException("Failed to read table metadata from Lance dataset" +
                       LanceFormatErrorSuffix());
   }
-  auto table_kvs = ParseTsvKvs(table_md);
-  auto it = table_kvs.find("comment");
-  if (it != table_kvs.end()) {
-    entry->comment = Value(it->second);
+  string table_comment_value = table_comment;
+  lance_free_string(table_comment);
+  if (!table_comment_value.empty()) {
+    entry->comment = Value(table_comment_value);
   }
 
   lance_close_dataset(dataset);
