@@ -93,13 +93,85 @@ async fn stage_transaction(
     Ok(())
 }
 
-fn build_new_column_transform(
+enum PreparedNewColumnTransform {
+    AllNulls {
+        output_schema: Arc<ArrowSchema>,
+    },
+    BatchUdf {
+        output_schema: Arc<ArrowSchema>,
+        physical: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+        read_columns: Vec<String>,
+    },
+}
+
+impl PreparedNewColumnTransform {
+    fn build(&self) -> (NewColumnTransform, Option<Vec<String>>) {
+        match self {
+            Self::AllNulls { output_schema } => {
+                (NewColumnTransform::AllNulls(output_schema.clone()), None)
+            }
+            Self::BatchUdf {
+                output_schema,
+                physical,
+                read_columns,
+            } => {
+                let output_fields = output_schema.fields().to_vec();
+                let schema_ref = output_schema.clone();
+                let physical = physical.clone();
+                let mapper = move |batch: &RecordBatch| {
+                    let num_rows = batch.num_rows();
+                    let mut arrays = Vec::with_capacity(physical.len());
+                    for (idx, (field, expr)) in
+                        output_fields.iter().zip(physical.iter()).enumerate()
+                    {
+                        let arr = expr
+                            .evaluate(batch)
+                            .map_err(|err| {
+                                lance::Error::invalid_input(format!(
+                                    "expression[{idx}] evaluate: {err}"
+                                ))
+                            })?
+                            .into_array(num_rows)
+                            .map_err(|err| {
+                                lance::Error::invalid_input(format!(
+                                    "expression[{idx}] into_array: {err}"
+                                ))
+                            })?;
+                        let arr = if arr.data_type() != field.data_type() {
+                            compute::cast(&arr, field.data_type()).map_err(|err| {
+                                lance::Error::invalid_input(format!(
+                                    "expression[{idx}] cast: {err}"
+                                ))
+                            })?
+                        } else {
+                            arr
+                        };
+                        arrays.push(arr);
+                    }
+                    RecordBatch::try_new(schema_ref.clone(), arrays)
+                        .map_err(|err| lance::Error::invalid_input(format!("output batch: {err}")))
+                };
+
+                (
+                    NewColumnTransform::BatchUDF(BatchUDF {
+                        mapper: Box::new(mapper),
+                        output_schema: output_schema.clone(),
+                        result_checkpoint: None,
+                    }),
+                    Some(read_columns.clone()),
+                )
+            }
+        }
+    }
+}
+
+fn prepare_new_column_transform(
     dataset: &Dataset,
     output_schema: Arc<ArrowSchema>,
     expressions: &[String],
-) -> FfiResult<(NewColumnTransform, Option<Vec<String>>)> {
+) -> FfiResult<PreparedNewColumnTransform> {
     if expressions.is_empty() {
-        return Ok((NewColumnTransform::AllNulls(output_schema), None));
+        return Ok(PreparedNewColumnTransform::AllNulls { output_schema });
     }
     if expressions.len() != output_schema.fields().len() {
         return Err(FfiError::new(
@@ -156,49 +228,16 @@ fn build_new_column_transform(
         })
         .collect::<FfiResult<Vec<_>>>()?;
 
-    let output_fields = output_schema.fields().to_vec();
-    let schema_ref = output_schema.clone();
-    let mapper = move |batch: &RecordBatch| {
-        let num_rows = batch.num_rows();
-        let mut arrays = Vec::with_capacity(physical.len());
-        for (idx, (field, expr)) in output_fields.iter().zip(physical.iter()).enumerate() {
-            let arr = expr
-                .evaluate(batch)
-                .map_err(|err| {
-                    lance::Error::invalid_input(format!("expression[{idx}] evaluate: {err}"))
-                })?
-                .into_array(num_rows)
-                .map_err(|err| {
-                    lance::Error::invalid_input(format!("expression[{idx}] into_array: {err}"))
-                })?;
-            let arr = if arr.data_type() != field.data_type() {
-                compute::cast(&arr, field.data_type()).map_err(|err| {
-                    lance::Error::invalid_input(format!("expression[{idx}] cast: {err}"))
-                })?
-            } else {
-                arr
-            };
-            arrays.push(arr);
-        }
-        RecordBatch::try_new(schema_ref.clone(), arrays)
-            .map_err(|err| lance::Error::invalid_input(format!("output batch: {err}")))
-    };
-
-    let read_columns = Some(
-        read_schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect(),
-    );
-    Ok((
-        NewColumnTransform::BatchUDF(BatchUDF {
-            mapper: Box::new(mapper),
-            output_schema,
-            result_checkpoint: None,
-        }),
+    let read_columns = read_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    Ok(PreparedNewColumnTransform::BatchUdf {
+        output_schema,
+        physical,
         read_columns,
-    ))
+    })
 }
 
 async fn build_add_columns_transaction(
@@ -210,10 +249,10 @@ async fn build_add_columns_transaction(
     let fragments = dataset.get_fragments();
     let mut updated_fragments = Vec::with_capacity(fragments.len());
     let mut merged_schema = None;
+    let prepared = prepare_new_column_transform(dataset, output_schema.clone(), expressions)?;
 
     for fragment in fragments {
-        let (transform, read_columns) =
-            build_new_column_transform(dataset, output_schema.clone(), expressions)?;
+        let (transform, read_columns) = prepared.build();
         let (updated, schema) = fragment
             .add_columns(transform, read_columns, batch_size)
             .await

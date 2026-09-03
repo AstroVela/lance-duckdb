@@ -1991,6 +1991,24 @@ public:
       }
     }
 
+    // Lance commits are atomic for one dataset, but there is no coordinator
+    // that can atomically publish snapshots for multiple datasets. Reject the
+    // transaction before publishing any snapshot instead of risking a partial
+    // commit if a later dataset conflicts or fails.
+    if (datasets.size() > 1) {
+      for (auto &pending : datasets) {
+        lance_dataset_transaction_free(pending.transaction);
+      }
+      for (auto &append : appends) {
+        lance_free_transaction(append.transaction);
+      }
+      DuckTransactionManager::RollbackTransaction(transaction_p);
+      return ErrorData(
+          ExceptionType::TRANSACTION,
+          "Lance cannot atomically commit changes to multiple datasets in "
+          "one transaction");
+    }
+
     for (idx_t dataset_idx = 0; dataset_idx < datasets.size(); dataset_idx++) {
       auto &pending = datasets[dataset_idx];
       auto rc = lance_dataset_transaction_commit(pending.transaction);

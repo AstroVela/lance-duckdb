@@ -184,11 +184,16 @@ public:
     auto *filter_ptr =
         filter_ir.empty() ? nullptr
                           : reinterpret_cast<const uint8_t *>(filter_ir.data());
-    auto rc = lance_delete_transaction_with_storage_options(
-        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        filter_ptr, filter_ir.size(), LanceGetSessionHandle(context.client),
-        &txn, &deleted_rows);
+    string transaction_display_uri;
+    auto *dataset = LanceOpenDatasetForTable(context.client, table,
+                                             transaction_display_uri);
+    if (!dataset) {
+      throw IOException("Failed to open Lance dataset for DELETE: " +
+                        transaction_display_uri + LanceFormatErrorSuffix());
+    }
+    auto rc = lance_delete_transaction_for_dataset(
+        dataset, filter_ptr, filter_ir.size(), &txn, &deleted_rows);
+    lance_close_dataset(dataset);
     if (rc != 0) {
       throw IOException("Failed to create Lance DELETE transaction for '" +
                         open_path + "'" + LanceFormatErrorSuffix());

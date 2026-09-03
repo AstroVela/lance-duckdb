@@ -608,7 +608,8 @@ pub unsafe extern "C" fn lance_delete_transaction_with_storage_options(
     out_transaction: *mut *mut c_void,
     out_deleted_rows: *mut i64,
 ) -> i32 {
-    match delete_transaction_with_storage_options_inner(
+    match delete_transaction_inner(
+        None,
         path,
         option_keys,
         option_values,
@@ -630,8 +631,49 @@ pub unsafe extern "C" fn lance_delete_transaction_with_storage_options(
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lance_delete_transaction_for_dataset(
+    dataset: *mut c_void,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    out_transaction: *mut *mut c_void,
+    out_deleted_rows: *mut i64,
+) -> i32 {
+    // SAFETY: The caller supplies a live `DatasetHandle` allocated by this FFI
+    // library and retains ownership for the duration of this call.
+    let dataset = match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => handle.dataset.clone(),
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return -1;
+        }
+    };
+    match delete_transaction_inner(
+        Some(dataset),
+        ptr::null(),
+        ptr::null(),
+        ptr::null(),
+        0,
+        filter_ir,
+        filter_ir_len,
+        ptr::null_mut(),
+        out_transaction,
+        out_deleted_rows,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn delete_transaction_with_storage_options_inner(
+fn delete_transaction_inner(
+    dataset_override: Option<Arc<lance::Dataset>>,
     path: *const c_char,
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
@@ -655,7 +697,11 @@ fn delete_transaction_with_storage_options_inner(
         ));
     }
 
-    let path_str = unsafe { cstr_to_str(path, "path")? };
+    let path = if dataset_override.is_some() {
+        String::new()
+    } else {
+        unsafe { cstr_to_str(path, "path")? }.to_string()
+    };
     if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
@@ -710,12 +756,16 @@ fn delete_transaction_with_storage_options_inner(
     let session = unsafe { optional_session_handle(session)? };
 
     let (maybe_txn, deleted_rows) = match runtime::block_on(async {
-        let mut builder = DatasetBuilder::from_uri(path_str).with_storage_options(storage_options);
-        if let Some(session) = session.clone() {
-            builder = builder.with_session(session);
-        }
-        let dataset = builder.load().await.map_err(|e| e.to_string())?;
-        let dataset = Arc::new(dataset);
+        let dataset = if let Some(dataset) = dataset_override.clone() {
+            dataset
+        } else {
+            let mut builder =
+                DatasetBuilder::from_uri(path.as_str()).with_storage_options(storage_options);
+            if let Some(session) = session.clone() {
+                builder = builder.with_session(session);
+            }
+            Arc::new(builder.load().await.map_err(|e| e.to_string())?)
+        };
 
         let mut scanner = dataset.scan();
         scanner

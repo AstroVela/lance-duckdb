@@ -101,5 +101,92 @@ WHERE id = 3 AND answer = 42;
 ----
 1
 
+# DELETE must build from the staged snapshot so it can compose with ALTER and
+# the default-filling UPDATE in the same transaction.
+statement ok
+CREATE OR REPLACE TEMP TABLE alter_delete_initial_versions AS
+SELECT count(*)::BIGINT AS c
+FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN delete_marker BIGINT DEFAULT (3 + 4);
+
+statement ok
+DELETE FROM alter_txn_ns.main.lance_alter_transaction
+WHERE id = 1 AND delete_marker = 7;
+
+query II
+SELECT id, delete_marker
+FROM alter_txn_ns.main.lance_alter_transaction
+ORDER BY id;
+----
+0	7
+2	7
+3	7
+
+statement ok
+COMMIT;
+
+query T
+SELECT ((SELECT c FROM alter_delete_initial_versions) + 1) =
+       (SELECT count(*)::BIGINT
+        FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*'));
+----
+true
+
+# Lance has no atomic commit spanning multiple datasets. Reject such a
+# transaction before publishing either staged snapshot.
+statement ok
+CREATE OR REPLACE TABLE alter_txn_ns.main.lance_alter_transaction_other AS
+SELECT range::BIGINT AS id FROM range(2);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE alter_multi_initial_versions AS
+SELECT
+  (SELECT count(*)::BIGINT
+   FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*')) AS first_c,
+  (SELECT count(*)::BIGINT
+   FROM glob('test/.tmp/lance_alter_transaction_other.lance/_versions/*')) AS second_c;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN staged_first BIGINT DEFAULT 11;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction_other
+ADD COLUMN staged_second BIGINT DEFAULT 22;
+
+statement error
+COMMIT;
+----
+TransactionContext Error:
+
+query I
+SELECT count(*)
+FROM duckdb_columns()
+WHERE database_name = 'alter_txn_ns'
+  AND schema_name = 'main'
+  AND column_name IN ('staged_first', 'staged_second');
+----
+0
+
+query TT
+SELECT
+  (SELECT first_c FROM alter_multi_initial_versions) =
+    (SELECT count(*)::BIGINT
+     FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*')),
+  (SELECT second_c FROM alter_multi_initial_versions) =
+    (SELECT count(*)::BIGINT
+     FROM glob('test/.tmp/lance_alter_transaction_other.lance/_versions/*'));
+----
+true	true
+
 statement ok
 DETACH alter_txn_ns;
