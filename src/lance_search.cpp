@@ -1941,7 +1941,7 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
     return op;
   }
   auto &bind_data = get.bind_data->Cast<LanceKnnBindData>();
-  if (bind_data.vane_state.worker_bind ||
+  if (!bind_data.vane_state.valid || bind_data.vane_state.worker_bind ||
       bind_data.vane_state.execution_variant !=
           LanceVaneSearchTaskVariant::FINAL_SEARCH) {
     return op;
