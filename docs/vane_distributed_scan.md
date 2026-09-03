@@ -96,7 +96,10 @@ authenticated `FINAL_SEARCH` assignment. Their search and reranking semantics
 therefore remain one global Lance operation during this phase. Indexed vector
 candidates, full-text candidates, and hybrid global normalization and reranking
 are later phases of
-[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
+[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). The admission
+boundary and executable counterexample for the next indexed-vector phase are
+documented in the
+[indexed vector candidate contract](vane_indexed_vector_candidates.md).
 
 Unknown variants, malformed payload sizes, foreign state identities, duplicate
 or overlapping fragment assignments, and changed retry assignments fail

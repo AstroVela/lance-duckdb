@@ -1496,8 +1496,92 @@ fn cmp_desc_f32(left: f32, right: f32) -> Ordering {
 mod tests {
     use std::collections::HashMap;
     use std::ffi::CString;
+    use std::path::PathBuf;
+
+    use arrow_array::{FixedSizeListArray, Int64Array, RecordBatchIterator};
+    use lance::dataset::WriteParams;
+    use lance::index::{vector::VectorIndexParams, DatasetIndexExt};
+    use lance::Dataset;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::IndexType;
+    use lance_linalg::distance::DistanceType;
 
     use super::*;
+
+    struct TestDatasetDir(PathBuf);
+
+    impl Drop for TestDatasetDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn indexed_vector_contract_batch(
+        schema: Arc<Schema>,
+        ids: Vec<i64>,
+        vectors: Vec<[f32; 2]>,
+    ) -> RecordBatch {
+        let values = Float32Array::from_iter_values(vectors.into_iter().flatten());
+        let vectors = FixedSizeListArray::try_new_from_values(values, 2).expect("vectors");
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(vectors)],
+        )
+        .expect("contract batch")
+    }
+
+    fn collect_indexed_vector_candidates(
+        handle: &DatasetHandle,
+        fragments: Vec<lance_table::format::Fragment>,
+        index_segments: Vec<lance_table::format::IndexMetadata>,
+        nprobes: u64,
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        let stream = create_exact_vector_stream(
+            handle,
+            "vector",
+            &[0.0, 0.0],
+            k,
+            nprobes,
+            0,
+            None,
+            false,
+            true,
+            fragments,
+            index_segments,
+            true,
+        )
+        .expect("indexed candidate stream");
+        let mut stream = VectorCandidateStream::new(stream);
+        let mut result = Vec::new();
+        while let Some(batch) = stream.next().expect("indexed candidate batch") {
+            let row_ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("row ids");
+            let distances = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("distances");
+            result.extend(
+                row_ids
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(distances.values().iter().copied()),
+            );
+        }
+        result.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        result.truncate(k);
+        result
+    }
 
     #[test]
     fn vector_candidates_are_reordered_by_name_and_type() {
@@ -1541,6 +1625,157 @@ mod tests {
                 .values(),
             &[0.25, 0.5]
         );
+    }
+
+    #[test]
+    fn fragment_local_default_probes_change_indexed_vector_semantics() {
+        let dataset_dir = TestDatasetDir(std::env::temp_dir().join(format!(
+            "lance-indexed-vector-contract-{}",
+            rand::random::<u64>()
+        )));
+        let uri = dataset_dir.0.to_string_lossy().to_string();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                false,
+            ),
+        ]));
+        // The partition nearest to the query contains only distant vectors in
+        // fragment zero. Fragment one contains closer vectors assigned to the
+        // other centroid. A dataset-wide default search finds k rows in the
+        // first partition and stops; a fragment-one search has no hits there
+        // and adaptively probes the second partition.
+        let batches = vec![
+            indexed_vector_contract_batch(
+                schema.clone(),
+                vec![0, 1, 2],
+                vec![[-100.0, 0.0], [-101.0, 0.0], [-102.0, 0.0]],
+            ),
+            indexed_vector_contract_batch(
+                schema.clone(),
+                vec![3, 4, 5],
+                vec![[6.0, 0.0], [7.0, 0.0], [8.0, 0.0]],
+            ),
+        ];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = runtime::block_on(Dataset::write(
+            reader,
+            &uri,
+            Some(WriteParams {
+                max_rows_per_group: 3,
+                max_rows_per_file: 3,
+                ..WriteParams::default()
+            }),
+        ))
+        .expect("runtime")
+        .expect("write contract dataset");
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![0.0, 0.0, 10.0, 0.0]),
+                2,
+            )
+            .expect("centroids"),
+        );
+        let index_params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(2, centroids).expect("IVF parameters"),
+        );
+        runtime::block_on(dataset.create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".to_string()),
+            &index_params,
+            true,
+        ))
+        .expect("runtime")
+        .expect("create vector index");
+        let index_segments = runtime::block_on(dataset.load_indices_by_name("vector_idx"))
+            .expect("runtime")
+            .expect("load vector index segments");
+        let handle = DatasetHandle::new(Arc::new(dataset));
+        let fragments = handle.dataset.fragments().as_ref().clone();
+        let k = 2;
+
+        let global_default = collect_indexed_vector_candidates(
+            &handle,
+            fragments.clone(),
+            index_segments.clone(),
+            0,
+            k,
+        );
+        let mut fragment_default = fragments
+            .iter()
+            .cloned()
+            .flat_map(|fragment| {
+                collect_indexed_vector_candidates(
+                    &handle,
+                    vec![fragment],
+                    index_segments.clone(),
+                    0,
+                    k,
+                )
+            })
+            .collect::<Vec<_>>();
+        fragment_default.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        fragment_default.truncate(k);
+
+        assert_eq!(
+            global_default
+                .iter()
+                .map(|(_, distance)| *distance)
+                .collect::<Vec<_>>(),
+            vec![10_000.0, 10_201.0]
+        );
+        assert_eq!(
+            fragment_default
+                .iter()
+                .map(|(_, distance)| *distance)
+                .collect::<Vec<_>>(),
+            vec![36.0, 49.0]
+        );
+        assert_ne!(fragment_default, global_default);
+
+        // An explicit nprobes value fixes the same partition set for every
+        // scan. This is a necessary condition for a future indexed candidate
+        // contract, but production routing remains singleton until segment
+        // assignment and refinement are specified end to end.
+        for nprobes in [1, 2] {
+            let global = collect_indexed_vector_candidates(
+                &handle,
+                fragments.clone(),
+                index_segments.clone(),
+                nprobes,
+                k,
+            );
+            let mut split = fragments
+                .iter()
+                .cloned()
+                .flat_map(|fragment| {
+                    collect_indexed_vector_candidates(
+                        &handle,
+                        vec![fragment],
+                        index_segments.clone(),
+                        nprobes,
+                        k,
+                    )
+                })
+                .collect::<Vec<_>>();
+            split.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            split.truncate(k);
+            assert_eq!(split, global, "nprobes={nprobes}");
+        }
     }
 
     #[test]
