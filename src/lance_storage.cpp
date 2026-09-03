@@ -2009,16 +2009,35 @@ public:
           "one transaction");
     }
 
+    auto finish_dataset_transactions = [&](bool compensate,
+                                           bool invalidate_cache) -> ErrorData {
+      ErrorData cleanup_error;
+      for (auto &pending : datasets) {
+        if (!pending.transaction) {
+          continue;
+        }
+        if (compensate &&
+            lance_dataset_transaction_compensate(pending.transaction) != 0) {
+          cleanup_error.Merge(ErrorData(
+              ExceptionType::TRANSACTION,
+              "Failed to compensate published transaction-local Lance "
+              "dataset" +
+                  LanceFormatErrorSuffix()));
+        }
+        if (invalidate_cache) {
+          LanceInvalidateDatasetCache(context, pending.cache_key);
+        }
+        lance_dataset_transaction_free(pending.transaction);
+        pending.transaction = nullptr;
+      }
+      return cleanup_error;
+    };
+
     for (idx_t dataset_idx = 0; dataset_idx < datasets.size(); dataset_idx++) {
       auto &pending = datasets[dataset_idx];
       auto rc = lance_dataset_transaction_commit(pending.transaction);
-      lance_dataset_transaction_free(pending.transaction);
-      pending.transaction = nullptr;
       if (rc != 0) {
-        for (idx_t cleanup_idx = dataset_idx + 1; cleanup_idx < datasets.size();
-             cleanup_idx++) {
-          lance_dataset_transaction_free(datasets[cleanup_idx].transaction);
-        }
+        finish_dataset_transactions(false, false);
         for (auto &append : appends) {
           lance_free_transaction(append.transaction);
         }
@@ -2049,22 +2068,32 @@ public:
              cleanup_idx++) {
           lance_free_transaction(appends[cleanup_idx].transaction);
         }
+        auto compensation_error = finish_dataset_transactions(true, true);
         DuckTransactionManager::RollbackTransaction(transaction_p);
-        return ErrorData(ExceptionType::TRANSACTION,
+        ErrorData result(ExceptionType::TRANSACTION,
                          "Failed to commit Lance append transaction for '" +
                              pending.path + "'" + LanceFormatErrorSuffix());
+        result.Merge(compensation_error);
+        return result;
       }
     }
 
-    auto result =
-        DuckTransactionManager::CommitTransaction(context, transaction_p);
-    if (!result.HasError()) {
+    ErrorData result;
+    try {
+      result =
+          DuckTransactionManager::CommitTransaction(context, transaction_p);
+    } catch (...) {
+      finish_dataset_transactions(true, true);
+      throw;
+    }
+    if (result.HasError()) {
+      auto compensation_error = finish_dataset_transactions(true, true);
+      result.Merge(compensation_error);
+    } else {
       for (auto &pending : appends) {
         LanceInvalidateDatasetCache(context, pending.cache_key);
       }
-      for (auto &pending : datasets) {
-        LanceInvalidateDatasetCache(context, pending.cache_key);
-      }
+      finish_dataset_transactions(false, true);
     }
     return result;
   }

@@ -94,6 +94,7 @@ int32_t lance_dataset_transaction_update_field_metadata(
     void *dataset_transaction, const char *field_path, const char *key,
     const char *value);
 int32_t lance_dataset_transaction_commit(void *dataset_transaction);
+int32_t lance_dataset_transaction_compensate(void *dataset_transaction);
 void lance_dataset_transaction_free(void *dataset_transaction);
 
 void *lance_get_schema(void *dataset);
@@ -288,22 +289,21 @@ void *lance_get_knn_schema(void *dataset, const char *vector_column,
 void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  const float *query_values, size_t query_len,
                                  uint64_t k, uint64_t nprobes,
-                                 uint64_t refine_factor,
+                                 uint64_t refine_factor, const char *filter_sql,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
                                  uint8_t prefilter, uint8_t use_index);
 
-const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
-                                      const float *query_values,
-                                      size_t query_len, uint64_t k,
-                                      uint64_t nprobes, uint64_t refine_factor,
-                                      const uint8_t *filter_ir,
-                                      size_t filter_ir_len, uint8_t prefilter,
-                                      uint8_t use_index, uint8_t verbose);
+const char *lance_explain_knn_scan_ir(
+    void *dataset, const char *vector_column, const float *query_values,
+    size_t query_len, uint64_t k, uint64_t nprobes, uint64_t refine_factor,
+    const char *filter_sql, const uint8_t *filter_ir, size_t filter_ir_len,
+    uint8_t prefilter, uint8_t use_index, uint8_t verbose);
 
 void *lance_get_fts_schema(void *dataset, const char *text_column,
                            const char *query, uint64_t k, uint8_t prefilter);
 void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
                                  const char *query, uint64_t k,
+                                 const char *filter_sql,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
                                  uint8_t prefilter);
 

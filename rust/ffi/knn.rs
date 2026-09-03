@@ -10,7 +10,7 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_usize, parse_optional_filter_ir, slice_from_ptr, to_c_string,
+    cstr_to_str, nonzero_u64_to_usize, parse_optional_search_filter, slice_from_ptr, to_c_string,
     FfiError, FfiResult,
 };
 
@@ -109,6 +109,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    filter_sql: *const c_char,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -122,6 +123,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         k,
         nprobes,
         refine_factor,
+        filter_sql,
         filter_ir,
         filter_ir_len,
         prefilter,
@@ -147,6 +149,7 @@ fn create_knn_stream_ir_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    filter_sql: *const c_char,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -160,17 +163,19 @@ fn create_knn_stream_ir_inner(
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
     let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
-    let filter = unsafe {
-        parse_optional_filter_ir(
-            filter_ir,
-            filter_ir_len,
-            ErrorCode::KnnStreamCreate,
-            "knn filter_ir",
-        )?
-    };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let filter = unsafe {
+        parse_optional_search_filter(
+            filter_sql,
+            filter_ir,
+            filter_ir_len,
+            handle.dataset.schema(),
+            ErrorCode::KnnStreamCreate,
+            "knn filter",
+        )?
+    };
     let projection = projection::build_knn_projection(&handle.base_projection);
 
     let mut scan = handle.dataset.scan();
@@ -224,6 +229,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    filter_sql: *const c_char,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -238,6 +244,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
         k,
         nprobes,
         refine_factor,
+        filter_sql,
         filter_ir,
         filter_ir_len,
         prefilter,
@@ -264,6 +271,7 @@ fn explain_knn_scan_ir_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    filter_sql: *const c_char,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -278,17 +286,19 @@ fn explain_knn_scan_ir_inner(
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
     let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
-    let filter = unsafe {
-        parse_optional_filter_ir(
-            filter_ir,
-            filter_ir_len,
-            ErrorCode::ExplainPlan,
-            "knn filter_ir",
-        )?
-    };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let filter = unsafe {
+        parse_optional_search_filter(
+            filter_sql,
+            filter_ir,
+            filter_ir_len,
+            handle.dataset.schema(),
+            ErrorCode::ExplainPlan,
+            "knn filter",
+        )?
+    };
     let projection = projection::build_knn_projection(&handle.base_projection);
 
     let mut scan = handle.dataset.scan();

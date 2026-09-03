@@ -18,7 +18,7 @@ use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
     cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize, parse_optional_filter_ir,
-    slice_from_ptr, FfiError, FfiResult,
+    parse_optional_search_filter, slice_from_ptr, FfiError, FfiResult,
 };
 
 #[no_mangle]
@@ -81,6 +81,7 @@ pub unsafe extern "C" fn lance_create_fts_stream_ir(
     text_column: *const c_char,
     query: *const c_char,
     k: u64,
+    filter_sql: *const c_char,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -90,6 +91,7 @@ pub unsafe extern "C" fn lance_create_fts_stream_ir(
         text_column,
         query,
         k,
+        filter_sql,
         filter_ir,
         filter_ir_len,
         prefilter,
@@ -105,28 +107,32 @@ pub unsafe extern "C" fn lance_create_fts_stream_ir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_fts_stream_ir_inner(
     dataset: *mut c_void,
     text_column: *const c_char,
     query: *const c_char,
     k: u64,
+    filter_sql: *const c_char,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
 ) -> FfiResult<StreamHandle> {
     let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
     let query = unsafe { cstr_to_str(query, "query")? };
-    let filter = unsafe {
-        parse_optional_filter_ir(
-            filter_ir,
-            filter_ir_len,
-            ErrorCode::FtsStreamCreate,
-            "fts filter_ir",
-        )?
-    };
     let k_i64 = nonzero_u64_to_i64(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let filter = unsafe {
+        parse_optional_search_filter(
+            filter_sql,
+            filter_ir,
+            filter_ir_len,
+            handle.dataset.schema(),
+            ErrorCode::FtsStreamCreate,
+            "fts filter",
+        )?
+    };
     let projection = handle.fts_projection.clone();
 
     let fts_query = FullTextSearchQuery::new(query.to_string())

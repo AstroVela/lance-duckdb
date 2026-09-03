@@ -29,6 +29,9 @@ pub(crate) struct DatasetTransactionHandle {
     base_version: u64,
     working: Arc<Dataset>,
     detached_versions: Vec<u64>,
+    // Retained until DuckDB's catalog commit succeeds so a failed catalog
+    // commit can restore the base snapshot.
+    published: Option<Arc<Dataset>>,
 }
 
 fn transaction_handle<'a>(ptr: *mut c_void) -> FfiResult<&'a DatasetTransactionHandle> {
@@ -297,6 +300,7 @@ pub unsafe extern "C" fn lance_dataset_transaction_new(dataset: *mut c_void) -> 
             base_version: dataset.dataset.version_id(),
             working: dataset.dataset.clone(),
             detached_versions: Vec::new(),
+            published: None,
         })
     })();
     match result {
@@ -530,56 +534,132 @@ pub unsafe extern "C" fn lance_dataset_transaction_update_table_metadata(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn lance_dataset_transaction_commit(dataset_transaction: *mut c_void) -> i32 {
-    let result = transaction_handle(dataset_transaction).and_then(|handle| {
-        if handle.working.version_id() == handle.base_version {
-            return Ok(());
-        }
-        let transaction = Transaction::new(
-            handle.base_version,
-            Operation::Restore {
-                version: handle.working.version_id(),
-            },
-            None,
-        );
-        let latest_version = match runtime::block_on(handle.working.latest_version_id()) {
-            Ok(Ok(version)) => version,
-            Ok(Err(err)) => {
-                return Err(FfiError::new(
-                    ErrorCode::DatasetCommitTransaction,
-                    format!("resolve latest Lance version before commit: {err}"),
-                ))
-            }
-            Err(err) => {
-                return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))
-            }
-        };
-        if latest_version != handle.base_version {
+fn commit_dataset_transaction(handle: &mut DatasetTransactionHandle) -> FfiResult<()> {
+    if handle.published.is_some() {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            "transaction-local Lance snapshot is already published",
+        ));
+    }
+    if handle.working.version_id() == handle.base_version {
+        return Ok(());
+    }
+    let transaction = Transaction::new(
+        handle.base_version,
+        Operation::Restore {
+            version: handle.working.version_id(),
+        },
+        None,
+    );
+    let latest_version = match runtime::block_on(handle.working.latest_version_id()) {
+        Ok(Ok(version)) => version,
+        Ok(Err(err)) => {
             return Err(FfiError::new(
                 ErrorCode::DatasetCommitTransaction,
-                format!(
-                    "Lance dataset changed concurrently (transaction started at version {}, latest is {})",
-                    handle.base_version, latest_version
-                ),
-            ));
+                format!("resolve latest Lance version before commit: {err}"),
+            ))
         }
-        match runtime::block_on(
-            CommitBuilder::new(handle.working.clone())
-                .with_max_retries(0)
-                .execute(transaction),
-        ) {
-            Ok(Ok(_)) => {
-                record_commit();
-                Ok(())
-            }
-            Ok(Err(err)) => Err(FfiError::new(
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+    if latest_version != handle.base_version {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            format!(
+                "Lance dataset changed concurrently (transaction started at version {}, latest is {})",
+                handle.base_version, latest_version
+            ),
+        ));
+    }
+    match runtime::block_on(
+        CommitBuilder::new(handle.working.clone())
+            .with_max_retries(0)
+            .execute(transaction),
+    ) {
+        Ok(Ok(dataset)) => {
+            record_commit();
+            handle.published = Some(Arc::new(dataset));
+            Ok(())
+        }
+        Ok(Err(err)) => Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            format!("publish transaction-local Lance snapshot: {err}"),
+        )),
+        Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_transaction_commit(dataset_transaction: *mut c_void) -> i32 {
+    let result = transaction_handle_mut(dataset_transaction).and_then(commit_dataset_transaction);
+
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn compensate_dataset_transaction(handle: &mut DatasetTransactionHandle) -> FfiResult<()> {
+    let Some(published) = handle.published.clone() else {
+        return Ok(());
+    };
+    let published_version = published.version_id();
+    let latest_version = match runtime::block_on(published.latest_version_id()) {
+        Ok(Ok(version)) => version,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
                 ErrorCode::DatasetCommitTransaction,
-                format!("publish transaction-local Lance snapshot: {err}"),
-            )),
-            Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+                format!("resolve latest Lance version before compensation: {err}"),
+            ))
         }
-    });
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+    if latest_version != published_version {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            format!(
+                "cannot compensate Lance commit at version {} because latest is {}",
+                published_version, latest_version
+            ),
+        ));
+    }
+
+    let transaction = Transaction::new(
+        published_version,
+        Operation::Restore {
+            version: handle.base_version,
+        },
+        None,
+    );
+    match runtime::block_on(
+        CommitBuilder::new(published)
+            .with_max_retries(0)
+            .execute(transaction),
+    ) {
+        Ok(Ok(_)) => {
+            record_commit();
+            handle.published = None;
+            Ok(())
+        }
+        Ok(Err(err)) => Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            format!("compensate published Lance snapshot: {err}"),
+        )),
+        Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_transaction_compensate(
+    dataset_transaction: *mut c_void,
+) -> i32 {
+    let result =
+        transaction_handle_mut(dataset_transaction).and_then(compensate_dataset_transaction);
 
     match result {
         Ok(()) => {
@@ -613,5 +693,90 @@ pub unsafe extern "C" fn lance_dataset_transaction_free(dataset_transaction: *mu
             }
             Ok::<(), lance::Error>(())
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use arrow_array::{Int32Array, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::dataset::WriteParams;
+
+    use super::*;
+
+    #[test]
+    fn compensate_restores_the_base_snapshot() {
+        let dataset_dir =
+            std::env::temp_dir().join(format!("ffi-transaction-{}", rand::random::<u64>()));
+        let uri = dataset_dir.to_string_lossy().to_string();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let reader = RecordBatchIterator::new(
+            vec![Ok(RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap())]
+            .into_iter(),
+            schema,
+        );
+        let dataset = runtime::block_on(Dataset::write(reader, &uri, Some(WriteParams::default())))
+            .unwrap()
+            .unwrap();
+        let base_version = dataset.version_id();
+        let mut handle = DatasetTransactionHandle {
+            base_version,
+            working: Arc::new(dataset),
+            detached_versions: Vec::new(),
+            published: None,
+        };
+        let transaction = Transaction::new(
+            base_version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: Some(UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: "transaction-test".to_string(),
+                        value: Some("published".to_string()),
+                    }],
+                    replace: false,
+                }),
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        runtime::block_on(stage_transaction(&mut handle, transaction))
+            .unwrap()
+            .unwrap();
+
+        let handle_ptr = Box::into_raw(Box::new(handle)) as *mut c_void;
+        unsafe {
+            assert_eq!(lance_dataset_transaction_commit(handle_ptr), 0);
+        }
+        let published = runtime::block_on(Dataset::open(&uri)).unwrap().unwrap();
+        assert_eq!(
+            published.manifest().table_metadata.get("transaction-test"),
+            Some(&"published".to_string())
+        );
+
+        unsafe {
+            assert_eq!(lance_dataset_transaction_compensate(handle_ptr), 0);
+        }
+        let compensated = runtime::block_on(Dataset::open(&uri)).unwrap().unwrap();
+        assert_eq!(compensated.version_id(), published.version_id() + 1);
+        assert_eq!(
+            compensated
+                .manifest()
+                .table_metadata
+                .get("transaction-test"),
+            None
+        );
+
+        unsafe {
+            lance_dataset_transaction_free(handle_ptr);
+        }
+        let _ = fs::remove_dir_all(dataset_dir);
     }
 }

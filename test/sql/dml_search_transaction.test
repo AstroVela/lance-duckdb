@@ -1,0 +1,84 @@
+# name: test/sql/dml_search_transaction.test
+# description: transaction-local search for attached Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/.tmp' AS search_txn_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE search_txn_ns.main.search_transaction AS
+SELECT *
+FROM (
+  VALUES
+    (1::BIGINT, 'old document'::VARCHAR, 1::BIGINT,
+     [10.0, 10.0]::FLOAT[2]),
+    (2::BIGINT, 'another document'::VARCHAR, 2::BIGINT,
+     [20.0, 20.0]::FLOAT[2])
+) AS rows(id, text, label, vec);
+
+# Namespace query_table only sees published versions. Once the transaction has
+# a detached snapshot, vector and FTS searches must use that dataset handle.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE search_txn_ns.main.search_transaction
+ADD COLUMN marker BIGINT DEFAULT 7;
+
+statement ok
+INSERT INTO search_txn_ns.main.search_transaction(id, text, label, vec)
+VALUES (3, 'staged needle', 3, [0.0, 0.0]);
+
+# Exercise both the namespace-specific filter argument and an outer DuckDB
+# filter. The direct staged-snapshot path combines both filters before search.
+query II
+SELECT id, marker
+FROM lance_vector_search(
+  'search_txn_ns.main.search_transaction',
+  'vec',
+  [0.0, 0.0]::FLOAT[2],
+  k = 1,
+  prefilter = true,
+  use_index = false,
+  filter = 'label = 3'
+)
+WHERE marker = 7;
+----
+3	7
+
+query II
+SELECT id, marker
+FROM lance_fts(
+  'search_txn_ns.main.search_transaction',
+  'text',
+  'staged',
+  k = 10,
+  prefilter = true,
+  filter = 'label = 3'
+)
+WHERE marker = 7;
+----
+3	7
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM search_txn_ns.main.search_transaction;
+----
+2
+
+query I
+SELECT count(*)
+FROM duckdb_columns()
+WHERE database_name = 'search_txn_ns'
+  AND schema_name = 'main'
+  AND table_name = 'search_transaction'
+  AND column_name = 'marker';
+----
+0
+
+statement ok
+DETACH search_txn_ns;
