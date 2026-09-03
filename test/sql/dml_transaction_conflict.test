@@ -42,3 +42,48 @@ SELECT id FROM conflict_ns.main.transaction_conflict ORDER BY id;
 
 statement ok con1
 DETACH conflict_ns;
+
+# Each ATTACH owns a separate transaction manager. DuckDB must reject a second
+# attached-database writer before either manager reaches its commit callback.
+statement ok
+ATTACH 'test/.tmp' AS conflict_alias_a (TYPE LANCE);
+
+statement ok
+ATTACH 'test/.tmp' AS conflict_alias_b (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE conflict_alias_a.main.cross_manager_conflict AS
+SELECT 1::BIGINT AS id;
+
+# Materialize an independent catalog entry through the second attachment.
+query I
+SELECT id FROM conflict_alias_b.main.cross_manager_conflict;
+----
+1
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO conflict_alias_a.main.cross_manager_conflict VALUES (2);
+
+statement error
+INSERT INTO conflict_alias_b.main.cross_manager_conflict VALUES (3);
+----
+TransactionContext Error: Attempting to write to database
+
+statement ok
+ROLLBACK;
+
+# DuckDB rejects the second attached-database writer before either transaction
+# manager can publish, so rolling back leaves the base snapshot unchanged.
+query I
+SELECT id FROM conflict_alias_a.main.cross_manager_conflict ORDER BY id;
+----
+1
+
+statement ok
+DETACH conflict_alias_b;
+
+statement ok
+DETACH conflict_alias_a;

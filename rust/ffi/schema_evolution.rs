@@ -22,6 +22,7 @@ use super::util::{
     canonicalize_lance_field_path, cstr_to_str, optional_cstr_array, to_c_string, FfiError,
     FfiResult,
 };
+use super::write_guard::acquire_shared_write_guard;
 
 pub(super) fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
     dataset
@@ -230,6 +231,7 @@ fn dataset_add_columns_inner(
     } else {
         Some(batch_size)
     };
+    let _write_guard = acquire_shared_write_guard();
 
     if expressions_len == 0 {
         let transforms = NewColumnTransform::AllNulls(output_schema);
@@ -388,6 +390,7 @@ fn dataset_drop_columns_inner(
 
     let mut ds = (*handle.dataset).clone();
     let col_refs = cols.iter().map(|c| c.as_str()).collect::<Vec<_>>();
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(ds.drop_columns(&col_refs)) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -427,6 +430,7 @@ fn dataset_alter_columns_rename_inner(
 
     let mut ds = (*handle.dataset).clone();
     let alteration = ColumnAlteration::new(path).rename(new_name);
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(ds.alter_columns(&[alteration])) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -465,6 +469,7 @@ fn dataset_alter_columns_set_nullable_inner(
 
     let mut ds = (*handle.dataset).clone();
     let alteration = ColumnAlteration::new(path).set_nullable(nullable);
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(ds.alter_columns(&[alteration])) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -512,6 +517,7 @@ fn dataset_alter_columns_cast_inner(
 
     let mut ds = (*handle.dataset).clone();
     let alteration = ColumnAlteration::new(path).cast_to(new_type);
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(ds.alter_columns(&[alteration])) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -559,6 +565,7 @@ fn dataset_update_table_metadata_inner(
 
     let mut ds = (*handle.dataset).clone();
     let updates = [(key.as_str(), value)];
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(async { ds.update_metadata(updates).await }) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -606,6 +613,7 @@ fn dataset_update_config_inner(
 
     let mut ds = (*handle.dataset).clone();
     let updates = [(key.as_str(), value)];
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(async { ds.update_config(updates).await }) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -653,6 +661,7 @@ fn dataset_update_schema_metadata_inner(
 
     let mut ds = (*handle.dataset).clone();
     let updates = [(key.as_str(), value)];
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(async { ds.update_schema_metadata(updates).await }) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -712,6 +721,7 @@ fn dataset_update_field_metadata_inner(
             )
         })?;
 
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(async { builder.await }) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
@@ -768,6 +778,7 @@ fn dataset_compact_files_with_options_inner(
     let mut ds = (*handle.dataset).clone();
     let options = parse_compaction_options_json(options_json)?;
 
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(compact_files(&mut ds, options, None)) {
         Ok(Ok(metrics)) => write_metrics_json(
             &metrics,
@@ -855,6 +866,7 @@ fn dataset_cleanup_old_versions_with_options_struct(
         .before_timestamp(Utc::now() - Duration::seconds(options.older_than_seconds))
         .delete_unverified(options.delete_unverified)
         .error_if_tagged_old_versions(options.error_if_tagged_old_versions);
+    let _write_guard = acquire_shared_write_guard();
 
     if let Some(retain_n_versions) = options.retain_n_versions {
         let retain_n_versions = usize::try_from(retain_n_versions).map_err(|err| {
@@ -1094,6 +1106,7 @@ fn dataset_create_scalar_index_inner(
     let mut ds = (*handle.dataset).clone();
     let canonical_column = canonicalize_lance_field_path(ds.schema(), column, "index column")?;
     let cols = [canonical_column.as_str()];
+    let _write_guard = acquire_shared_write_guard();
     match runtime::block_on(ds.create_index(
         &cols,
         IndexType::Scalar,

@@ -148,6 +148,7 @@ set(RUST_FFI_DEPENDS
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/update.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write_guard.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/expr_ir.rs

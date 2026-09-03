@@ -18,6 +18,7 @@ use super::schema_evolution::{parse_arrow_schema, parse_batch_size_from_config};
 use super::session::record_commit;
 use super::types::DatasetHandle;
 use super::util::{cstr_to_str, optional_cstr_array, FfiError, FfiResult};
+use super::write_guard::{acquire_exclusive_write_guard, WriteGuard};
 
 /// A transaction-local Lance snapshot.
 ///
@@ -32,6 +33,8 @@ pub(crate) struct DatasetTransactionHandle {
     // Retained until DuckDB's catalog commit succeeds so a failed catalog
     // commit can restore the base snapshot.
     published: Option<Arc<Dataset>>,
+    // Held from publication through DuckDB catalog commit or compensation.
+    write_guard: Option<WriteGuard>,
 }
 
 fn transaction_handle<'a>(ptr: *mut c_void) -> FfiResult<&'a DatasetTransactionHandle> {
@@ -301,6 +304,7 @@ pub unsafe extern "C" fn lance_dataset_transaction_new(dataset: *mut c_void) -> 
             working: dataset.dataset.clone(),
             detached_versions: Vec::new(),
             published: None,
+            write_guard: None,
         })
     })();
     match result {
@@ -544,6 +548,7 @@ fn commit_dataset_transaction(handle: &mut DatasetTransactionHandle) -> FfiResul
     if handle.working.version_id() == handle.base_version {
         return Ok(());
     }
+    let write_guard = acquire_exclusive_write_guard();
     let transaction = Transaction::new(
         handle.base_version,
         Operation::Restore {
@@ -578,6 +583,7 @@ fn commit_dataset_transaction(handle: &mut DatasetTransactionHandle) -> FfiResul
         Ok(Ok(dataset)) => {
             record_commit();
             handle.published = Some(Arc::new(dataset));
+            handle.write_guard = Some(write_guard);
             Ok(())
         }
         Ok(Err(err)) => Err(FfiError::new(
@@ -699,12 +705,16 @@ pub unsafe extern "C" fn lance_dataset_transaction_free(dataset_transaction: *mu
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance::dataset::WriteParams;
 
     use super::*;
+    use crate::ffi::write_guard::acquire_shared_write_guard;
 
     #[test]
     fn compensate_restores_the_base_snapshot() {
@@ -730,6 +740,7 @@ mod tests {
             working: Arc::new(dataset),
             detached_versions: Vec::new(),
             published: None,
+            write_guard: None,
         };
         let transaction = Transaction::new(
             base_version,
@@ -761,6 +772,19 @@ mod tests {
             Some(&"published".to_string())
         );
 
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiting_writer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = acquire_shared_write_guard();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
         unsafe {
             assert_eq!(lance_dataset_transaction_compensate(handle_ptr), 0);
         }
@@ -773,10 +797,16 @@ mod tests {
                 .get("transaction-test"),
             None
         );
+        assert!(matches!(
+            acquired_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
 
         unsafe {
             lance_dataset_transaction_free(handle_ptr);
         }
+        acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiting_writer.join().unwrap();
         let _ = fs::remove_dir_all(dataset_dir);
     }
 }
