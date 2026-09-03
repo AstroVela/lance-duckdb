@@ -1091,13 +1091,9 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
             }
         };
         let index_segment_uuids = segment_bytes
-            .chunks_exact(INDEX_SEGMENT_UUID_SIZE)
-            .map(|bytes| {
-                let mut uuid = [0_u8; INDEX_SEGMENT_UUID_SIZE];
-                uuid.copy_from_slice(bytes);
-                uuid
-            })
-            .collect::<Vec<_>>();
+            .as_chunks::<INDEX_SEGMENT_UUID_SIZE>()
+            .0
+            .to_vec();
         if index_segment_uuids.contains(&[0; INDEX_SEGMENT_UUID_SIZE])
             || index_segment_uuids
                 .windows(2)
