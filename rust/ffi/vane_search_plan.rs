@@ -306,7 +306,7 @@ impl SearchIndexPlan {
             {
                 bail!("SearchIndexPlan {name} branch has invalid fragment coverage");
             }
-            if branch.use_index != !branch.selected.is_empty() {
+            if branch.use_index == branch.selected.is_empty() {
                 bail!("SearchIndexPlan {name} branch has an inconsistent index decision");
             }
             for metadata in &branch.selected {

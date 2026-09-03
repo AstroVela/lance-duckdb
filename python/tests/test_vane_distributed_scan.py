@@ -2576,9 +2576,15 @@ def test_large_vector_searches_outside_phase_one_remain_final_search(
         _write_vector_candidate_dataset(connection, path)
         searches = (
             (
-                "indexed",
+                "indexed-default-probes",
                 "SELECT id FROM lance_vector_search("
                 f"{path_sql}, 'vec', {query}, k = 8, use_index = true)",
+            ),
+            (
+                "indexed-fixed-probes",
+                "SELECT id FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 8, nprobs = 1, "
+                "use_index = true)",
             ),
             (
                 "postfilter",
@@ -3100,7 +3106,14 @@ def test_indexed_partial_coverage_global_search_matches_native(
 
         searches = (
             (
-                "indexed-vector",
+                "indexed-vector-fixed-probes-no-refine",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+                "k = 5, nprobs = 1, use_index = true) "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "indexed-vector-refine",
                 "SELECT id, _distance FROM lance_vector_search("
                 f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
                 "k = 5, nprobs = 1, refine_factor = 2, use_index = true) "
