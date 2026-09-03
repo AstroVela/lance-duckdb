@@ -6,6 +6,8 @@ use lance::session::Session;
 use lance::Dataset;
 use lance_core::cache::CacheBackend;
 
+#[cfg(feature = "vane-distributed")]
+use super::vane_distributed_search::VectorCandidateStream;
 use crate::datafusion_stream::DataFusionStream;
 use crate::scanner::{LanceStream, LanceTakeStream};
 
@@ -61,6 +63,8 @@ impl DatasetHandle {
 
 pub(crate) enum StreamHandle {
     Lance(LanceStream),
+    #[cfg(feature = "vane-distributed")]
+    VectorCandidates(VectorCandidateStream),
     Take(LanceTakeStream),
     DataFusion(DataFusionStream),
     Batches(std::vec::IntoIter<RecordBatch>),
@@ -70,6 +74,8 @@ impl StreamHandle {
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>, anyhow::Error> {
         match self {
             StreamHandle::Lance(stream) => stream.next().map_err(anyhow::Error::new),
+            #[cfg(feature = "vane-distributed")]
+            StreamHandle::VectorCandidates(stream) => stream.next(),
             StreamHandle::Take(stream) => stream.next().map_err(anyhow::Error::new),
             StreamHandle::DataFusion(stream) => stream.next().map_err(anyhow::Error::new),
             StreamHandle::Batches(iter) => Ok(iter.next()),

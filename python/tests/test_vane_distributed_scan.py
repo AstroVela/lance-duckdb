@@ -29,6 +29,9 @@ from vane.runners.ray import set_runner_ray
 from packaged_dynamic_extension import load_packaged_dynamic_lance
 
 WORKER_COUNT = 2
+VECTOR_CANDIDATE_DIMENSION = 256
+VECTOR_CANDIDATE_ROWS = 4608
+VECTOR_CANDIDATE_ROWS_PER_FRAGMENT = 512
 STABLE_ROW_ID_FIXTURE = (
     Path(__file__).resolve().parents[2] / "test/data/stable_row_ids.lance"
 )
@@ -1411,6 +1414,46 @@ def _write_dataset(
     )
 
 
+def _write_vector_candidate_dataset(connection, path: str | Path) -> None:
+    # Persist the label as Arrow LargeUtf8, then restore the regular-offset
+    # setting before search. This keeps the physical Lance layout different
+    # from a schema synthesized from DuckDB's VARCHAR logical type.
+    connection.execute("SET arrow_output_version = '1.0'")
+    connection.execute("SET arrow_large_buffer_size = true")
+    try:
+        connection.execute(
+            "COPY (SELECT i::BIGINT AS id, (i % 3 = 1) AS keep, "
+            "('label-' || i::VARCHAR)::VARCHAR AS label, "
+            "CASE WHEN i = 24 THEN NULL ELSE "
+            "struct_pack(label := i::BIGINT, even := (i % 2 = 0)) END AS payload, "
+            f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> "
+            "CASE WHEN x = 0 THEN (i % 8)::FLOAT ELSE 0.0::FLOAT END)"
+            f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}] AS vec "
+            f"FROM range({VECTOR_CANDIDATE_ROWS}) AS source(i)) "
+            f"TO {_sql_literal(path)} "
+            "(FORMAT LANCE, MODE 'create', "
+            f"MAX_ROWS_PER_FILE {VECTOR_CANDIDATE_ROWS_PER_FRAGMENT})"
+        )
+    finally:
+        connection.execute("SET arrow_large_buffer_size = false")
+
+
+def _zero_vector_sql() -> str:
+    return (
+        f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), "
+        "x -> 0.0::FLOAT)"
+        f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}]"
+    )
+
+
+def _overflow_vector_sql() -> str:
+    return (
+        f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), "
+        "x -> CASE WHEN x = 0 THEN 3e20::FLOAT ELSE 0.0::FLOAT END)"
+        f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}]"
+    )
+
+
 def _physical_plan(connection, relation):
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation, f"lance-distributed-scan-{uuid.uuid4()}"
@@ -1618,6 +1661,27 @@ def _search_task_assignment_details(batch: bytes) -> tuple[str, bytes, int, int]
     digest_offset = variant_offset + len(variant_marker)
     assert len(singleton[digest_offset : digest_offset + 32]) == 32
     return task_id, singleton, variant_offset, digest_offset
+
+
+def _vector_candidate_assignment_details(
+    batch: bytes,
+) -> list[tuple[str, bytes, int, int, int]]:
+    result: list[tuple[str, bytes, int, int, int]] = []
+    for task_id, singleton, _ in vane.ray_cxx.split_scan_split_batch(batch):
+        assert task_id.startswith("vector-candidates:")
+        _, search_uuid, fragment_text = task_id.split(":", 2)
+        fragment_id = int(fragment_text)
+        singleton = bytes(singleton)
+        variant_marker = b"\x01" + search_uuid.encode()
+        assert singleton.count(variant_marker) == 1
+        variant_offset = singleton.index(variant_marker)
+        digest_offset = variant_offset + len(variant_marker)
+        payload_end = digest_offset + 32 + 8
+        payload = singleton[variant_offset:payload_end]
+        assert len(payload) == 77
+        assert int.from_bytes(payload[-8:], "little") == fragment_id
+        result.append((task_id, singleton, variant_offset, digest_offset, fragment_id))
+    return result
 
 
 def _rewrite_search_task_assignment_payload(batch: bytes, payload: bytes) -> bytes:
@@ -2293,6 +2357,259 @@ def test_global_search_overloads_match_native_and_emit_one_task(ray_runner) -> N
         connection.close()
 
 
+def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
+    tmp_path: Path, ray_cluster: frozenset[str], ray_runner
+) -> None:
+    import ray
+
+    connection = _connect()
+    path = tmp_path / "vector_candidates.lance"
+    path_sql = _sql_literal(path)
+    query = _zero_vector_sql()
+    overflow_query = _overflow_vector_sql()
+    try:
+        _write_vector_candidate_dataset(connection, path)
+        connection.execute(
+            f"ATTACH {_sql_literal(tmp_path)} AS vector_candidate_ns "
+            "(TYPE LANCE, READ_ONLY false)"
+        )
+        connection.execute(
+            "DELETE FROM vector_candidate_ns.main.vector_candidates "
+            "WHERE id IN (0, 8, 16)"
+        )
+        searches = (
+            (
+                "unfiltered",
+                "SELECT id, keep, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, use_index = false) "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "small-k",
+                "SELECT _distance, id FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "distance-only",
+                "SELECT _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
+                "ORDER BY _distance",
+            ),
+            (
+                "large-string",
+                "SELECT id, label, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "count-only",
+                "SELECT count(*) FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false)",
+            ),
+            (
+                "constant-only",
+                "SELECT 1 FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false)",
+            ),
+            (
+                "nested-projection",
+                "SELECT id, payload.label, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "non-finite-distance",
+                "SELECT id, isinf(_distance) FROM lance_vector_search("
+                f"{path_sql}, 'vec', {overflow_query}, k = 3, "
+                "use_index = false) ORDER BY id",
+            ),
+            (
+                "prefilter",
+                "SELECT id, keep, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, prefilter = true, "
+                "use_index = false) WHERE keep ORDER BY _distance, id",
+            ),
+            (
+                "empty-prefilter",
+                "SELECT id, keep, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, prefilter = true, "
+                "use_index = false) WHERE id < 0 ORDER BY _distance, id",
+            ),
+        )
+
+        for name, sql in searches:
+            expected_sql = sql.replace("use_index = false", "use_index = true")
+            assert expected_sql != sql
+            expected = connection.execute(expected_sql).fetchall()
+            if name == "unfiltered":
+                assert [row[0] for row in expected] == [
+                    index * 8 for index in range(3, 36)
+                ]
+            elif name == "small-k":
+                # Fragment zero alone has far more than k equal-distance rows;
+                # these are its deterministic (_distance, _rowid) local winners.
+                assert [row[1] for row in expected] == [24, 32, 40]
+            elif name == "distance-only":
+                assert expected == [(0.0,), (0.0,), (0.0,)]
+            elif name == "large-string":
+                assert expected == [
+                    (24, "label-24", 0.0),
+                    (32, "label-32", 0.0),
+                    (40, "label-40", 0.0),
+                ]
+            elif name == "count-only":
+                assert expected == [(3,)]
+            elif name == "constant-only":
+                assert expected == [(1,), (1,), (1,)]
+            elif name == "nested-projection":
+                assert [row[0] for row in expected] == [24, 32, 40]
+                assert [row[1] for row in expected] == [None, 32, 40]
+            elif name == "non-finite-distance":
+                assert expected == [(1, True), (2, True), (3, True)]
+            elif name == "empty-prefilter":
+                assert expected == []
+
+            relation = connection.sql(sql)
+            details = [
+                detail
+                for batches in _split_batches(connection, relation).values()
+                for batch in batches
+                for detail in _vector_candidate_assignment_details(batch)
+            ]
+            task_ids = [detail[0] for detail in details]
+            fragment_ids = [detail[4] for detail in details]
+            assert len(details) >= 2, name
+            assert len(task_ids) == len(set(task_ids)), name
+            assert len(fragment_ids) == len(set(fragment_ids)), name
+            expected_fragment_count = (
+                VECTOR_CANDIDATE_ROWS + VECTOR_CANDIDATE_ROWS_PER_FRAGMENT - 1
+            ) // VECTOR_CANDIDATE_ROWS_PER_FRAGMENT
+            assert set(fragment_ids) == set(range(expected_fragment_count)), name
+            assert all(detail[1][detail[2]] == 1 for detail in details), name
+            assert all(
+                detail[1].count(b"lance.search-task") == 1 for detail in details
+            ), name
+
+            baseline_task_ids = set(_settled_ray_fte_create_task_locations())
+            assert _run(ray_runner, relation) == expected, name
+            if name == "unfiltered":
+                execution_node_ids = _ray_fte_create_task_node_ids(
+                    baseline_task_ids, expected_count=WORKER_COUNT
+                )
+                assert execution_node_ids == set(ray_cluster)
+                _assert_vane_worker_topology(ray, ray_runner)
+    finally:
+        connection.close()
+
+
+def test_namespace_vector_outer_filter_remains_after_top_k(
+    tmp_path: Path, ray_runner
+) -> None:
+    connection = _connect()
+    path = tmp_path / "namespace_vector_candidates.lance"
+    query = _zero_vector_sql()
+    source = _sql_literal("namespace_candidate_ns.main.namespace_vector_candidates")
+    try:
+        _write_vector_candidate_dataset(connection, path)
+        connection.execute(
+            f"ATTACH {_sql_literal(tmp_path)} AS namespace_candidate_ns " "(TYPE LANCE)"
+        )
+        candidate_call = (
+            "lance_vector_search("
+            f"{source}, 'vec', {query}, k = 3, prefilter = true, "
+            "use_index = false, filter = 'id >= 0')"
+        )
+        native_call = candidate_call.replace("use_index = false", "use_index = true")
+
+        eligible = connection.sql(
+            f"SELECT id FROM {candidate_call} ORDER BY _distance, id"
+        )
+        eligible_details = [
+            detail
+            for batches in _split_batches(connection, eligible).values()
+            for batch in batches
+            for detail in _vector_candidate_assignment_details(batch)
+        ]
+        assert (
+            len(eligible_details)
+            == (VECTOR_CANDIDATE_ROWS + VECTOR_CANDIDATE_ROWS_PER_FRAGMENT - 1)
+            // VECTOR_CANDIDATE_ROWS_PER_FRAGMENT
+        )
+
+        top = connection.execute(
+            f"SELECT id FROM {native_call} ORDER BY _distance, id LIMIT 1"
+        ).fetchone()
+        assert top == (0,)
+        sql = (
+            f"SELECT id FROM {candidate_call} WHERE id <> {top[0]} "
+            "ORDER BY _distance, id"
+        )
+        expected = connection.execute(
+            f"SELECT id FROM {native_call} WHERE id <> {top[0]} "
+            "ORDER BY _distance, id"
+        ).fetchall()
+        assert expected == [(8,), (16,)]
+
+        relation = connection.sql(sql)
+        flattened = [
+            batch
+            for batches in _split_batches(connection, relation).values()
+            for batch in batches
+        ]
+        assert len(flattened) == 1
+        _, singleton, variant_offset, _ = _search_task_assignment_details(flattened[0])
+        assert singleton[variant_offset] == 0
+        assert _run(ray_runner, relation) == expected
+    finally:
+        connection.close()
+
+
+def test_large_vector_searches_outside_phase_one_remain_final_search(
+    tmp_path: Path,
+) -> None:
+    connection = _connect()
+    path = tmp_path / "vector-candidate-routing.lance"
+    path_sql = _sql_literal(path)
+    query = _zero_vector_sql()
+    try:
+        _write_vector_candidate_dataset(connection, path)
+        searches = (
+            (
+                "indexed",
+                "SELECT id FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 8, use_index = true)",
+            ),
+            (
+                "postfilter",
+                "SELECT id FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 8, prefilter = false, "
+                "use_index = false) WHERE keep",
+            ),
+            (
+                "computed-postfilter",
+                "SELECT id FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 8, prefilter = true, "
+                "use_index = false) WHERE keep AND _distance >= 0",
+            ),
+        )
+        for name, sql in searches:
+            relation = connection.sql(sql)
+            flattened = [
+                batch
+                for batches in _split_batches(connection, relation).values()
+                for batch in batches
+            ]
+            assert len(flattened) == 1, name
+            task_id, singleton, variant_offset, _ = _search_task_assignment_details(
+                flattened[0]
+            )
+            assert task_id.startswith("final-search:"), name
+            assert singleton[variant_offset] == 0, name
+    finally:
+        connection.close()
+
+
 def test_global_search_computed_score_postfilters_match_native(ray_runner) -> None:
     path = (
         Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
@@ -2693,8 +3010,8 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
 
             invalid_variant = bytearray(singleton)
             invalid_variant[variant_offset] = 0xFF
-            reserved_variant = bytearray(singleton)
-            reserved_variant[variant_offset] = 1
+            candidate_without_fragment = bytearray(singleton)
+            candidate_without_fragment[variant_offset] = 1
             foreign_digest = bytearray(singleton)
             foreign_digest[digest_offset] ^= 1
             truncated_assignment = _rewrite_search_task_assignment_payload(
@@ -2712,8 +3029,8 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
                     "SearchTaskAssignment payload has an invalid variant",
                 ),
                 (
-                    bytes(reserved_variant),
-                    "unsupported SearchTaskAssignment variant",
+                    bytes(candidate_without_fragment),
+                    "SearchTaskAssignment payload has an invalid size",
                 ),
                 (bytes(foreign_digest), "different global state"),
                 (foreign_singleton, "unauthorized SearchTaskAssignment identity"),

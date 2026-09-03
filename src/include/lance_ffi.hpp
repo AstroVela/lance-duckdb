@@ -170,6 +170,17 @@ void *lance_vane_create_knn_stream_ir(
     const uint8_t *namespace_filter_plan, size_t namespace_filter_plan_len,
     uint8_t prefilter, uint8_t use_index, const uint8_t *index_plan,
     size_t index_plan_len);
+void *lance_vane_create_vector_candidate_stream_ir(
+    void *dataset, const char *generation, const char *vector_column,
+    const float *query_values, size_t query_len, uint64_t k,
+    const uint8_t *filter_ir, size_t filter_ir_len,
+    const uint8_t *namespace_filter_plan, size_t namespace_filter_plan_len,
+    uint8_t prefilter, const uint8_t *index_plan, size_t index_plan_len,
+    const uint64_t *fragment_ids, size_t fragment_ids_len);
+void *lance_vane_take_vector_rows(void *dataset, const uint64_t *row_ids,
+                                  const float *distances, size_t len,
+                                  const char *const *columns,
+                                  size_t columns_len);
 void *lance_vane_create_fts_stream_ir(
     void *dataset, const char *generation, const char *text_column,
     const char *query, uint64_t k, const uint8_t *filter_ir,

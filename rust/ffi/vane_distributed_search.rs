@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -29,13 +30,53 @@ use super::dataset::{load_supported_raw_index_metadata, MAX_SERIALIZED_INDEX_SEC
 use super::projection;
 use super::types::{DatasetHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, dataset_handle, nonzero_u64_to_usize, parse_optional_filter_ir, slice_from_ptr,
-    FfiError, FfiResult,
+    cstr_to_str, dataset_handle, nonzero_u64_to_usize, optional_cstr_array,
+    parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult,
 };
 use super::vane_search_plan::{build_search_index_plan, SearchIndexPlan, SearchKind};
 
 const NAMESPACE_FILTER_VERSION: u16 = 1;
 const NAMESPACE_FILTER_HEADER_LEN: usize = 6;
+
+pub(crate) struct VectorCandidateStream {
+    inner: LanceStream,
+}
+
+impl VectorCandidateStream {
+    fn new(inner: LanceStream) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn next(&mut self) -> anyhow::Result<Option<RecordBatch>> {
+        let Some(batch) = self.inner.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(reorder_vector_candidate_batch(batch)?))
+    }
+}
+
+fn reorder_vector_candidate_batch(batch: RecordBatch) -> anyhow::Result<RecordBatch> {
+    let schema = batch.schema();
+    let row_id_index = schema.index_of(ROW_ID_COLUMN)?;
+    let distance_index = schema.index_of(DISTANCE_COLUMN)?;
+    if schema.field(row_id_index).data_type() != &DataType::UInt64
+        || schema.field(distance_index).data_type() != &DataType::Float32
+    {
+        anyhow::bail!("vector candidate stream returned an invalid schema");
+    }
+    let fields = vec![
+        schema.field(row_id_index).clone(),
+        schema.field(distance_index).clone(),
+    ];
+    let columns = vec![
+        batch.column(row_id_index).clone(),
+        batch.column(distance_index).clone(),
+    ];
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
 
 unsafe fn optional_cstr<'a>(
     value: *const c_char,
@@ -612,6 +653,11 @@ fn create_exact_vector_stream(
         scan.filter_expr(filter);
     }
     let query = Float32Array::from_iter_values(query_values.iter().copied());
+    // For exact flat search, Lance applies the fetch after sorting by
+    // (_distance ASC, _rowid ASC).  The distributed local-k/global-k
+    // equivalence relies on that upstream tie-break contract; the Ray
+    // regression test deliberately places more than k equal-distance rows in
+    // one fragment.
     scan.nearest(vector_column, &query, k).map_err(|err| {
         FfiError::new(
             ErrorCode::KnnStreamCreate,
@@ -877,6 +923,203 @@ pub unsafe extern "C" fn lance_vane_create_knn_stream_ir(
         )?))
     })();
     stream_result(result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
+    dataset: *mut c_void,
+    generation: *const c_char,
+    vector_column: *const c_char,
+    query_values: *const f32,
+    query_len: usize,
+    k: u64,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    namespace_filter_plan: *const u8,
+    namespace_filter_plan_len: usize,
+    prefilter: u8,
+    index_plan: *const u8,
+    index_plan_len: usize,
+    fragment_ids: *const u64,
+    fragment_ids_len: usize,
+) -> *mut c_void {
+    let result = (|| -> FfiResult<StreamHandle> {
+        // SAFETY: C++ passes a live dataset handle created by this FFI module.
+        let handle = unsafe { dataset_handle(dataset)? };
+        // SAFETY: C++ passes NUL-terminated strings that remain live for this call.
+        let generation = unsafe { cstr_to_str(generation, "generation")? };
+        // SAFETY: C++ passes a NUL-terminated string that remains live for this call.
+        let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
+        // SAFETY: C++ passes query_len readable f32 values for the duration of this call.
+        let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
+        // SAFETY: C++ passes fragment_ids_len readable u64 values for this call.
+        let fragment_ids =
+            unsafe { slice_from_ptr(fragment_ids, fragment_ids_len, "fragment_ids")? };
+        if fragment_ids.is_empty() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "vector candidate assignment must contain a fragment",
+            ));
+        }
+        if fragment_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "vector candidate fragment ids must be sorted and unique",
+            ));
+        }
+        let k = nonzero_u64_to_usize(k, "k")?;
+        // SAFETY: C++ passes the frozen plan buffer and its exact byte length.
+        let bytes = unsafe { parse_index_plan(index_plan, index_plan_len)? };
+        let validated = runtime_result(
+            runtime::block_on(validate_plan(
+                handle,
+                bytes,
+                generation,
+                SearchKind::Vector,
+                Some(vector_column),
+                None,
+                false,
+            )),
+            "validate SearchIndexPlan",
+        )?;
+        // SAFETY: C++ passes each optional serialized filter buffer with its exact length.
+        let filter = unsafe {
+            combined_filter(
+                filter_ir,
+                filter_ir_len,
+                namespace_filter_plan,
+                namespace_filter_plan_len,
+                ErrorCode::KnnStreamCreate,
+            )?
+        };
+        if filter.is_some() && prefilter == 0 {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "vector candidates do not support post-filter search",
+            ));
+        }
+
+        let mut fragments_by_id = validated
+            .fragments
+            .into_iter()
+            .map(|fragment| (fragment.id, fragment))
+            .collect::<HashMap<_, _>>();
+        let mut selected = Vec::with_capacity(fragment_ids.len());
+        for fragment_id in fragment_ids {
+            let fragment = fragments_by_id.remove(fragment_id).ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("vector candidate fragment {fragment_id} is not in the frozen plan"),
+                )
+            })?;
+            selected.push(fragment);
+        }
+
+        Ok(StreamHandle::VectorCandidates(VectorCandidateStream::new(
+            create_exact_vector_stream(
+                handle,
+                vector_column,
+                query_values,
+                k,
+                0,
+                0,
+                filter,
+                prefilter != 0,
+                false,
+                selected,
+                Vec::new(),
+                true,
+            )?,
+        )))
+    })();
+    stream_result(result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_take_vector_rows(
+    dataset: *mut c_void,
+    row_ids: *const u64,
+    distances: *const f32,
+    len: usize,
+    columns: *const *const c_char,
+    columns_len: usize,
+) -> *mut c_void {
+    let result = (|| -> FfiResult<RecordBatch> {
+        // SAFETY: C++ passes a live dataset handle created by this FFI module.
+        let handle = unsafe { dataset_handle(dataset)? };
+        // SAFETY: C++ passes len readable row ids for the duration of this call.
+        let row_ids = unsafe { slice_from_ptr(row_ids, len, "row_ids")? };
+        // SAFETY: C++ passes len readable distances for the duration of this call.
+        let distances = unsafe { slice_from_ptr(distances, len, "distances")? };
+        // SAFETY: C++ passes columns_len live NUL-terminated column names for this call.
+        let columns =
+            unsafe { optional_cstr_array(columns, columns_len, "vector materialization columns")? };
+        if row_ids.is_empty() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "vector materialization requires at least one row",
+            ));
+        }
+        let mut unique_columns = HashSet::with_capacity(columns.len());
+        for column in &columns {
+            if column == DISTANCE_COLUMN
+                || !handle
+                    .base_projection
+                    .iter()
+                    .any(|candidate| candidate == column)
+                || !unique_columns.insert(column.as_str())
+            {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid vector materialization column: {column}"),
+                ));
+            }
+        }
+
+        let (mut arrays, mut fields) = if columns.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let projection = ProjectionRequest::from_columns(&columns, handle.dataset.schema());
+            let rows = runtime_result(
+                runtime::block_on(handle.dataset.take_rows(row_ids, projection)),
+                "vector take_rows",
+            )?;
+            if rows.num_rows() != row_ids.len() {
+                return Err(FfiError::new(
+                    ErrorCode::KnnStreamCreate,
+                    "vector take_rows returned an unexpected row count",
+                ));
+            }
+            (
+                rows.columns().to_vec(),
+                rows.schema().fields().iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+
+        arrays.push(Arc::new(Float32Array::from(distances.to_vec())) as Arc<dyn Array>);
+        fields.push(Arc::new(Field::new(
+            DISTANCE_COLUMN,
+            DataType::Float32,
+            false,
+        )));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|err| {
+            FfiError::new(
+                ErrorCode::KnnStreamCreate,
+                format!("vector materialization batch: {err}"),
+            )
+        })
+    })();
+
+    match result {
+        Ok(batch) => {
+            clear_last_error();
+            Box::into_raw(Box::new(batch)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
 }
 
 #[no_mangle]
@@ -1255,6 +1498,50 @@ mod tests {
     use std::ffi::CString;
 
     use super::*;
+
+    #[test]
+    fn vector_candidates_are_reordered_by_name_and_type() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(DISTANCE_COLUMN, DataType::Float32, false),
+                Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(Float32Array::from(vec![0.25, 0.5])) as Arc<dyn Array>,
+                Arc::new(UInt64Array::from(vec![9, 12])) as Arc<dyn Array>,
+            ],
+        )
+        .expect("input batch");
+
+        let reordered = reorder_vector_candidate_batch(batch).expect("reorder");
+        assert_eq!(
+            reordered
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect::<Vec<_>>(),
+            vec![ROW_ID_COLUMN, DISTANCE_COLUMN]
+        );
+        assert_eq!(
+            reordered
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("row ids")
+                .values(),
+            &[9, 12]
+        );
+        assert_eq!(
+            reordered
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("distances")
+                .values(),
+            &[0.25, 0.5]
+        );
+    }
 
     #[test]
     fn hybrid_normalization_matches_native_constant_range_rule() {
