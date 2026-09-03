@@ -23,7 +23,7 @@ FROM (
 # staged Dataset instead of retaining the bind-time choice.
 statement ok
 PREPARE prepared_vector_search AS
-SELECT id
+SELECT id, _distance >= 0 AS metric_ok
 FROM lance_vector_search(
   'search_txn_ns.main.search_transaction',
   'vec',
@@ -34,7 +34,7 @@ FROM lance_vector_search(
 
 statement ok
 PREPARE prepared_fts_search AS
-SELECT id
+SELECT id, _score > 0 AS metric_ok
 FROM lance_fts(
   'search_txn_ns.main.search_transaction',
   'text',
@@ -44,7 +44,7 @@ FROM lance_fts(
 
 statement ok
 PREPARE prepared_hybrid_search AS
-SELECT id
+SELECT id, _hybrid_score >= 0 AS metric_ok
 FROM lance_hybrid_search(
   'search_txn_ns.main.search_transaction',
   'vec',
@@ -69,24 +69,31 @@ FROM search_txn_ns.main.search_transaction;
 statement ok
 BEGIN TRANSACTION;
 
+# Adding a field after PREPARE must not shift the search metric columns in the
+# runtime Arrow batches.
+statement ok
+ALTER TABLE search_txn_ns.main.search_transaction
+ADD COLUMN prepared_marker BIGINT DEFAULT -1;
+
 statement ok
 INSERT INTO search_txn_ns.main.search_transaction
+  (id, text, label, vec)
 VALUES (3, 'staged needle', 3, [0.0, 0.0]);
 
-query I
+query II
 EXECUTE prepared_vector_search;
 ----
-3
+3	true
 
-query I
+query II
 EXECUTE prepared_fts_search;
 ----
-3
+3	true
 
-query I
+query II
 EXECUTE prepared_hybrid_search;
 ----
-3
+3	true
 
 query I
 EXECUTE prepared_table_scan;
@@ -105,15 +112,15 @@ ROLLBACK;
 
 # A later execution has no workspace and must return to namespace query_table
 # instead of retaining the previously opened detached snapshot.
-query I
+query II
 EXECUTE prepared_vector_search;
 ----
-1
+1	true
 
-query I
+query II
 EXECUTE prepared_hybrid_search;
 ----
-1
+1	true
 
 query I
 EXECUTE prepared_table_scan;

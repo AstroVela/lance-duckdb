@@ -17,8 +17,8 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize, parse_optional_filter_ir,
-    parse_optional_search_filter, slice_from_ptr, FfiError, FfiResult,
+    cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize, optional_cstr_array,
+    parse_optional_filter_ir, parse_optional_search_filter, slice_from_ptr, FfiError, FfiResult,
 };
 
 #[no_mangle]
@@ -85,6 +85,8 @@ pub unsafe extern "C" fn lance_create_fts_stream_ir(
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
+    columns: *const *const c_char,
+    columns_len: usize,
 ) -> *mut c_void {
     match create_fts_stream_ir_inner(
         dataset,
@@ -95,6 +97,8 @@ pub unsafe extern "C" fn lance_create_fts_stream_ir(
         filter_ir,
         filter_ir_len,
         prefilter,
+        columns,
+        columns_len,
     ) {
         Ok(stream) => {
             clear_last_error();
@@ -117,6 +121,8 @@ fn create_fts_stream_ir_inner(
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
+    columns: *const *const c_char,
+    columns_len: usize,
 ) -> FfiResult<StreamHandle> {
     let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
     let query = unsafe { cstr_to_str(query, "query")? };
@@ -133,7 +139,11 @@ fn create_fts_stream_ir_inner(
             "fts filter",
         )?
     };
-    let projection = handle.fts_projection.clone();
+    let mut projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
+    if projection.is_empty() {
+        projection.extend(handle.base_projection.iter().cloned());
+    }
+    projection.push(SCORE_COLUMN.to_string());
 
     let fts_query = FullTextSearchQuery::new(query.to_string())
         .with_column(text_column.to_string())
@@ -152,7 +162,7 @@ fn create_fts_stream_ir_inner(
         )
     })?;
     scan.disable_scoring_autoprojection();
-    scan.project(projection.as_ref()).map_err(|err| {
+    scan.project(&projection).map_err(|err| {
         FfiError::new(
             ErrorCode::FtsStreamCreate,
             format!("fts scan project: {err}"),
@@ -205,6 +215,8 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
     use_index: u8,
     alpha: f32,
     oversample_factor: u32,
+    columns: *const *const c_char,
+    columns_len: usize,
 ) -> *mut c_void {
     match create_hybrid_stream_ir_inner(
         dataset,
@@ -222,6 +234,8 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
         use_index,
         alpha,
         oversample_factor,
+        columns,
+        columns_len,
     ) {
         Ok(stream) => {
             clear_last_error();
@@ -251,6 +265,8 @@ fn create_hybrid_stream_ir_inner(
     use_index: u8,
     alpha: f32,
     oversample_factor: u32,
+    columns: *const *const c_char,
+    columns_len: usize,
 ) -> FfiResult<StreamHandle> {
     if query_len == 0 {
         return Err(FfiError::new(
@@ -273,8 +289,10 @@ fn create_hybrid_stream_ir_inner(
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let rows = create_hybrid_batch(
         handle,
+        &projection,
         vector_column,
         query_values,
         text_column,
@@ -295,6 +313,7 @@ fn create_hybrid_stream_ir_inner(
 #[allow(clippy::too_many_arguments)]
 fn create_hybrid_batch(
     handle: &super::types::DatasetHandle,
+    bound_projection: &[String],
     vector_column: &str,
     query_values: &[f32],
     text_column: &str,
@@ -453,8 +472,12 @@ fn create_hybrid_batch(
     ranked.truncate(k);
 
     let row_ids: Vec<u64> = ranked.iter().map(|(rowid, _, _, _)| *rowid).collect();
-    let projection =
-        ProjectionRequest::from_columns(handle.base_projection.as_ref(), handle.dataset.schema());
+    let projection_columns = if bound_projection.is_empty() {
+        handle.base_projection.as_ref()
+    } else {
+        bound_projection
+    };
+    let projection = ProjectionRequest::from_columns(projection_columns, handle.dataset.schema());
     let rows = match runtime::block_on(handle.dataset.take_rows(&row_ids, projection)) {
         Ok(Ok(batch)) => batch,
         Ok(Err(err)) => {

@@ -3,6 +3,7 @@ use std::ptr;
 
 use arrow_array::Float32Array;
 
+use crate::constants::DISTANCE_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use crate::scanner::LanceStream;
@@ -10,8 +11,8 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_usize, parse_optional_search_filter, slice_from_ptr, to_c_string,
-    FfiError, FfiResult,
+    cstr_to_str, nonzero_u64_to_usize, optional_cstr_array, parse_optional_search_filter,
+    slice_from_ptr, to_c_string, FfiError, FfiResult,
 };
 
 #[no_mangle]
@@ -114,6 +115,8 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     filter_ir_len: usize,
     prefilter: u8,
     use_index: u8,
+    columns: *const *const c_char,
+    columns_len: usize,
 ) -> *mut c_void {
     match create_knn_stream_ir_inner(
         dataset,
@@ -128,6 +131,8 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         filter_ir_len,
         prefilter,
         use_index,
+        columns,
+        columns_len,
     ) {
         Ok(stream) => {
             clear_last_error();
@@ -154,6 +159,8 @@ fn create_knn_stream_ir_inner(
     filter_ir_len: usize,
     prefilter: u8,
     use_index: u8,
+    columns: *const *const c_char,
+    columns_len: usize,
 ) -> FfiResult<StreamHandle> {
     if query_len == 0 {
         return Err(FfiError::new(
@@ -176,7 +183,11 @@ fn create_knn_stream_ir_inner(
             "knn filter",
         )?
     };
-    let projection = projection::build_knn_projection(&handle.base_projection);
+    let mut projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
+    if projection.is_empty() {
+        projection.extend(handle.base_projection.iter().cloned());
+    }
+    projection.push(DISTANCE_COLUMN.to_string());
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
@@ -203,7 +214,7 @@ fn create_knn_stream_ir_inner(
     }
     scan.use_index(use_index != 0);
     scan.disable_scoring_autoprojection();
-    scan.project(projection.as_ref()).map_err(|err| {
+    scan.project(&projection).map_err(|err| {
         FfiError::new(
             ErrorCode::KnnStreamCreate,
             format!("knn scan project: {err}"),

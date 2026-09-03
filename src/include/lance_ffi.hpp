@@ -290,7 +290,8 @@ void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  uint64_t k, uint64_t nprobes,
                                  uint64_t refine_factor, const char *filter_sql,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
-                                 uint8_t prefilter, uint8_t use_index);
+                                 uint8_t prefilter, uint8_t use_index,
+                                 const char **columns, size_t columns_len);
 
 const char *lance_explain_knn_scan_ir(
     void *dataset, const char *vector_column, const float *query_values,
@@ -304,7 +305,8 @@ void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
                                  const char *query, uint64_t k,
                                  const char *filter_sql,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
-                                 uint8_t prefilter);
+                                 uint8_t prefilter, const char **columns,
+                                 size_t columns_len);
 
 typedef struct LanceNamespaceQueryConfig {
   uint8_t namespace_kind;
@@ -355,7 +357,8 @@ void *lance_create_hybrid_stream_ir(
     size_t query_len, const char *text_column, const char *text_query,
     uint64_t k, uint64_t nprobes, uint64_t refine_factor,
     const uint8_t *filter_ir, size_t filter_ir_len, uint8_t prefilter,
-    uint8_t use_index, float alpha, uint32_t oversample_factor);
+    uint8_t use_index, float alpha, uint32_t oversample_factor,
+    const char **columns, size_t columns_len);
 
 // Index DDL / metadata
 int32_t lance_dataset_create_index(void *dataset, const char *index_name,
