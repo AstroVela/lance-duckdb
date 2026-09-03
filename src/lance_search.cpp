@@ -1946,6 +1946,13 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
           LanceVaneSearchTaskVariant::FINAL_SEARCH) {
     return op;
   }
+  for (auto &column : get.GetColumnIds()) {
+    if (column.IsEmptyColumn()) {
+      // The empty virtual column carries cardinality rather than a Lance
+      // result column, so it cannot be materialized by physical column index.
+      return op;
+    }
+  }
   if (bind_data.complex_filter_pushdown_failed) {
     // This can represent a computed or mixed postfilter that the normal
     // FINAL_SEARCH path preserves above the scan. Candidate admission must

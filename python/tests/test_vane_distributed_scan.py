@@ -2388,6 +2388,16 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
                 "ORDER BY _distance",
             ),
             (
+                "count-only",
+                "SELECT count(*) FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false)",
+            ),
+            (
+                "constant-only",
+                "SELECT 1 FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 3, use_index = false)",
+            ),
+            (
                 "nested-projection",
                 "SELECT id, payload.label, _distance FROM lance_vector_search("
                 f"{path_sql}, 'vec', {query}, k = 3, use_index = false) "
@@ -2427,6 +2437,10 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
                 assert [row[1] for row in expected] == [24, 32, 40]
             elif name == "distance-only":
                 assert expected == [(0.0,), (0.0,), (0.0,)]
+            elif name == "count-only":
+                assert expected == [(3,)]
+            elif name == "constant-only":
+                assert expected == [(1,), (1,), (1,)]
             elif name == "nested-projection":
                 assert [row[0] for row in expected] == [24, 32, 40]
                 assert [row[1] for row in expected] == [None, 32, 40]
