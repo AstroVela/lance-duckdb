@@ -2037,7 +2037,7 @@ public:
       auto &pending = datasets[dataset_idx];
       auto rc = lance_dataset_transaction_commit(pending.transaction);
       if (rc != 0) {
-        finish_dataset_transactions(false, false);
+        finish_dataset_transactions(false, true);
         for (auto &append : appends) {
           lance_free_transaction(append.transaction);
         }
