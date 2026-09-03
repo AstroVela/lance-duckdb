@@ -82,6 +82,12 @@ enum WriterKind {
     Uncommitted,
 }
 
+#[derive(Clone)]
+enum WriterTarget {
+    Path(String),
+    Dataset(Arc<Dataset>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VectorListKind {
     List,
@@ -104,7 +110,7 @@ struct VectorConversion {
 
 struct WriterState {
     kind: WriterKind,
-    path: String,
+    target: WriterTarget,
     params: WriteParams,
 
     vector_candidates: Vec<VectorConversion>,
@@ -488,7 +494,7 @@ fn convert_record_batch(
 
 fn spawn_writer_thread(
     kind: WriterKind,
-    path: String,
+    target: WriterTarget,
     params: WriteParams,
     schema: SchemaRef,
     receiver: Receiver<RecordBatch>,
@@ -497,6 +503,9 @@ fn spawn_writer_thread(
         let reader = ReceiverRecordBatchReader::new(schema, receiver);
         match kind {
             WriterKind::Committed => {
+                let WriterTarget::Path(path) = target else {
+                    return Err("committed writer requires a path target".to_string());
+                };
                 let fut = Dataset::write(reader, &path, Some(params));
                 match runtime::block_on(fut) {
                     Ok(Ok(_)) => Ok(WriterResult::Committed),
@@ -506,9 +515,19 @@ fn spawn_writer_thread(
             }
             WriterKind::Uncommitted => {
                 let source: Box<dyn RecordBatchReader + Send> = Box::new(reader);
-                let builder = InsertBuilder::new(path.as_str()).with_params(&params);
-                let fut = builder.execute_uncommitted_stream(source);
-                match runtime::block_on(fut) {
+                let result = match target {
+                    WriterTarget::Path(path) => runtime::block_on(
+                        InsertBuilder::new(path.as_str())
+                            .with_params(&params)
+                            .execute_uncommitted_stream(source),
+                    ),
+                    WriterTarget::Dataset(dataset) => runtime::block_on(
+                        InsertBuilder::new(dataset)
+                            .with_params(&params)
+                            .execute_uncommitted_stream(source),
+                    ),
+                };
+                match result {
                     Ok(Ok(txn)) => Ok(WriterResult::Uncommitted(Box::new(txn))),
                     Ok(Err(err)) => Err(err.to_string()),
                     Err(err) => Err(format!("runtime: {err}")),
@@ -571,6 +590,7 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     schema: *const c_void,
 ) -> *mut c_void {
     match open_uncommitted_writer_inner(
+        None,
         path,
         mode,
         option_keys,
@@ -581,6 +601,48 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
         max_bytes_per_file,
         data_storage_version,
         session,
+        schema,
+    ) {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_uncommitted_writer_for_dataset(
+    dataset: *mut c_void,
+    max_rows_per_file: u64,
+    max_rows_per_group: u64,
+    max_bytes_per_file: u64,
+    schema: *const c_void,
+) -> *mut c_void {
+    // SAFETY: The caller supplies a live `DatasetHandle` allocated by this FFI
+    // library and retains ownership for the duration of this call.
+    let dataset = match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => handle.dataset.clone(),
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return ptr::null_mut();
+        }
+    };
+    match open_uncommitted_writer_inner(
+        Some(dataset),
+        ptr::null(),
+        ptr::null(),
+        ptr::null(),
+        ptr::null(),
+        0,
+        max_rows_per_file,
+        max_rows_per_group,
+        max_bytes_per_file,
+        ptr::null(),
+        ptr::null_mut(),
         schema,
     ) {
         Ok(handle) => {
@@ -622,6 +684,7 @@ fn parse_data_storage_version_arg(
 
 #[allow(clippy::too_many_arguments)]
 fn open_uncommitted_writer_inner(
+    dataset_override: Option<Arc<Dataset>>,
     path: *const c_char,
     mode: *const c_char,
     option_keys: *const *const c_char,
@@ -634,8 +697,19 @@ fn open_uncommitted_writer_inner(
     session: *mut c_void,
     schema: *const c_void,
 ) -> FfiResult<WriterHandle> {
-    let path = unsafe { cstr_to_str(path, "path")? }.to_string();
-    let mode = unsafe { cstr_to_str(mode, "mode")? };
+    let (target, write_mode) = if let Some(dataset) = dataset_override {
+        (WriterTarget::Dataset(dataset), WriteMode::Append)
+    } else {
+        let path = unsafe { cstr_to_str(path, "path")? }.to_string();
+        let mode = unsafe { cstr_to_str(mode, "mode")? };
+        let write_mode = WriteMode::try_from(mode).map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetWriteOpen,
+                format!("invalid write mode '{mode}': {err}"),
+            )
+        })?;
+        (WriterTarget::Path(path), write_mode)
+    };
 
     if schema.is_null() {
         return Err(FfiError::new(ErrorCode::InvalidArgument, "schema is null"));
@@ -687,13 +761,6 @@ fn open_uncommitted_writer_inner(
         ));
     };
     let schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
-
-    let write_mode = WriteMode::try_from(mode).map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetWriteOpen,
-            format!("invalid write mode '{mode}': {err}"),
-        )
-    })?;
 
     let max_rows_per_file = usize::try_from(max_rows_per_file).map_err(|err| {
         FfiError::new(
@@ -759,7 +826,7 @@ fn open_uncommitted_writer_inner(
         data_type,
         state: Mutex::new(WriterState {
             kind: WriterKind::Uncommitted,
-            path,
+            target,
             params,
             vector_candidates,
             buffered_batches: Vec::new(),
@@ -911,7 +978,7 @@ fn open_writer_inner(
         data_type,
         state: Mutex::new(WriterState {
             kind: WriterKind::Committed,
-            path,
+            target: WriterTarget::Path(path),
             params,
             vector_candidates,
             buffered_batches: Vec::new(),
@@ -1030,7 +1097,7 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
                 let (sender, receiver) = sync_channel::<RecordBatch>(2);
                 let join = spawn_writer_thread(
                     guard.kind,
-                    guard.path.clone(),
+                    guard.target.clone(),
                     guard.params.clone(),
                     output_schema.clone(),
                     receiver,
@@ -1125,7 +1192,7 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
             let (sender, receiver) = sync_channel::<RecordBatch>(2);
             let join = spawn_writer_thread(
                 guard.kind,
-                guard.path.clone(),
+                guard.target.clone(),
                 guard.params.clone(),
                 output_schema.clone(),
                 receiver,
@@ -1230,7 +1297,7 @@ fn writer_finish_uncommitted_inner(
             let (sender, receiver) = sync_channel::<RecordBatch>(2);
             let join = spawn_writer_thread(
                 guard.kind,
-                guard.path.clone(),
+                guard.target.clone(),
                 guard.params.clone(),
                 output_schema.clone(),
                 receiver,

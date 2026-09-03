@@ -230,6 +230,11 @@ void *lance_open_uncommitted_writer_with_storage_options(
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
     const char *data_storage_version, void *session, const ArrowSchema *schema);
+void *lance_open_uncommitted_writer_for_dataset(void *dataset,
+                                                uint64_t max_rows_per_file,
+                                                uint64_t max_rows_per_group,
+                                                uint64_t max_bytes_per_file,
+                                                const ArrowSchema *schema);
 int32_t lance_writer_write_batch(void *writer, ArrowArray *array);
 int32_t lance_writer_finish(void *writer);
 int32_t lance_writer_finish_uncommitted(void *writer, void **out_transaction);
@@ -258,6 +263,10 @@ int32_t lance_merge_begin_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, uint64_t max_rows_per_file, uint64_t max_rows_per_group,
     uint64_t max_bytes_per_file, void *session, void **out_merge_handle);
+int32_t lance_merge_begin_for_dataset(void *dataset, uint64_t max_rows_per_file,
+                                      uint64_t max_rows_per_group,
+                                      uint64_t max_bytes_per_file,
+                                      void **out_merge_handle);
 int32_t lance_merge_add_delete_rowids(void *merge_handle,
                                       const uint64_t *row_ids,
                                       size_t row_ids_len);

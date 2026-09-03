@@ -138,6 +138,42 @@ SELECT ((SELECT c FROM alter_delete_initial_versions) + 1) =
 ----
 true
 
+# INSERT must create its uncommitted writer from the staged schema after ALTER.
+statement ok
+CREATE OR REPLACE TEMP TABLE alter_insert_initial_versions AS
+SELECT count(*)::BIGINT AS c
+FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE alter_txn_ns.main.lance_alter_transaction
+ADD COLUMN insert_marker BIGINT DEFAULT (6 + 7);
+
+statement ok
+INSERT INTO alter_txn_ns.main.lance_alter_transaction(id) VALUES (4);
+
+query I
+SELECT count(*)
+FROM alter_txn_ns.main.lance_alter_transaction
+WHERE id = 4
+  AND answer = 42
+  AND delete_marker = 7
+  AND insert_marker = 13;
+----
+1
+
+statement ok
+COMMIT;
+
+query T
+SELECT ((SELECT c FROM alter_insert_initial_versions) + 1) =
+       (SELECT count(*)::BIGINT
+        FROM glob('test/.tmp/lance_alter_transaction.lance/_versions/*'));
+----
+true
+
 # Lance has no atomic commit spanning multiple datasets. Reject such a
 # transaction before publishing either staged snapshot.
 statement ok

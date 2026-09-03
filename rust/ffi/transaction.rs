@@ -58,24 +58,17 @@ fn transaction_handle_mut<'a>(ptr: *mut c_void) -> FfiResult<&'a mut DatasetTran
 
 async fn stage_transaction(
     handle: &mut DatasetTransactionHandle,
-    mut transaction: Transaction,
+    transaction: Transaction,
 ) -> FfiResult<()> {
     let working_version = handle.working.version_id();
     if transaction.read_version != working_version {
-        if matches!(transaction.operation, Operation::Append { .. }) {
-            // Append fragments are unassigned and independent of the source
-            // manifest, so consecutive INSERT statements can be rebased onto
-            // the transaction-local snapshot without regenerating their data.
-            transaction.read_version = working_version;
-        } else {
-            return Err(FfiError::new(
-                ErrorCode::DatasetCommitTransaction,
-                format!(
-                    "transaction read version {} does not match transaction-local Lance version {}",
-                    transaction.read_version, working_version
-                ),
-            ));
-        }
+        return Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            format!(
+                "transaction read version {} does not match transaction-local Lance version {}",
+                transaction.read_version, working_version
+            ),
+        ));
     }
 
     let dataset = CommitBuilder::new(handle.working.clone())
