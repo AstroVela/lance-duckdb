@@ -72,10 +72,11 @@ after loading the statically linked extension on each worker database.
 ## Global search contract
 
 Vector, full-text, and hybrid search are admitted as global operations. The
-`lance.search-task` version 1 split codec has two executable variants in this
+`lance.search-task` version 1 split codec has three executable variants in this
 phase. `FINAL_SEARCH` contains the search-node UUID and the SHA-256 identity of
 the serialized global search state. `VECTOR_CANDIDATES` additionally identifies
-one Lance fragment.
+one Lance fragment. `INDEXED_VECTOR_CANDIDATES` identifies either one frozen
+physical index segment or one uncovered flat fragment.
 
 An exact vector search is planned as `VECTOR_CANDIDATES` only when
 `use_index = false`, the filter is absent or is applied as a prefilter, the
@@ -90,23 +91,28 @@ table-in/table-out operator uses batched Lance takes to materialize the requeste
 result columns. Because every fragment is assigned exactly once, the
 union of fragment-local top-k sets contains the dataset-wide exact top-k.
 
-Small exact searches, indexed vector searches, vector post-filter searches,
-full-text searches, and hybrid searches are deliberately planned as one
-authenticated `FINAL_SEARCH` assignment. Their search and reranking semantics
-therefore remain one global Lance operation during this phase. Indexed vector
-candidates, full-text candidates, and hybrid global normalization and reranking
-are later phases of
-[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). The admission
-boundary and executable counterexample for the next indexed-vector phase are
-documented in the
+An indexed vector search is planned as `INDEXED_VECTOR_CANDIDATES` only when it
+has an explicit positive `nprobs`, no refinement or post-filter, at least two
+disjoint frozen work units, and enough estimated work. Each physical index
+segment is assigned once by UUID; fragments outside those segments are assigned
+once as flat work. Workers retain Lance's native partition selection and return
+local top-k candidates to the same global `TopN` and materialization path.
+
+Small searches, adaptive-probe indexed searches, refinement, vector
+post-filters, full-text searches, and hybrid searches are deliberately planned
+as one authenticated `FINAL_SEARCH` assignment. Full-text candidates and hybrid
+global normalization and reranking are later phases of
+[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). The indexed
+admission boundary and executable adaptive-probe counterexample are documented
+in the
 [indexed vector candidate contract](vane_indexed_vector_candidates.md).
 
 Unknown variants, malformed payload sizes, foreign state identities, duplicate
-or overlapping fragment assignments, and changed retry assignments fail
-closed. An explicit Vane no-work assignment suppresses that worker scan without
-opening the snapshot; once applied, it cannot be interchanged with an
-executable assignment. A valid detached worker bind remains idempotent when
-Vane translates its serialized plan again, including the no-work state.
+or overlapping work assignments, and changed retry assignments fail closed. An
+explicit Vane no-work assignment suppresses that worker scan without opening
+the snapshot; once applied, it cannot be interchanged with an executable
+assignment. A valid detached worker bind remains idempotent when Vane translates
+its serialized plan again, including the no-work state.
 
 Before task creation, the coordinator freezes the source class, physical URI,
 dataset version and generation, schema fingerprint, filter state, search
@@ -241,7 +247,7 @@ each fragment split. The official DuckDB build retains these pushdowns.
 | --- | --- | --- |
 | Ordinary Lance scan | One split per fragment, scheduled across workers | The physical dataset and frozen snapshot must be replayable by every worker. |
 | `rowid`/`_rowid` point lookup | Ordered take splits, scheduled across workers | Duplicate `IN` candidates are normalized; final row order still requires `ORDER BY`. |
-| `lance_vector_search` | Exact flat searches use disjoint fragment candidate assignments, Vane native global `TopN`, and one batched Lance take | Requires `use_index = false`, no post-filter, at least two fragments with known row counts, and enough estimated work. Other vector searches use one `FINAL_SEARCH` assignment. |
+| `lance_vector_search` | Exact flat and eligible fixed-probe indexed searches use disjoint candidate assignments, Vane native global `TopN`, and one batched Lance take | Exact work is assigned by fragment. Indexed work is assigned by frozen physical segment plus uncovered flat fragment, and additionally requires explicit positive `nprobs` with no refinement. Both paths require no post-filter, at least two work units with known row counts, and enough estimated work. Other vector searches use one `FINAL_SEARCH` assignment. |
 | `lance_fts` | One authenticated `FINAL_SEARCH` task on one worker | Global score ordering remains one Lance operation in this phase. |
 | `lance_hybrid_search` | One authenticated `FINAL_SEARCH` task on one worker | Vector/text retrieval, normalization, and reranking remain one global Lance operation in this phase. |
 | Directory namespace reads | Resolved to a frozen replayable physical URI | Attach-time and planning-time storage state must agree. |
@@ -253,12 +259,12 @@ each fragment split. The official DuckDB build retains these pushdowns.
 
 The scan integration covers read-only table scans, including filters,
 projections, point lookups, aggregates, sampling, global limits, empty datasets,
-directory namespace tables, exact flat vector candidates, singleton indexed
-vector search, full-text search, hybrid search, and standard REST tables that
-provide a stable replayable physical snapshot. Later candidate and reranking
-phases remain tracked in
-[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). Distributed
-writes have a separate
+directory namespace tables, exact flat vector candidates, fixed-probe indexed
+vector candidates, singleton search modes outside those admission boundaries,
+full-text search, hybrid search, and standard REST tables that provide a stable
+replayable physical snapshot. Later candidate and reranking phases remain
+tracked in [Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
+Distributed writes have a separate
 [write contract](./vane_distributed_write.md). Distributed replay of
 `TYPE LANCE` secret catalog entries is not part of either contract.
 

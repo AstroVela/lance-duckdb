@@ -841,8 +841,8 @@ LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     global.filter_pushed_down = bind_data.vane_state.filter_pushed_down;
     return state;
   }
-  if (bind_data.vane_state.execution_variant ==
-      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+  if (LanceVaneIsVectorCandidateVariant(
+          bind_data.vane_state.execution_variant)) {
     global.vane_dataset_entry = LanceVaneOpenSearchSnapshotForMaterialization(
         context, bind_data.vane_state);
     global.vane_dataset = global.vane_dataset_entry->Handle();
@@ -908,8 +908,8 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
 
 #ifdef LANCE_VANE_DISTRIBUTED
   if (bind_data.vane_state.worker_bind ||
-      bind_data.vane_state.execution_variant ==
-          LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+      LanceVaneIsVectorCandidateVariant(
+          bind_data.vane_state.execution_variant)) {
     auto &search = bind_data.vane_state;
     const uint8_t *filter_ir =
         search.final_filter_ir.empty()
@@ -932,24 +932,45 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
           reinterpret_cast<const uint8_t *>(search.index_plan.data()),
           search.index_plan.size());
     };
-    if (search.execution_variant ==
-        LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
-      auto &fragment_ids = search.worker_bind ? search.selected_fragment_ids
-                                              : search.fragment_ids;
+    if (LanceVaneIsVectorCandidateVariant(search.execution_variant)) {
+      auto indexed = search.execution_variant ==
+                     LanceVaneSearchTaskVariant::INDEXED_VECTOR_CANDIDATES;
+      auto &fragment_ids =
+          indexed ? (search.worker_bind
+                         ? search.selected_fragment_ids
+                         : search.indexed_vector_uncovered_fragment_ids)
+                  : (search.worker_bind ? search.selected_fragment_ids
+                                        : search.fragment_ids);
+      auto &segment_uuids = search.worker_bind
+                                ? search.selected_index_segment_uuids
+                                : search.indexed_vector_segment_uuids;
+      string segment_uuid_bytes;
+      if (indexed) {
+        for (auto &segment_uuid : segment_uuids) {
+          segment_uuid_bytes.append(segment_uuid);
+        }
+      }
       result->stream = lance_vane_create_vector_candidate_stream_ir(
           global.vane_dataset, search.dataset_generation_id.c_str(),
           search.arguments.vector_column.c_str(),
           search.arguments.vector_query.data(),
-          search.arguments.vector_query.size(), search.arguments.k, filter_ir,
+          search.arguments.vector_query.size(), search.arguments.k,
+          indexed ? search.arguments.nprobes : 0, filter_ir,
           search.final_filter_ir.size(),
           search.namespace_filter_plan.empty()
               ? nullptr
               : reinterpret_cast<const uint8_t *>(
                     search.namespace_filter_plan.data()),
           search.namespace_filter_plan.size(),
-          search.arguments.prefilter ? 1 : 0,
+          search.arguments.prefilter ? 1 : 0, indexed ? 1 : 0,
           reinterpret_cast<const uint8_t *>(search.index_plan.data()),
-          search.index_plan.size(), fragment_ids.data(), fragment_ids.size());
+          search.index_plan.size(),
+          segment_uuid_bytes.empty()
+              ? nullptr
+              : reinterpret_cast<const uint8_t *>(segment_uuid_bytes.data()),
+          indexed ? segment_uuids.size() : 0,
+          fragment_ids.empty() ? nullptr : fragment_ids.data(),
+          fragment_ids.size());
     } else {
       result->stream =
           create_final_stream(filter_ir, search.final_filter_ir.size());
@@ -962,7 +983,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     }
     if (!result->stream) {
       throw IOException(
-          "Failed to create exact distributed Lance vector search stream" +
+          "Failed to create distributed Lance vector search stream" +
           LanceVaneFormatErrorSuffix(search.physical_uri,
                                      search.private_uri_diagnostics));
     }
@@ -1377,8 +1398,7 @@ static unique_ptr<FunctionData> LanceCreateDistributedKnnWorkerBind(
   result->explain_verbose = state.arguments.explain_verbose;
   result->namespace_backed = false;
   result->namespace_filter = state.arguments.namespace_filter;
-  if (state.execution_variant ==
-      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+  if (LanceVaneIsVectorCandidateVariant(state.execution_variant)) {
     result->names = {"_rowid", "_distance"};
     result->types = {LogicalType::UBIGINT, LogicalType::FLOAT};
   } else {
@@ -1431,8 +1451,7 @@ static unique_ptr<FunctionData> LanceKnnDeserialize(Deserializer &deserializer,
   result->use_index = state.arguments.use_index;
   result->explain_verbose = state.arguments.explain_verbose;
   result->namespace_filter = state.arguments.namespace_filter;
-  if (state.execution_variant ==
-      LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) {
+  if (LanceVaneIsVectorCandidateVariant(state.execution_variant)) {
     result->names = {"_rowid", "_distance"};
     result->types = {LogicalType::UBIGINT, LogicalType::FLOAT};
   } else {
@@ -1890,8 +1909,7 @@ LanceVectorMaterializeSerialize(Serializer &serializer,
 static unique_ptr<FunctionData>
 LanceVectorMaterializeDeserialize(Deserializer &deserializer, TableFunction &) {
   auto state = LanceVaneDeserializeGlobalSearchState(deserializer);
-  if (state.execution_variant !=
-          LanceVaneSearchTaskVariant::VECTOR_CANDIDATES ||
+  if (!LanceVaneIsVectorCandidateVariant(state.execution_variant) ||
       state.arguments.kind != LanceVaneSearchKind::VECTOR ||
       state.worker_bind) {
     throw SerializationException(
@@ -1917,9 +1935,9 @@ static TableFunction LanceVectorMaterializeFunction() {
 }
 
 static unique_ptr<LogicalOperator>
-LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
-                                  unique_ptr<LogicalOperator> op,
-                                  vector<const Expression *> ancestor_filters) {
+LanceRewriteVectorCandidates(ClientContext &context, Optimizer &optimizer,
+                             unique_ptr<LogicalOperator> op,
+                             vector<const Expression *> ancestor_filters) {
   if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
     auto &filter = op->Cast<LogicalFilter>();
     for (auto &expression : filter.expressions) {
@@ -1930,8 +1948,8 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
     }
   }
   for (auto &child : op->children) {
-    child = LanceRewriteExactVectorCandidates(
-        context, optimizer, std::move(child), ancestor_filters);
+    child = LanceRewriteVectorCandidates(context, optimizer, std::move(child),
+                                         ancestor_filters);
   }
   if (op->type != LogicalOperatorType::LOGICAL_GET) {
     return op;
@@ -2008,7 +2026,7 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
   if (!state.arguments.prefilter && !bind_data.namespace_filter.empty()) {
     has_postfilter = true;
   }
-  if (!LanceVaneTryEnableExactVectorCandidates(state, has_postfilter)) {
+  if (!LanceVaneTryEnableVectorCandidates(state, has_postfilter)) {
     return op;
   }
 
@@ -2038,11 +2056,14 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
       vector<ColumnIndex>{ColumnIndex(0), ColumnIndex(1)});
   auto max_cardinality = NumericLimits<idx_t>::Maximum();
   auto k = NumericCast<idx_t>(state.arguments.k);
-  auto fragment_count = state.fragment_ids.size();
+  auto work_count =
+      state.execution_variant == LanceVaneSearchTaskVariant::VECTOR_CANDIDATES
+          ? state.fragment_ids.size()
+          : state.indexed_vector_segment_uuids.size() +
+                state.indexed_vector_uncovered_fragment_ids.size();
   auto candidate_cardinality =
-      fragment_count > 0 && k > max_cardinality / fragment_count
-          ? max_cardinality
-          : k * fragment_count;
+      work_count > 0 && k > max_cardinality / work_count ? max_cardinality
+                                                         : k * work_count;
   candidate_get->SetEstimatedCardinality(candidate_cardinality);
 
   vector<BoundOrderByNode> orders;
@@ -2074,11 +2095,10 @@ LanceRewriteExactVectorCandidates(ClientContext &context, Optimizer &optimizer,
   return std::move(materialize_get);
 }
 
-static void
-LanceExactVectorCandidatesOptimizer(OptimizerExtensionInput &input,
-                                    unique_ptr<LogicalOperator> &plan) {
-  plan = LanceRewriteExactVectorCandidates(input.context, input.optimizer,
-                                           std::move(plan), {});
+static void LanceVectorCandidatesOptimizer(OptimizerExtensionInput &input,
+                                           unique_ptr<LogicalOperator> &plan) {
+  plan = LanceRewriteVectorCandidates(input.context, input.optimizer,
+                                      std::move(plan), {});
 }
 #endif
 
@@ -3279,7 +3299,7 @@ void RegisterLanceSearch(ExtensionLoader &loader) {
 #ifdef LANCE_VANE_DISTRIBUTED
 void RegisterLanceSearchOptimizer(DBConfig &config) {
   OptimizerExtension extension;
-  extension.optimize_function = LanceExactVectorCandidatesOptimizer;
+  extension.optimize_function = LanceVectorCandidatesOptimizer;
   OptimizerExtension::Register(config, std::move(extension));
 }
 #endif

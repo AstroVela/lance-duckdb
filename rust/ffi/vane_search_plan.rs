@@ -7,6 +7,15 @@ use lance::Dataset;
 use lance_table::format::IndexMetadata;
 
 const FORMAT_VERSION: u16 = 1;
+const VECTOR_INDEX_DETAILS_SUFFIX: &str = "VectorIndexDetails";
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LanceVaneIndexedVectorWorkFragment {
+    pub segment_uuid: [u8; 16],
+    pub fragment_id: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchKind {
     Vector = 0,
@@ -390,6 +399,72 @@ impl SearchIndexPlan {
         Ok(())
     }
 
+    pub(crate) fn indexed_vector_work_fragments(
+        &self,
+    ) -> Option<Vec<LanceVaneIndexedVectorWorkFragment>> {
+        let branch = self.vector.as_ref()?;
+        if !branch.use_index || branch.selected.is_empty() {
+            return None;
+        }
+
+        let snapshot_fragments = self.fragments.iter().copied().collect::<HashSet<_>>();
+        let mut assigned_fragments = HashSet::with_capacity(self.fragments.len());
+        let mut result = Vec::with_capacity(self.fragments.len());
+        for metadata in &branch.selected {
+            // This is the frozen equivalent of Lance's
+            // `IndexDetails::is_vector` check; the decoded plan intentionally
+            // stores the Any type URL and payload instead of prost objects.
+            if metadata.uuid == [0; 16]
+                || !metadata
+                    .details
+                    .as_ref()
+                    .is_some_and(|(type_url, _)| type_url.ends_with(VECTOR_INDEX_DETAILS_SUFFIX))
+            {
+                return None;
+            }
+            let fragment_ids = metadata.fragment_ids.as_ref()?;
+            let mut segment_has_fragment = false;
+            for fragment_id in fragment_ids {
+                let fragment_id = u64::from(*fragment_id);
+                if !snapshot_fragments.contains(&fragment_id) {
+                    continue;
+                }
+                // Overlapping physical segment coverage cannot form disjoint
+                // candidate assignments. Keep that index layout singleton.
+                if !assigned_fragments.insert(fragment_id) {
+                    return None;
+                }
+                result.push(LanceVaneIndexedVectorWorkFragment {
+                    segment_uuid: metadata.uuid,
+                    fragment_id,
+                });
+                segment_has_fragment = true;
+            }
+            if !segment_has_fragment {
+                return None;
+            }
+        }
+
+        let mut covered = assigned_fragments.iter().copied().collect::<Vec<_>>();
+        covered.sort_unstable();
+        if covered != branch.covered_fragments {
+            return None;
+        }
+        for fragment_id in &branch.uncovered_fragments {
+            if !assigned_fragments.insert(*fragment_id) {
+                return None;
+            }
+            result.push(LanceVaneIndexedVectorWorkFragment {
+                segment_uuid: [0; 16],
+                fragment_id: *fragment_id,
+            });
+        }
+        if assigned_fragments != snapshot_fragments {
+            return None;
+        }
+        Some(result)
+    }
+
     pub(crate) fn fragments(
         &self,
         dataset: &Dataset,
@@ -463,6 +538,7 @@ impl SearchIndexPlan {
             fragments: dataset.fragments().as_ref().clone(),
             vector_segments,
             fts_segments,
+            indexed_vector_work_fragments: self.indexed_vector_work_fragments(),
         })
     }
 }
@@ -471,6 +547,7 @@ pub(crate) struct ValidatedSearchIndexPlan {
     pub(crate) fragments: Vec<lance_table::format::Fragment>,
     pub(crate) vector_segments: Vec<IndexMetadata>,
     pub(crate) fts_segments: Vec<IndexMetadata>,
+    pub(crate) indexed_vector_work_fragments: Option<Vec<LanceVaneIndexedVectorWorkFragment>>,
 }
 
 pub(crate) async fn build_search_index_plan(
@@ -916,7 +993,10 @@ mod tests {
                 name: format!("{field_name}_idx"),
                 dataset_version: 6,
                 fragment_ids: Some(vec![1]),
-                details: Some(("type.example/index".to_string(), vec![1, 2, 3])),
+                details: Some((
+                    "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                    vec![1, 2, 3],
+                )),
                 index_version: 1,
                 created_at_millis: Some(123_456),
                 base_id: None,
@@ -1046,6 +1126,73 @@ mod tests {
             decoded.vector.unwrap().field_id,
             decoded.fts.unwrap().field_id
         );
+    }
+
+    #[test]
+    fn indexed_vector_work_is_canonical_and_rejects_overlapping_segments() {
+        let indexed = plan(Some(indexed_branch(4, "vector", 1)), None);
+        assert_eq!(
+            indexed.indexed_vector_work_fragments(),
+            Some(vec![
+                LanceVaneIndexedVectorWorkFragment {
+                    segment_uuid: [1; 16],
+                    fragment_id: 1,
+                },
+                LanceVaneIndexedVectorWorkFragment {
+                    segment_uuid: [0; 16],
+                    fragment_id: 3,
+                },
+            ])
+        );
+
+        let mut multiple = indexed_branch(4, "vector", 1);
+        let mut second = multiple.selected[0].clone();
+        second.uuid = [2; 16];
+        second.fragment_ids = Some(vec![3]);
+        multiple.selected.push(second);
+        multiple.covered_fragments = vec![1, 3];
+        multiple.uncovered_fragments.clear();
+        assert_eq!(
+            plan(Some(multiple), None).indexed_vector_work_fragments(),
+            Some(vec![
+                LanceVaneIndexedVectorWorkFragment {
+                    segment_uuid: [1; 16],
+                    fragment_id: 1,
+                },
+                LanceVaneIndexedVectorWorkFragment {
+                    segment_uuid: [2; 16],
+                    fragment_id: 3,
+                },
+            ])
+        );
+
+        let mut overlap = indexed_branch(4, "vector", 1);
+        let mut overlapping = overlap.selected[0].clone();
+        overlapping.uuid = [2; 16];
+        overlap.selected.push(overlapping);
+        assert!(overlap
+            .selected
+            .windows(2)
+            .all(|pair| pair[0].uuid < pair[1].uuid));
+        assert!(plan(Some(overlap), None)
+            .indexed_vector_work_fragments()
+            .is_none());
+        let mut unsupported = indexed_branch(4, "vector", 1);
+        unsupported.selected[0].details = Some((
+            "type.googleapis.com/lance.index.BTreeIndexDetails".to_string(),
+            Vec::new(),
+        ));
+        assert!(plan(Some(unsupported), None)
+            .indexed_vector_work_fragments()
+            .is_none());
+        let mut zero_uuid = indexed_branch(4, "vector", 1);
+        zero_uuid.selected[0].uuid = [0; 16];
+        assert!(plan(Some(zero_uuid), None)
+            .indexed_vector_work_fragments()
+            .is_none());
+        assert!(plan(Some(branch(4, "vector")), None)
+            .indexed_vector_work_fragments()
+            .is_none());
     }
 
     #[test]

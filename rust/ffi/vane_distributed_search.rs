@@ -33,10 +33,13 @@ use super::util::{
     cstr_to_str, dataset_handle, nonzero_u64_to_usize, optional_cstr_array,
     parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult,
 };
-use super::vane_search_plan::{build_search_index_plan, SearchIndexPlan, SearchKind};
+use super::vane_search_plan::{
+    build_search_index_plan, LanceVaneIndexedVectorWorkFragment, SearchIndexPlan, SearchKind,
+};
 
 const NAMESPACE_FILTER_VERSION: u16 = 1;
 const NAMESPACE_FILTER_HEADER_LEN: usize = 6;
+const INDEX_SEGMENT_UUID_SIZE: usize = std::mem::size_of::<[u8; 16]>();
 
 pub(crate) struct VectorCandidateStream {
     inner: LanceStream,
@@ -519,6 +522,88 @@ pub unsafe extern "C" fn lance_vane_validate_search_index_plan(
     }
 }
 
+fn plan_indexed_vector_work_inner(
+    data: *const u8,
+    len: usize,
+    out_work: *mut *mut LanceVaneIndexedVectorWorkFragment,
+    out_len: *mut usize,
+) -> FfiResult<()> {
+    if out_work.is_null() || out_len.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "indexed vector work output pointers are null",
+        ));
+    }
+    // SAFETY: the caller passes the frozen SearchIndexPlan buffer and its
+    // exact byte length for the duration of this call.
+    let bytes = unsafe { parse_index_plan(data, len)? };
+    let plan = SearchIndexPlan::decode(bytes).map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("plan indexed vector work: {err}"),
+        )
+    })?;
+    let work = plan.indexed_vector_work_fragments().unwrap_or_default();
+    if work.is_empty() {
+        return Ok(());
+    }
+
+    let mut work = work.into_boxed_slice();
+    let work_len = work.len();
+    let work_ptr = work.as_mut_ptr();
+    std::mem::forget(work);
+    // SAFETY: both pointers were checked non-null above and point to writable
+    // storage owned by the C++ caller.
+    unsafe {
+        ptr::write_unaligned(out_work, work_ptr);
+        ptr::write_unaligned(out_len, work_len);
+    }
+    Ok(())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_plan_indexed_vector_work(
+    data: *const u8,
+    len: usize,
+    out_work: *mut *mut LanceVaneIndexedVectorWorkFragment,
+    out_len: *mut usize,
+) -> i32 {
+    if !out_work.is_null() {
+        // SAFETY: a non-null out_work points to caller-owned writable storage.
+        unsafe { ptr::write_unaligned(out_work, ptr::null_mut()) };
+    }
+    if !out_len.is_null() {
+        // SAFETY: a non-null out_len points to caller-owned writable storage.
+        unsafe { ptr::write_unaligned(out_len, 0) };
+    }
+    match plan_indexed_vector_work_inner(data, len, out_work, out_len) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_free_indexed_vector_work(
+    work: *mut LanceVaneIndexedVectorWorkFragment,
+    len: usize,
+) {
+    if work.is_null() {
+        return;
+    }
+    // SAFETY: work and len are the exact allocation returned by
+    // lance_vane_plan_indexed_vector_work and ownership is returned once.
+    unsafe {
+        let slice = ptr::slice_from_raw_parts_mut(work, len);
+        let _ = Box::<[LanceVaneIndexedVectorWorkFragment]>::from_raw(slice);
+    }
+}
+
 unsafe fn combined_filter(
     filter_ir: *const u8,
     filter_ir_len: usize,
@@ -633,7 +718,7 @@ async fn validate_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn create_exact_vector_stream(
+fn create_vector_stream(
     handle: &DatasetHandle,
     vector_column: &str,
     query_values: &[f32],
@@ -907,7 +992,7 @@ pub unsafe extern "C" fn lance_vane_create_knn_stream_ir(
                 ErrorCode::KnnStreamCreate,
             )?
         };
-        Ok(StreamHandle::Lance(create_exact_vector_stream(
+        Ok(StreamHandle::Lance(create_vector_stream(
             handle,
             vector_column,
             query_values,
@@ -933,13 +1018,17 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
     query_values: *const f32,
     query_len: usize,
     k: u64,
+    nprobes: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     namespace_filter_plan: *const u8,
     namespace_filter_plan_len: usize,
     prefilter: u8,
+    use_index: u8,
     index_plan: *const u8,
     index_plan_len: usize,
+    index_segment_uuids: *const u8,
+    index_segment_count: usize,
     fragment_ids: *const u64,
     fragment_ids_len: usize,
 ) -> *mut c_void {
@@ -952,19 +1041,84 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
         let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
         // SAFETY: C++ passes query_len readable f32 values for the duration of this call.
         let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
-        // SAFETY: C++ passes fragment_ids_len readable u64 values for this call.
-        let fragment_ids =
-            unsafe { slice_from_ptr(fragment_ids, fragment_ids_len, "fragment_ids")? };
-        if fragment_ids.is_empty() {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                "vector candidate assignment must contain a fragment",
-            ));
-        }
+        let use_index = match use_index {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "vector candidate use_index is not boolean",
+                ));
+            }
+        };
+        let fragment_ids = if fragment_ids_len == 0 {
+            if !fragment_ids.is_null() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "fragment_ids is non-null with zero length",
+                ));
+            }
+            &[]
+        } else {
+            // SAFETY: C++ passes fragment_ids_len readable u64 values for this call.
+            unsafe { slice_from_ptr(fragment_ids, fragment_ids_len, "fragment_ids")? }
+        };
         if fragment_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(FfiError::new(
                 ErrorCode::InvalidArgument,
                 "vector candidate fragment ids must be sorted and unique",
+            ));
+        }
+        let segment_bytes_len = index_segment_count
+            .checked_mul(INDEX_SEGMENT_UUID_SIZE)
+            .ok_or_else(|| FfiError::new(ErrorCode::InvalidArgument, "too many index segments"))?;
+        let segment_bytes = if segment_bytes_len == 0 {
+            if !index_segment_uuids.is_null() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "index_segment_uuids is non-null with zero length",
+                ));
+            }
+            &[]
+        } else {
+            // SAFETY: C++ passes index_segment_count consecutive UUIDs.
+            unsafe {
+                slice_from_ptr(
+                    index_segment_uuids,
+                    segment_bytes_len,
+                    "index_segment_uuids",
+                )?
+            }
+        };
+        let index_segment_uuids = segment_bytes
+            .chunks_exact(INDEX_SEGMENT_UUID_SIZE)
+            .map(|bytes| {
+                let mut uuid = [0_u8; INDEX_SEGMENT_UUID_SIZE];
+                uuid.copy_from_slice(bytes);
+                uuid
+            })
+            .collect::<Vec<_>>();
+        if index_segment_uuids.contains(&[0; INDEX_SEGMENT_UUID_SIZE])
+            || index_segment_uuids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "vector candidate index segment UUIDs must be sorted and unique",
+            ));
+        }
+        if use_index {
+            if nprobes == 0 || (index_segment_uuids.is_empty() && fragment_ids.is_empty()) {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "indexed vector candidate assignment is incomplete",
+                ));
+            }
+        } else if nprobes != 0 || !index_segment_uuids.is_empty() || fragment_ids.is_empty() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "flat vector candidate assignment is contradictory",
             ));
         }
         let k = nonzero_u64_to_usize(k, "k")?;
@@ -978,7 +1132,7 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
                 SearchKind::Vector,
                 Some(vector_column),
                 None,
-                false,
+                use_index,
             )),
             "validate SearchIndexPlan",
         )?;
@@ -999,14 +1153,81 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
             ));
         }
 
+        let (selected_segment_metadata, selected_fragment_ids) = if use_index {
+            let work = validated
+                .indexed_vector_work_fragments
+                .as_ref()
+                .ok_or_else(|| {
+                    FfiError::new(
+                        ErrorCode::InvalidArgument,
+                        "SearchIndexPlan cannot form disjoint indexed vector work",
+                    )
+                })?;
+            let allowed_segments = work
+                .iter()
+                .filter(|item| item.segment_uuid != [0; 16])
+                .map(|item| item.segment_uuid)
+                .collect::<HashSet<_>>();
+            let allowed_uncovered = work
+                .iter()
+                .filter(|item| item.segment_uuid == [0; 16])
+                .map(|item| item.fragment_id)
+                .collect::<HashSet<_>>();
+            if index_segment_uuids
+                .iter()
+                .any(|uuid| !allowed_segments.contains(uuid))
+                || fragment_ids
+                    .iter()
+                    .any(|fragment_id| !allowed_uncovered.contains(fragment_id))
+            {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "indexed vector candidate assignment is not in the frozen work plan",
+                ));
+            }
+
+            let requested_segments = index_segment_uuids.iter().copied().collect::<HashSet<_>>();
+            let selected_segments = validated
+                .vector_segments
+                .iter()
+                .filter(|metadata| requested_segments.contains(metadata.uuid.as_bytes()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected_segments.len() != requested_segments.len() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "indexed vector candidate segment metadata is incomplete",
+                ));
+            }
+            let mut selected_fragment_ids = work
+                .iter()
+                .filter(|item| requested_segments.contains(&item.segment_uuid))
+                .map(|item| item.fragment_id)
+                .collect::<Vec<_>>();
+            selected_fragment_ids.extend_from_slice(fragment_ids);
+            selected_fragment_ids.sort_unstable();
+            if selected_fragment_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "indexed vector candidate work overlaps",
+                ));
+            }
+            (selected_segments, selected_fragment_ids)
+        } else {
+            (Vec::new(), fragment_ids.to_vec())
+        };
+
         let mut fragments_by_id = validated
             .fragments
             .into_iter()
             .map(|fragment| (fragment.id, fragment))
             .collect::<HashMap<_, _>>();
-        let mut selected = Vec::with_capacity(fragment_ids.len());
-        for fragment_id in fragment_ids {
-            let fragment = fragments_by_id.remove(fragment_id).ok_or_else(|| {
+        let mut selected = Vec::with_capacity(selected_fragment_ids.len());
+        for fragment_id in selected_fragment_ids {
+            let fragment = fragments_by_id.remove(&fragment_id).ok_or_else(|| {
                 FfiError::new(
                     ErrorCode::InvalidArgument,
                     format!("vector candidate fragment {fragment_id} is not in the frozen plan"),
@@ -1016,18 +1237,18 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
         }
 
         Ok(StreamHandle::VectorCandidates(VectorCandidateStream::new(
-            create_exact_vector_stream(
+            create_vector_stream(
                 handle,
                 vector_column,
                 query_values,
                 k,
-                0,
+                nprobes,
                 0,
                 filter,
                 prefilter != 0,
-                false,
+                !selected_segment_metadata.is_empty(),
                 selected,
-                Vec::new(),
+                selected_segment_metadata,
                 true,
             )?,
         )))
@@ -1286,7 +1507,7 @@ fn create_exact_hybrid_batch(
     validated: super::vane_search_plan::ValidatedSearchIndexPlan,
 ) -> FfiResult<RecordBatch> {
     let oversample = k.saturating_mul(oversample_factor.max(1) as usize).max(k);
-    let mut vector_stream = StreamHandle::Lance(create_exact_vector_stream(
+    let mut vector_stream = StreamHandle::Lance(create_vector_stream(
         handle,
         vector_column,
         query_values,
@@ -1538,7 +1759,7 @@ mod tests {
         nprobes: u64,
         k: usize,
     ) -> Vec<(u64, f32)> {
-        let stream = create_exact_vector_stream(
+        let stream = create_vector_stream(
             handle,
             "vector",
             &[0.0, 0.0],
@@ -1744,9 +1965,9 @@ mod tests {
         assert_ne!(fragment_default, global_default);
 
         // An explicit nprobes value fixes the same partition set for every
-        // scan. This is a necessary condition for a future indexed candidate
-        // contract, but production routing remains singleton until segment
-        // assignment and refinement are specified end to end.
+        // scan. Production indexed candidates additionally assign frozen,
+        // disjoint physical segments instead of independently searching
+        // arbitrary fragment subsets.
         for nprobes in [1, 2] {
             let global = collect_indexed_vector_candidates(
                 &handle,
