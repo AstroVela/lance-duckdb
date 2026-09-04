@@ -34,6 +34,11 @@ LanceVaneIsVectorCandidateVariant(LanceVaneSearchTaskVariant variant) {
   return variant == LanceVaneSearchTaskVariant::VECTOR_CANDIDATES ||
          variant == LanceVaneSearchTaskVariant::INDEXED_VECTOR_CANDIDATES;
 }
+
+inline bool LanceVaneIsCandidateVariant(LanceVaneSearchTaskVariant variant) {
+  return LanceVaneIsVectorCandidateVariant(variant) ||
+         variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES;
+}
 enum class LanceVaneSearchOverload : uint8_t {
   VECTOR_FLOAT = 0,
   VECTOR_DOUBLE = 1,
@@ -119,6 +124,9 @@ struct LanceVaneGlobalSearchState {
   vector<uint64_t> indexed_vector_segment_fragment_offsets;
   vector<uint64_t> indexed_vector_segment_fragment_ids;
   vector<uint64_t> indexed_vector_uncovered_fragment_ids;
+  vector<string> fts_segment_uuids;
+  vector<uint64_t> fts_segment_fragment_offsets;
+  vector<uint64_t> fts_segment_fragment_ids;
   string state_sha256;
 
   bool worker_bind = false;
@@ -157,6 +165,8 @@ LanceVaneGlobalSearchState LanceVaneFinalizeGlobalSearchState(
 
 bool LanceVaneTryEnableVectorCandidates(LanceVaneGlobalSearchState &state,
                                         bool has_postfilter);
+bool LanceVaneTryEnableFtsCandidates(LanceVaneGlobalSearchState &state,
+                                     bool has_filter);
 
 vector<DistributedScanSplit>
 LanceVaneCreateSearchTaskAssignments(const LanceVaneGlobalSearchState &state);

@@ -11,10 +11,18 @@ use prost::Message;
 
 const FORMAT_VERSION: u16 = 1;
 const VECTOR_INDEX_DETAILS_SUFFIX: &str = "VectorIndexDetails";
+const INVERTED_INDEX_DETAILS_SUFFIX: &str = "InvertedIndexDetails";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LanceVaneIndexedVectorWorkFragment {
+    pub segment_uuid: [u8; 16],
+    pub fragment_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LanceVaneFtsWorkFragment {
     pub segment_uuid: [u8; 16],
     pub fragment_id: u64,
 }
@@ -476,6 +484,57 @@ impl SearchIndexPlan {
         Some(result)
     }
 
+    pub(crate) fn fts_work_fragments(&self) -> Option<Vec<LanceVaneFtsWorkFragment>> {
+        let branch = self.fts.as_ref()?;
+        if !branch.use_index
+            || branch.selected.is_empty()
+            || !branch.uncovered_fragments.is_empty()
+            || branch.selected.iter().any(|metadata| {
+                !metadata
+                    .details
+                    .as_ref()
+                    .is_some_and(|(type_url, _)| type_url.ends_with(INVERTED_INDEX_DETAILS_SUFFIX))
+            })
+        {
+            return None;
+        }
+
+        let snapshot_fragments = self.fragments.iter().copied().collect::<HashSet<_>>();
+        let mut assigned_fragments = HashSet::with_capacity(self.fragments.len());
+        let mut result = Vec::with_capacity(self.fragments.len());
+        for metadata in &branch.selected {
+            if metadata.uuid == [0; 16] {
+                return None;
+            }
+            let fragment_ids = metadata.fragment_ids.as_ref()?;
+            let mut segment_has_fragment = false;
+            for fragment_id in fragment_ids {
+                let fragment_id = u64::from(*fragment_id);
+                if !snapshot_fragments.contains(&fragment_id) {
+                    continue;
+                }
+                if !assigned_fragments.insert(fragment_id) {
+                    return None;
+                }
+                result.push(LanceVaneFtsWorkFragment {
+                    segment_uuid: metadata.uuid,
+                    fragment_id,
+                });
+                segment_has_fragment = true;
+            }
+            if !segment_has_fragment {
+                return None;
+            }
+        }
+
+        let mut covered = assigned_fragments.iter().copied().collect::<Vec<_>>();
+        covered.sort_unstable();
+        if covered != branch.covered_fragments || assigned_fragments != snapshot_fragments {
+            return None;
+        }
+        Some(result)
+    }
+
     pub(crate) fn fragments(
         &self,
         dataset: &Dataset,
@@ -551,6 +610,7 @@ impl SearchIndexPlan {
             fts_segments,
             vector_metric: self.vector.as_ref().and_then(BranchPlan::vector_metric),
             indexed_vector_work_fragments: self.indexed_vector_work_fragments(),
+            fts_work_fragments: self.fts_work_fragments(),
         })
     }
 }
@@ -561,6 +621,7 @@ pub(crate) struct ValidatedSearchIndexPlan {
     pub(crate) fts_segments: Vec<IndexMetadata>,
     pub(crate) vector_metric: Option<DistanceType>,
     pub(crate) indexed_vector_work_fragments: Option<Vec<LanceVaneIndexedVectorWorkFragment>>,
+    pub(crate) fts_work_fragments: Option<Vec<LanceVaneFtsWorkFragment>>,
 }
 
 fn frozen_vector_metric(metadata: &FrozenIndexMetadata) -> Option<DistanceType> {
@@ -1048,6 +1109,15 @@ mod tests {
         }
     }
 
+    fn indexed_fts_branch(field_id: i32, field_name: &str, uuid: u8) -> BranchPlan {
+        let mut branch = indexed_branch(field_id, field_name, uuid);
+        branch.selected[0].details = Some((
+            "type.googleapis.com/lance.index.InvertedIndexDetails".to_string(),
+            Vec::new(),
+        ));
+        branch
+    }
+
     fn plan(vector: Option<BranchPlan>, fts: Option<BranchPlan>) -> SearchIndexPlan {
         SearchIndexPlan {
             dataset_version: 7,
@@ -1234,6 +1304,48 @@ mod tests {
         assert!(plan(Some(branch(4, "vector")), None)
             .indexed_vector_work_fragments()
             .is_none());
+    }
+
+    #[test]
+    fn fts_work_requires_complete_disjoint_inverted_segments() {
+        let mut multiple = indexed_fts_branch(5, "text", 1);
+        let mut second = multiple.selected[0].clone();
+        second.uuid = [2; 16];
+        second.fragment_ids = Some(vec![3]);
+        multiple.selected.push(second);
+        multiple.covered_fragments = vec![1, 3];
+        multiple.uncovered_fragments.clear();
+        assert_eq!(
+            plan(None, Some(multiple.clone())).fts_work_fragments(),
+            Some(vec![
+                LanceVaneFtsWorkFragment {
+                    segment_uuid: [1; 16],
+                    fragment_id: 1,
+                },
+                LanceVaneFtsWorkFragment {
+                    segment_uuid: [2; 16],
+                    fragment_id: 3,
+                },
+            ])
+        );
+
+        let mut partial = multiple.clone();
+        partial.selected.pop();
+        partial.covered_fragments = vec![1];
+        partial.uncovered_fragments = vec![3];
+        assert!(plan(None, Some(partial)).fts_work_fragments().is_none());
+
+        let mut overlap = multiple.clone();
+        overlap.selected[1].fragment_ids = Some(vec![1, 3]);
+        assert!(plan(None, Some(overlap)).fts_work_fragments().is_none());
+
+        let mut wrong_type = multiple.clone();
+        wrong_type.selected[0].details = Some(vector_index_details(VectorMetricType::L2));
+        assert!(plan(None, Some(wrong_type)).fts_work_fragments().is_none());
+
+        let mut zero_uuid = multiple;
+        zero_uuid.selected[0].uuid = [0; 16];
+        assert!(plan(None, Some(zero_uuid)).fts_work_fragments().is_none());
     }
 
     #[test]

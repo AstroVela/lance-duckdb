@@ -12,9 +12,13 @@ use datafusion::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
 use datafusion_expr::Expr;
 use datafusion_proto::bytes::Serializeable;
 use lance::dataset::ProjectionRequest;
+use lance::index::DatasetIndexInternalExt;
 use lance::io::exec::fts::{FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::planner::Planner;
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::scalar::inverted::query::collect_query_tokens;
+use lance_index::scalar::inverted::{build_global_bm25_scorer, InvertedIndex, MemBM25Scorer};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::pb;
@@ -35,7 +39,8 @@ use super::util::{
     parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult,
 };
 use super::vane_search_plan::{
-    build_search_index_plan, LanceVaneIndexedVectorWorkFragment, SearchIndexPlan, SearchKind,
+    build_search_index_plan, LanceVaneFtsWorkFragment, LanceVaneIndexedVectorWorkFragment,
+    SearchIndexPlan, SearchKind,
 };
 
 const NAMESPACE_FILTER_VERSION: u16 = 1;
@@ -55,26 +60,51 @@ impl VectorCandidateStream {
         let Some(batch) = self.inner.next()? else {
             return Ok(None);
         };
-        Ok(Some(reorder_vector_candidate_batch(batch)?))
+        Ok(Some(reorder_candidate_batch(
+            batch,
+            DISTANCE_COLUMN,
+            "vector",
+        )?))
     }
 }
 
-fn reorder_vector_candidate_batch(batch: RecordBatch) -> anyhow::Result<RecordBatch> {
+pub(crate) struct FtsCandidateStream {
+    inner: DataFusionStream,
+}
+
+impl FtsCandidateStream {
+    fn new(inner: DataFusionStream) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn next(&mut self) -> anyhow::Result<Option<RecordBatch>> {
+        let Some(batch) = self.inner.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(reorder_candidate_batch(batch, SCORE_COLUMN, "FTS")?))
+    }
+}
+
+fn reorder_candidate_batch(
+    batch: RecordBatch,
+    value_column: &str,
+    search_name: &str,
+) -> anyhow::Result<RecordBatch> {
     let schema = batch.schema();
     let row_id_index = schema.index_of(ROW_ID_COLUMN)?;
-    let distance_index = schema.index_of(DISTANCE_COLUMN)?;
+    let value_index = schema.index_of(value_column)?;
     if schema.field(row_id_index).data_type() != &DataType::UInt64
-        || schema.field(distance_index).data_type() != &DataType::Float32
+        || schema.field(value_index).data_type() != &DataType::Float32
     {
-        anyhow::bail!("vector candidate stream returned an invalid schema");
+        anyhow::bail!("{search_name} candidate stream returned an invalid schema");
     }
     let fields = vec![
         schema.field(row_id_index).clone(),
-        schema.field(distance_index).clone(),
+        schema.field(value_index).clone(),
     ];
     let columns = vec![
         batch.column(row_id_index).clone(),
-        batch.column(distance_index).clone(),
+        batch.column(value_index).clone(),
     ];
     Ok(RecordBatch::try_new(
         Arc::new(Schema::new(fields)),
@@ -605,6 +635,82 @@ pub unsafe extern "C" fn lance_vane_free_indexed_vector_work(
     }
 }
 
+fn plan_fts_work_inner(
+    data: *const u8,
+    len: usize,
+    out_work: *mut *mut LanceVaneFtsWorkFragment,
+    out_len: *mut usize,
+) -> FfiResult<()> {
+    if out_work.is_null() || out_len.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "FTS work output pointers are null",
+        ));
+    }
+    // SAFETY: the caller passes the frozen SearchIndexPlan buffer and its
+    // exact byte length for the duration of this call.
+    let bytes = unsafe { parse_index_plan(data, len)? };
+    let plan = SearchIndexPlan::decode(bytes).map_err(|err| {
+        FfiError::new(ErrorCode::InvalidArgument, format!("plan FTS work: {err}"))
+    })?;
+    let work = plan.fts_work_fragments().unwrap_or_default();
+    if work.is_empty() {
+        return Ok(());
+    }
+
+    let mut work = work.into_boxed_slice();
+    let work_len = work.len();
+    let work_ptr = work.as_mut_ptr();
+    std::mem::forget(work);
+    // SAFETY: both pointers were checked non-null above and point to writable
+    // storage owned by the C++ caller.
+    unsafe {
+        ptr::write_unaligned(out_work, work_ptr);
+        ptr::write_unaligned(out_len, work_len);
+    }
+    Ok(())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_plan_fts_work(
+    data: *const u8,
+    len: usize,
+    out_work: *mut *mut LanceVaneFtsWorkFragment,
+    out_len: *mut usize,
+) -> i32 {
+    if !out_work.is_null() {
+        // SAFETY: a non-null out_work points to caller-owned writable storage.
+        unsafe { ptr::write_unaligned(out_work, ptr::null_mut()) };
+    }
+    if !out_len.is_null() {
+        // SAFETY: a non-null out_len points to caller-owned writable storage.
+        unsafe { ptr::write_unaligned(out_len, 0) };
+    }
+    match plan_fts_work_inner(data, len, out_work, out_len) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_free_fts_work(work: *mut LanceVaneFtsWorkFragment, len: usize) {
+    if work.is_null() {
+        return;
+    }
+    // SAFETY: work and len are the exact allocation returned by
+    // lance_vane_plan_fts_work and ownership is returned once.
+    unsafe {
+        let slice = ptr::slice_from_raw_parts_mut(work, len);
+        let _ = Box::<[LanceVaneFtsWorkFragment]>::from_raw(slice);
+    }
+}
+
 unsafe fn combined_filter(
     filter_ir: *const u8,
     filter_ir_len: usize,
@@ -808,11 +914,12 @@ fn create_vector_stream(
 fn rewrite_fts_plan(
     plan: Arc<dyn ExecutionPlan>,
     segments: &[lance_table::format::IndexMetadata],
+    base_scorer: Option<&Arc<MemBM25Scorer>>,
 ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
     let children = plan
         .children()
         .into_iter()
-        .map(|child| rewrite_fts_plan(child.clone(), segments))
+        .map(|child| rewrite_fts_plan(child.clone(), segments, base_scorer))
         .collect::<datafusion_common::Result<Vec<_>>>()?;
     let plan = with_new_children_if_necessary(plan, children)?;
 
@@ -829,7 +936,7 @@ fn rewrite_fts_plan(
             exec.prefilter_source().clone(),
             segments.to_vec(),
         );
-        if let Some(scorer) = exec.base_scorer() {
+        if let Some(scorer) = base_scorer.or_else(|| exec.base_scorer()) {
             replacement = replacement.with_base_scorer(scorer.clone());
         }
         return Ok(Arc::new(replacement));
@@ -846,7 +953,7 @@ fn rewrite_fts_plan(
             input,
             segments.to_vec(),
         );
-        if let Some(scorer) = exec.base_scorer() {
+        if let Some(scorer) = base_scorer.or_else(|| exec.base_scorer()) {
             replacement = replacement.with_base_scorer(scorer.clone());
         }
         return Ok(Arc::new(replacement));
@@ -867,6 +974,71 @@ fn rewrite_fts_plan(
     Ok(plan)
 }
 
+fn match_query_scorer_input(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> anyhow::Result<(
+    Arc<lance::Dataset>,
+    lance_index::scalar::inverted::query::MatchQuery,
+    lance_index::scalar::inverted::query::FtsSearchParams,
+)> {
+    if let Some(exec) = plan.as_ref().downcast_ref::<MatchQueryExec>() {
+        return Ok((
+            exec.dataset().clone(),
+            exec.query().clone(),
+            exec.params().clone(),
+        ));
+    }
+    for child in plan.children() {
+        if let Ok(input) = match_query_scorer_input(child) {
+            return Ok(input);
+        }
+    }
+    anyhow::bail!("indexed FTS candidate plan has no MatchQueryExec")
+}
+
+async fn build_corpus_fts_scorer(
+    plan: &Arc<dyn ExecutionPlan>,
+    segments: &[lance_table::format::IndexMetadata],
+) -> anyhow::Result<Arc<MemBM25Scorer>> {
+    let (dataset, query, params) = match_query_scorer_input(plan)?;
+    if matches!(query.fuzziness, Some(value) if value != 0) {
+        anyhow::bail!("distributed FTS candidates do not support fuzzy match queries");
+    }
+    let column = query
+        .column
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("indexed FTS candidate query has no column"))?;
+    let mut indices = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let index = dataset
+            .open_scalar_index(column, &segment.uuid, &NoOpMetricsCollector)
+            .await?;
+        let inverted = index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| {
+                anyhow::anyhow!("FTS segment {} is not an inverted index", segment.uuid)
+            })?;
+        indices.push(Arc::new(inverted.clone()));
+    }
+    // A corpus-wide scorer is only meaningful when every frozen physical
+    // segment uses the same tokenizer and scoring configuration.
+    if indices
+        .windows(2)
+        .any(|pair| pair[0].params() != pair[1].params())
+    {
+        anyhow::bail!("FTS index segments use inconsistent scoring parameters");
+    }
+    let first = indices
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("indexed FTS candidate corpus has no segments"))?;
+    let mut tokenizer = first.tokenizer();
+    let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+    Ok(Arc::new(
+        build_global_bm25_scorer(&indices, &tokens, &params).await?,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_exact_fts_stream(
     handle: &DatasetHandle,
@@ -875,10 +1047,17 @@ fn create_exact_fts_stream(
     k: usize,
     filter: Option<Expr>,
     prefilter: bool,
-    fragments: Vec<lance_table::format::Fragment>,
     index_segments: Vec<lance_table::format::IndexMetadata>,
+    scorer_segments: Option<Vec<lance_table::format::IndexMetadata>>,
     project_row_id_only: bool,
 ) -> FfiResult<StreamHandle> {
+    let candidate_output = scorer_segments.is_some();
+    if candidate_output && !project_row_id_only {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "distributed FTS candidate stream requires row-id projection",
+        ));
+    }
     let limit = i64::try_from(k)
         .map_err(|_| FfiError::new(ErrorCode::InvalidArgument, "k must fit in i64"))?;
     let query = FullTextSearchQuery::new(query.to_string())
@@ -891,7 +1070,11 @@ fn create_exact_fts_stream(
         })?
         .limit(Some(limit));
     let mut scan = handle.dataset.scan();
-    scan.with_fragments(fragments);
+    // The handle already points at the frozen dataset version. Do not also
+    // call `with_fragments`: Lance treats any explicit fragment list as a
+    // prefilter and derives its row-id source from the logical FTS index
+    // summary. A multi-segment index can then exclude rows from later physical
+    // segments. Candidate work is scoped by `index_segments` below instead.
     scan.prefilter(prefilter);
     if let Some(filter) = filter {
         scan.filter_expr(filter);
@@ -928,7 +1111,15 @@ fn create_exact_fts_stream(
             .create_plan()
             .await
             .map_err(|err| format!("create FTS plan: {err}"))?;
-        let plan = rewrite_fts_plan(plan, &index_segments)
+        let base_scorer = match scorer_segments {
+            Some(segments) => Some(
+                build_corpus_fts_scorer(&plan, &segments)
+                    .await
+                    .map_err(|err| format!("build corpus-wide FTS scorer: {err}"))?,
+            ),
+            None => None,
+        };
+        let plan = rewrite_fts_plan(plan, &index_segments, base_scorer.as_ref())
             .map_err(|err| format!("freeze FTS segments: {err}"))?;
         execute_plan(plan, LanceExecutionOptions::default())
             .map_err(|err| format!("execute distributed FTS plan: {err}"))
@@ -940,14 +1131,17 @@ fn create_exact_fts_stream(
         )
     })?
     .map_err(|err| FfiError::new(ErrorCode::FtsStreamCreate, err))?;
-    Ok(StreamHandle::DataFusion(
-        DataFusionStream::try_new(stream).map_err(|err| {
-            FfiError::new(
-                ErrorCode::FtsStreamCreate,
-                format!("distributed FTS stream: {err}"),
-            )
-        })?,
-    ))
+    let stream = DataFusionStream::try_new(stream).map_err(|err| {
+        FfiError::new(
+            ErrorCode::FtsStreamCreate,
+            format!("distributed FTS stream: {err}"),
+        )
+    })?;
+    if candidate_output {
+        Ok(StreamHandle::FtsCandidates(FtsCandidateStream::new(stream)))
+    } else {
+        Ok(StreamHandle::DataFusion(stream))
+    }
 }
 
 #[no_mangle]
@@ -1274,81 +1468,116 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
     stream_result(result)
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn lance_vane_take_vector_rows(
+#[derive(Clone, Copy)]
+enum SearchMaterializationKind {
+    Vector,
+    Fts,
+}
+
+impl SearchMaterializationKind {
+    fn value_column(self) -> &'static str {
+        match self {
+            Self::Vector => DISTANCE_COLUMN,
+            Self::Fts => SCORE_COLUMN,
+        }
+    }
+
+    fn search_name(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Fts => "FTS",
+        }
+    }
+
+    fn error_code(self) -> ErrorCode {
+        match self {
+            Self::Vector => ErrorCode::KnnStreamCreate,
+            Self::Fts => ErrorCode::FtsStreamCreate,
+        }
+    }
+}
+
+fn take_search_rows(
+    handle: &DatasetHandle,
+    row_ids: &[u64],
+    values: &[f32],
+    columns: &[String],
+    kind: SearchMaterializationKind,
+) -> FfiResult<RecordBatch> {
+    let value_column = kind.value_column();
+    let search_name = kind.search_name();
+    if row_ids.is_empty() || row_ids.len() != values.len() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{search_name} materialization requires matching nonempty candidates"),
+        ));
+    }
+    let mut unique_columns = HashSet::with_capacity(columns.len());
+    for column in columns {
+        if column == value_column
+            || !handle
+                .base_projection
+                .iter()
+                .any(|candidate| candidate == column)
+            || !unique_columns.insert(column.as_str())
+        {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid {search_name} materialization column: {column}"),
+            ));
+        }
+    }
+
+    let (mut arrays, mut fields) = if columns.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let projection = ProjectionRequest::from_columns(columns, handle.dataset.schema());
+        let rows = runtime_result(
+            runtime::block_on(handle.dataset.take_rows(row_ids, projection)),
+            &format!("{search_name} take_rows"),
+        )?;
+        if rows.num_rows() != row_ids.len() {
+            return Err(FfiError::new(
+                kind.error_code(),
+                format!("{search_name} take_rows returned an unexpected row count"),
+            ));
+        }
+        (
+            rows.columns().to_vec(),
+            rows.schema().fields().iter().cloned().collect::<Vec<_>>(),
+        )
+    };
+
+    arrays.push(Arc::new(Float32Array::from(values.to_vec())) as Arc<dyn Array>);
+    fields.push(Arc::new(Field::new(value_column, DataType::Float32, false)));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|err| {
+        FfiError::new(
+            kind.error_code(),
+            format!("{search_name} materialization batch: {err}"),
+        )
+    })
+}
+
+unsafe fn take_search_rows_ffi(
     dataset: *mut c_void,
     row_ids: *const u64,
-    distances: *const f32,
+    values: *const f32,
     len: usize,
     columns: *const *const c_char,
     columns_len: usize,
-) -> *mut c_void {
-    let result = (|| -> FfiResult<RecordBatch> {
-        // SAFETY: C++ passes a live dataset handle created by this FFI module.
-        let handle = unsafe { dataset_handle(dataset)? };
-        // SAFETY: C++ passes len readable row ids for the duration of this call.
-        let row_ids = unsafe { slice_from_ptr(row_ids, len, "row_ids")? };
-        // SAFETY: C++ passes len readable distances for the duration of this call.
-        let distances = unsafe { slice_from_ptr(distances, len, "distances")? };
-        // SAFETY: C++ passes columns_len live NUL-terminated column names for this call.
-        let columns =
-            unsafe { optional_cstr_array(columns, columns_len, "vector materialization columns")? };
-        if row_ids.is_empty() {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                "vector materialization requires at least one row",
-            ));
-        }
-        let mut unique_columns = HashSet::with_capacity(columns.len());
-        for column in &columns {
-            if column == DISTANCE_COLUMN
-                || !handle
-                    .base_projection
-                    .iter()
-                    .any(|candidate| candidate == column)
-                || !unique_columns.insert(column.as_str())
-            {
-                return Err(FfiError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("invalid vector materialization column: {column}"),
-                ));
-            }
-        }
+    kind: SearchMaterializationKind,
+) -> FfiResult<RecordBatch> {
+    // SAFETY: C++ passes a live dataset handle created by this FFI module.
+    let handle = unsafe { dataset_handle(dataset)? };
+    // SAFETY: C++ passes len readable candidate values for this call.
+    let row_ids = unsafe { slice_from_ptr(row_ids, len, "row_ids")? };
+    let values = unsafe { slice_from_ptr(values, len, "search values")? };
+    // SAFETY: C++ passes columns_len live NUL-terminated column names for this call.
+    let columns = unsafe { optional_cstr_array(columns, columns_len, "materialization columns")? };
+    take_search_rows(handle, row_ids, values, &columns, kind)
+}
 
-        let (mut arrays, mut fields) = if columns.is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            let projection = ProjectionRequest::from_columns(&columns, handle.dataset.schema());
-            let rows = runtime_result(
-                runtime::block_on(handle.dataset.take_rows(row_ids, projection)),
-                "vector take_rows",
-            )?;
-            if rows.num_rows() != row_ids.len() {
-                return Err(FfiError::new(
-                    ErrorCode::KnnStreamCreate,
-                    "vector take_rows returned an unexpected row count",
-                ));
-            }
-            (
-                rows.columns().to_vec(),
-                rows.schema().fields().iter().cloned().collect::<Vec<_>>(),
-            )
-        };
-
-        arrays.push(Arc::new(Float32Array::from(distances.to_vec())) as Arc<dyn Array>);
-        fields.push(Arc::new(Field::new(
-            DISTANCE_COLUMN,
-            DataType::Float32,
-            false,
-        )));
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|err| {
-            FfiError::new(
-                ErrorCode::KnnStreamCreate,
-                format!("vector materialization batch: {err}"),
-            )
-        })
-    })();
-
+fn materialization_result(result: FfiResult<RecordBatch>) -> *mut c_void {
     match result {
         Ok(batch) => {
             clear_last_error();
@@ -1359,6 +1588,50 @@ pub unsafe extern "C" fn lance_vane_take_vector_rows(
             ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_take_vector_rows(
+    dataset: *mut c_void,
+    row_ids: *const u64,
+    distances: *const f32,
+    len: usize,
+    columns: *const *const c_char,
+    columns_len: usize,
+) -> *mut c_void {
+    materialization_result(unsafe {
+        take_search_rows_ffi(
+            dataset,
+            row_ids,
+            distances,
+            len,
+            columns,
+            columns_len,
+            SearchMaterializationKind::Vector,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_take_fts_rows(
+    dataset: *mut c_void,
+    row_ids: *const u64,
+    scores: *const f32,
+    len: usize,
+    columns: *const *const c_char,
+    columns_len: usize,
+) -> *mut c_void {
+    materialization_result(unsafe {
+        take_search_rows_ffi(
+            dataset,
+            row_ids,
+            scores,
+            len,
+            columns,
+            columns_len,
+            SearchMaterializationKind::Fts,
+        )
+    })
 }
 
 #[no_mangle]
@@ -1411,9 +1684,154 @@ pub unsafe extern "C" fn lance_vane_create_fts_stream_ir(
             k,
             filter,
             prefilter != 0,
-            validated.fragments,
             validated.fts_segments,
+            None,
             false,
+        )
+    })();
+    stream_result(result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_vane_create_fts_candidate_stream_ir(
+    dataset: *mut c_void,
+    generation: *const c_char,
+    text_column: *const c_char,
+    query: *const c_char,
+    k: u64,
+    index_plan: *const u8,
+    index_plan_len: usize,
+    index_segment_uuids: *const u8,
+    index_segment_count: usize,
+) -> *mut c_void {
+    let result = (|| -> FfiResult<StreamHandle> {
+        // SAFETY: C++ passes a live dataset handle created by this FFI module.
+        let handle = unsafe { dataset_handle(dataset)? };
+        // SAFETY: C++ passes live NUL-terminated strings for this call.
+        let generation = unsafe { cstr_to_str(generation, "generation")? };
+        let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
+        let query = unsafe { cstr_to_str(query, "query")? };
+        let k = nonzero_u64_to_usize(k, "k")?;
+        let segment_bytes_len = index_segment_count
+            .checked_mul(INDEX_SEGMENT_UUID_SIZE)
+            .ok_or_else(|| FfiError::new(ErrorCode::InvalidArgument, "too many FTS segments"))?;
+        if segment_bytes_len == 0 {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "FTS candidate assignment has no index segments",
+            ));
+        }
+        // SAFETY: C++ passes index_segment_count consecutive UUIDs for this call.
+        let segment_bytes = unsafe {
+            slice_from_ptr(
+                index_segment_uuids,
+                segment_bytes_len,
+                "FTS index_segment_uuids",
+            )?
+        };
+        let index_segment_uuids = segment_bytes
+            .as_chunks::<INDEX_SEGMENT_UUID_SIZE>()
+            .0
+            .to_vec();
+        if index_segment_uuids.contains(&[0; INDEX_SEGMENT_UUID_SIZE])
+            || index_segment_uuids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "FTS candidate index segment UUIDs must be sorted and unique",
+            ));
+        }
+
+        // SAFETY: C++ passes the frozen plan buffer and its exact byte length.
+        let bytes = unsafe { parse_index_plan(index_plan, index_plan_len)? };
+        let validated = runtime_result(
+            runtime::block_on(validate_plan(
+                handle,
+                bytes,
+                generation,
+                SearchKind::Fts,
+                None,
+                Some(text_column),
+                false,
+            )),
+            "validate SearchIndexPlan",
+        )?;
+        let work = validated.fts_work_fragments.as_ref().ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                "SearchIndexPlan cannot form complete disjoint FTS work",
+            )
+        })?;
+        let allowed_segments = work
+            .iter()
+            .map(|item| item.segment_uuid)
+            .collect::<HashSet<_>>();
+        if index_segment_uuids
+            .iter()
+            .any(|uuid| !allowed_segments.contains(uuid))
+        {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "FTS candidate assignment is not in the frozen work plan",
+            ));
+        }
+
+        let requested_segments = index_segment_uuids.iter().copied().collect::<HashSet<_>>();
+        let selected_segments = validated
+            .fts_segments
+            .iter()
+            .filter(|metadata| requested_segments.contains(metadata.uuid.as_bytes()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected_segments.len() != requested_segments.len() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "FTS candidate segment metadata is incomplete",
+            ));
+        }
+        let mut selected_fragment_ids = work
+            .iter()
+            .filter(|item| requested_segments.contains(&item.segment_uuid))
+            .map(|item| item.fragment_id)
+            .collect::<Vec<_>>();
+        selected_fragment_ids.sort_unstable();
+        if selected_fragment_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "FTS candidate work overlaps",
+            ));
+        }
+
+        let scorer_segments = validated.fts_segments.clone();
+        let snapshot_fragment_ids = validated
+            .fragments
+            .into_iter()
+            .map(|fragment| fragment.id)
+            .collect::<HashSet<_>>();
+        for fragment_id in selected_fragment_ids {
+            if !snapshot_fragment_ids.contains(&fragment_id) {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("FTS candidate fragment {fragment_id} is not in the frozen plan"),
+                ));
+            }
+        }
+
+        create_exact_fts_stream(
+            handle,
+            text_column,
+            query,
+            k,
+            None,
+            false,
+            selected_segments,
+            Some(scorer_segments),
+            true,
         )
     })();
     stream_result(result)
@@ -1550,8 +1968,8 @@ fn create_exact_hybrid_batch(
         oversample,
         filter,
         prefilter,
-        validated.fragments,
         validated.fts_segments,
+        None,
         true,
     )?;
     let fts_rows = collect_row_f32_pairs(&mut fts_stream, ROW_ID_COLUMN, SCORE_COLUMN)?;
@@ -1824,47 +2242,50 @@ mod tests {
     }
 
     #[test]
-    fn vector_candidates_are_reordered_by_name_and_type() {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new(DISTANCE_COLUMN, DataType::Float32, false),
-                Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
-            ])),
-            vec![
-                Arc::new(Float32Array::from(vec![0.25, 0.5])) as Arc<dyn Array>,
-                Arc::new(UInt64Array::from(vec![9, 12])) as Arc<dyn Array>,
-            ],
-        )
-        .expect("input batch");
+    fn search_candidates_are_reordered_by_name_and_type() {
+        for (value_column, search_name) in [(DISTANCE_COLUMN, "vector"), (SCORE_COLUMN, "FTS")] {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new(value_column, DataType::Float32, false),
+                    Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+                ])),
+                vec![
+                    Arc::new(Float32Array::from(vec![0.25, 0.5])) as Arc<dyn Array>,
+                    Arc::new(UInt64Array::from(vec![9, 12])) as Arc<dyn Array>,
+                ],
+            )
+            .expect("input batch");
 
-        let reordered = reorder_vector_candidate_batch(batch).expect("reorder");
-        assert_eq!(
-            reordered
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name())
-                .collect::<Vec<_>>(),
-            vec![ROW_ID_COLUMN, DISTANCE_COLUMN]
-        );
-        assert_eq!(
-            reordered
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("row ids")
-                .values(),
-            &[9, 12]
-        );
-        assert_eq!(
-            reordered
-                .column(1)
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .expect("distances")
-                .values(),
-            &[0.25, 0.5]
-        );
+            let reordered =
+                reorder_candidate_batch(batch, value_column, search_name).expect("reorder");
+            assert_eq!(
+                reordered
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name())
+                    .collect::<Vec<_>>(),
+                vec![ROW_ID_COLUMN, value_column]
+            );
+            assert_eq!(
+                reordered
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("row ids")
+                    .values(),
+                &[9, 12]
+            );
+            assert_eq!(
+                reordered
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("candidate values")
+                    .values(),
+                &[0.25, 0.5]
+            );
+        }
     }
 
     #[test]

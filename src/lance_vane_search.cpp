@@ -36,9 +36,12 @@ static constexpr const char *LANCE_VANE_VECTOR_CANDIDATE_TASK_ID_PREFIX =
 static constexpr const char
     *LANCE_VANE_INDEXED_VECTOR_CANDIDATE_TASK_ID_PREFIX =
         "indexed-vector-candidates:";
+static constexpr const char *LANCE_VANE_FTS_CANDIDATE_TASK_ID_PREFIX =
+    "fts-candidates:";
 static constexpr idx_t LANCE_VANE_VECTOR_CANDIDATE_MIN_FRAGMENTS = 2;
 static constexpr uint64_t LANCE_VANE_VECTOR_CANDIDATE_MIN_DISTANCE_VALUES =
     1ULL << 20;
+static constexpr uint64_t LANCE_VANE_FTS_CANDIDATE_MIN_ROWS = 4096;
 static constexpr idx_t LANCE_VANE_SEARCH_UUID_SIZE = BaseUUID::STRING_SIZE;
 static constexpr idx_t LANCE_VANE_SHA256_SIZE = 32;
 static constexpr idx_t LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE =
@@ -48,6 +51,9 @@ static constexpr idx_t LANCE_VANE_VECTOR_CANDIDATE_TASK_PAYLOAD_SIZE =
 static constexpr idx_t LANCE_VANE_INDEX_SEGMENT_UUID_SIZE = 16;
 static constexpr idx_t LANCE_VANE_INDEXED_VECTOR_TASK_PAYLOAD_SIZE =
     LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE + 1 +
+    LANCE_VANE_INDEX_SEGMENT_UUID_SIZE;
+static constexpr idx_t LANCE_VANE_FTS_CANDIDATE_TASK_PAYLOAD_SIZE =
+    LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE +
     LANCE_VANE_INDEX_SEGMENT_UUID_SIZE;
 
 struct LanceVaneSearchBytesDeleter {
@@ -311,6 +317,12 @@ CanonicalSearchStateBytes(const LanceVaneGlobalSearchState &state) {
                 [&](uint64_t fragment_id) { writer.U64(fragment_id); });
   writer.Vector(state.indexed_vector_uncovered_fragment_ids,
                 [&](uint64_t fragment_id) { writer.U64(fragment_id); });
+  writer.Vector(state.fts_segment_uuids,
+                [&](const string &uuid) { writer.String(uuid); });
+  writer.Vector(state.fts_segment_fragment_offsets,
+                [&](uint64_t offset) { writer.U64(offset); });
+  writer.Vector(state.fts_segment_fragment_ids,
+                [&](uint64_t fragment_id) { writer.U64(fragment_id); });
   writer.Bool(static_cast<bool>(state.frozen_snapshot));
   if (state.frozen_snapshot) {
     writer.String(state.frozen_snapshot->dataset.manifest_sha256);
@@ -425,7 +437,10 @@ EncodeSearchTaskAssignment(const LanceVaneSearchTaskAssignment &assignment) {
        (has_fragment == has_index_segment ||
         (has_index_segment && assignment.index_segment_uuid.size() !=
                                   LANCE_VANE_INDEX_SEGMENT_UUID_SIZE))) ||
-      assignment.variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+      (assignment.variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES &&
+       (has_fragment || !has_index_segment ||
+        assignment.index_segment_uuid.size() !=
+            LANCE_VANE_INDEX_SEGMENT_UUID_SIZE))) {
     throw InternalException("Cannot encode a malformed SearchTaskAssignment");
   }
   string payload;
@@ -435,6 +450,8 @@ EncodeSearchTaskAssignment(const LanceVaneSearchTaskAssignment &assignment) {
   } else if (assignment.variant ==
              LanceVaneSearchTaskVariant::INDEXED_VECTOR_CANDIDATES) {
     payload_size = LANCE_VANE_INDEXED_VECTOR_TASK_PAYLOAD_SIZE;
+  } else if (assignment.variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    payload_size = LANCE_VANE_FTS_CANDIDATE_TASK_PAYLOAD_SIZE;
   }
   payload.reserve(payload_size);
   payload.push_back(static_cast<char>(assignment.variant));
@@ -454,6 +471,8 @@ EncodeSearchTaskAssignment(const LanceVaneSearchTaskAssignment &assignment) {
       AppendU64(payload, assignment.fragment_id.GetIndex());
       payload.append(sizeof(uint64_t), '\0');
     }
+  } else if (assignment.variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    payload.append(assignment.index_segment_uuid);
   }
   return payload;
 }
@@ -517,6 +536,23 @@ DecodeSearchTaskAssignment(const string &payload) {
     } else {
       throw SerializationException(
           "SearchTaskAssignment payload has an invalid work kind");
+    }
+    break;
+  }
+  case static_cast<uint8_t>(LanceVaneSearchTaskVariant::FTS_CANDIDATES): {
+    if (payload.size() != LANCE_VANE_FTS_CANDIDATE_TASK_PAYLOAD_SIZE) {
+      throw SerializationException(
+          "SearchTaskAssignment payload has an invalid size");
+    }
+    result.variant = LanceVaneSearchTaskVariant::FTS_CANDIDATES;
+    result.index_segment_uuid =
+        payload.substr(LANCE_VANE_SEARCH_TASK_BASE_PAYLOAD_SIZE,
+                       LANCE_VANE_INDEX_SEGMENT_UUID_SIZE);
+    if (std::all_of(result.index_segment_uuid.begin(),
+                    result.index_segment_uuid.end(),
+                    [](char value) { return value == 0; })) {
+      throw SerializationException(
+          "SearchTaskAssignment payload has an invalid index segment");
     }
     break;
   }
@@ -584,6 +620,12 @@ ExpectedSearchTaskId(const LanceVaneGlobalSearchState &state,
     if (index_segment_uuid.empty() && fragment_id.IsValid()) {
       return prefix + ":fragment:" + to_string(fragment_id.GetIndex());
     }
+  }
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES &&
+      !index_segment_uuid.empty() && !fragment_id.IsValid()) {
+    return string(LANCE_VANE_FTS_CANDIDATE_TASK_ID_PREFIX) +
+           state.search_node_uuid + ":" +
+           HexIndexSegmentUUID(index_segment_uuid);
   }
   throw InternalException("Unsupported distributed search task identity");
 }
@@ -655,6 +697,53 @@ static bool HasValidIndexedVectorWork(const LanceVaneGlobalSearchState &state) {
   return assigned_fragments == state.fragment_ids;
 }
 
+static bool HasValidFtsWork(const LanceVaneGlobalSearchState &state) {
+  auto &segment_uuids = state.fts_segment_uuids;
+  auto &offsets = state.fts_segment_fragment_offsets;
+  auto &segment_fragments = state.fts_segment_fragment_ids;
+  if (segment_uuids.empty()) {
+    return offsets.empty() && segment_fragments.empty();
+  }
+  if (offsets.size() != segment_uuids.size() + 1 || offsets.front() != 0 ||
+      offsets.back() != segment_fragments.size() ||
+      !std::is_sorted(segment_uuids.begin(), segment_uuids.end()) ||
+      std::adjacent_find(segment_uuids.begin(), segment_uuids.end()) !=
+          segment_uuids.end()) {
+    return false;
+  }
+
+  vector<uint64_t> assigned_fragments;
+  assigned_fragments.reserve(segment_fragments.size());
+  for (idx_t segment_idx = 0; segment_idx < segment_uuids.size();
+       segment_idx++) {
+    auto &uuid = segment_uuids[segment_idx];
+    if (uuid.size() != LANCE_VANE_INDEX_SEGMENT_UUID_SIZE ||
+        std::all_of(uuid.begin(), uuid.end(),
+                    [](char value) { return value == 0; })) {
+      return false;
+    }
+    auto begin = offsets[segment_idx];
+    auto end = offsets[segment_idx + 1];
+    if (begin >= end || end > segment_fragments.size()) {
+      return false;
+    }
+    auto first = segment_fragments.begin() + begin;
+    auto last = segment_fragments.begin() + end;
+    if (!std::is_sorted(first, last) ||
+        std::adjacent_find(first, last) != last) {
+      return false;
+    }
+    assigned_fragments.insert(assigned_fragments.end(), first, last);
+  }
+  std::sort(assigned_fragments.begin(), assigned_fragments.end());
+  if (std::adjacent_find(assigned_fragments.begin(),
+                         assigned_fragments.end()) !=
+      assigned_fragments.end()) {
+    return false;
+  }
+  return assigned_fragments == state.fragment_ids;
+}
+
 static LanceVaneSearchTaskAssignment
 ValidateAuthorizedTask(const LanceVaneGlobalSearchState &state,
                        const string &task_id, const string &payload) {
@@ -706,6 +795,12 @@ ValidateAuthorizedTask(const LanceVaneGlobalSearchState &state,
           state.indexed_vector_uncovered_fragment_ids.end(),
           assignment.fragment_id.GetIndex());
     }
+  } else if (state.execution_variant ==
+             LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    authorized = !assignment.fragment_id.IsValid() &&
+                 std::binary_search(state.fts_segment_uuids.begin(),
+                                    state.fts_segment_uuids.end(),
+                                    assignment.index_segment_uuid);
   }
   if (!authorized ||
       task_id != ExpectedSearchTaskId(state, assignment.fragment_id,
@@ -721,7 +816,7 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
                                       bool verify_digest) {
   auto supported_variant =
       state.execution_variant == LanceVaneSearchTaskVariant::FINAL_SEARCH ||
-      LanceVaneIsVectorCandidateVariant(state.execution_variant);
+      LanceVaneIsCandidateVariant(state.execution_variant);
   if (state.contract_version != LANCE_VANE_SEARCH_CONTRACT_VERSION ||
       static_cast<uint8_t>(state.source_class) >
           static_cast<uint8_t>(LanceVaneSearchSourceClass::STANDARD_REST) ||
@@ -732,7 +827,7 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
       state.authorized_task_ids.size() !=
           state.authorized_task_payloads.size() ||
       !supported_variant || !HasValidFragmentStats(state) ||
-      !HasValidIndexedVectorWork(state)) {
+      !HasValidIndexedVectorWork(state) || !HasValidFtsWork(state)) {
     throw SerializationException("Distributed Lance search state is malformed");
   }
   for (auto &name : state.output_names) {
@@ -771,6 +866,7 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
         state.execution_variant != LanceVaneSearchTaskVariant::FINAL_SEARCH ||
         !state.fragment_ids.empty() ||
         !state.indexed_vector_segment_uuids.empty() ||
+        !state.fts_segment_uuids.empty() ||
         !state.selected_fragment_ids.empty() ||
         !state.selected_index_segment_uuids.empty()) {
       throw SerializationException(
@@ -803,6 +899,7 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
        state.empty_assignment || state.authorization_restricted ||
        !state.authorized_task_ids.empty() ||
        !state.indexed_vector_segment_uuids.empty() ||
+       !state.fts_segment_uuids.empty() ||
        !state.selected_fragment_ids.empty() ||
        !state.selected_index_segment_uuids.empty())) {
     throw SerializationException(
@@ -821,6 +918,7 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
         state.arguments.use_index ||
         state.fragment_ids.size() < LANCE_VANE_VECTOR_CANDIDATE_MIN_FRAGMENTS ||
         !state.indexed_vector_segment_uuids.empty() ||
+        !state.fts_segment_uuids.empty() ||
         (!state.arguments.prefilter &&
          (!state.final_filter_ir.empty() ||
           !state.namespace_filter_plan.empty()))) {
@@ -841,6 +939,7 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
         !state.arguments.use_index || state.arguments.nprobes == 0 ||
         state.arguments.refine_factor != 0 ||
         state.indexed_vector_segment_uuids.empty() || work_count < 2 ||
+        !state.fts_segment_uuids.empty() ||
         (!state.arguments.prefilter &&
          (!state.final_filter_ir.empty() ||
           !state.namespace_filter_plan.empty()))) {
@@ -855,7 +954,34 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
             "incomplete");
       }
     }
+  } else if (state.execution_variant ==
+             LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    if (state.arguments.kind != LanceVaneSearchKind::FTS ||
+        state.arguments.namespace_backed ||
+        state.source_class != LanceVaneSearchSourceClass::DIRECT ||
+        !state.arguments.use_index ||
+        !state.indexed_vector_segment_uuids.empty() ||
+        state.fts_segment_uuids.size() < 2 || !state.final_filter_ir.empty() ||
+        !state.namespace_filter_plan.empty() || state.filter_pushed_down) {
+      throw SerializationException(
+          "Distributed Lance FTS candidate state is contradictory");
+    }
+    uint64_t total_rows = 0;
+    for (auto row_count : state.fragment_row_counts) {
+      if (row_count < 0 ||
+          NumericCast<uint64_t>(row_count) >
+              NumericLimits<uint64_t>::Maximum() - total_rows) {
+        throw SerializationException(
+            "Distributed Lance FTS candidate row counts are incomplete");
+      }
+      total_rows += NumericCast<uint64_t>(row_count);
+    }
+    if (total_rows < LANCE_VANE_FTS_CANDIDATE_MIN_ROWS) {
+      throw SerializationException(
+          "Distributed Lance FTS candidate state is below its work threshold");
+    }
   } else if (!state.indexed_vector_segment_uuids.empty() ||
+             !state.fts_segment_uuids.empty() ||
              !state.selected_fragment_ids.empty() ||
              !state.selected_index_segment_uuids.empty()) {
     throw SerializationException(
@@ -927,7 +1053,8 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
             "Distributed Lance exact vector candidate segments are "
             "contradictory");
       }
-    } else {
+    } else if (state.execution_variant ==
+               LanceVaneSearchTaskVariant::INDEXED_VECTOR_CANDIDATES) {
       if (!std::is_sorted(authorized_fragments.begin(),
                           authorized_fragments.end()) ||
           std::adjacent_find(authorized_fragments.begin(),
@@ -958,6 +1085,29 @@ static void ValidateGlobalSearchState(const LanceVaneGlobalSearchState &state,
         throw SerializationException(
             "Distributed Lance indexed vector candidate assignment is "
             "contradictory");
+      }
+    } else {
+      if (!authorized_fragments.empty() ||
+          !state.selected_fragment_ids.empty() ||
+          !std::is_sorted(authorized_segments.begin(),
+                          authorized_segments.end()) ||
+          std::adjacent_find(authorized_segments.begin(),
+                             authorized_segments.end()) !=
+              authorized_segments.end()) {
+        throw SerializationException(
+            "Distributed Lance FTS candidate authorization is not unique");
+      }
+      if (!state.task_assignment_applied) {
+        if (authorized_segments != state.fts_segment_uuids ||
+            !state.selected_index_segment_uuids.empty()) {
+          throw SerializationException(
+              "Distributed Lance FTS candidate preauthorization is "
+              "contradictory");
+        }
+      } else if (!state.empty_assignment &&
+                 authorized_segments != state.selected_index_segment_uuids) {
+        throw SerializationException(
+            "Distributed Lance FTS candidate assignment is contradictory");
       }
     }
   }
@@ -1131,11 +1281,27 @@ struct LanceVaneIndexedVectorWorkDeleter {
   }
 };
 
+struct LanceVaneFtsWorkDeleter {
+  size_t len;
+
+  void operator()(LanceVaneFtsWorkFragment *value) const {
+    if (value) {
+      lance_vane_free_fts_work(value, len);
+    }
+  }
+};
+
 struct LanceVaneIndexedVectorWork {
   vector<string> segment_uuids;
   vector<uint64_t> segment_fragment_offsets;
   vector<uint64_t> segment_fragment_ids;
   vector<uint64_t> uncovered_fragment_ids;
+};
+
+struct LanceVaneFtsWork {
+  vector<string> segment_uuids;
+  vector<uint64_t> segment_fragment_offsets;
+  vector<uint64_t> segment_fragment_ids;
 };
 
 static bool TryPlanIndexedVectorWork(const LanceVaneGlobalSearchState &state,
@@ -1193,12 +1359,63 @@ static bool TryPlanIndexedVectorWork(const LanceVaneGlobalSearchState &state,
   return true;
 }
 
+static bool TryPlanFtsWork(const LanceVaneGlobalSearchState &state,
+                           LanceVaneFtsWork &result) {
+  LanceVaneFtsWorkFragment *work = nullptr;
+  size_t work_len = 0;
+  auto rc = lance_vane_plan_fts_work(
+      reinterpret_cast<const uint8_t *>(state.index_plan.data()),
+      state.index_plan.size(), &work, &work_len);
+  unique_ptr<LanceVaneFtsWorkFragment, LanceVaneFtsWorkDeleter> work_owner(
+      work, LanceVaneFtsWorkDeleter{work_len});
+  if (rc != 0 || (work_len > 0 && !work)) {
+    throw IOException("Failed to plan distributed FTS work" +
+                      LanceFormatErrorSuffix());
+  }
+  if (work_len == 0) {
+    return false;
+  }
+
+  LanceVaneFtsWork planned;
+  planned.segment_fragment_offsets.push_back(0);
+  for (idx_t work_idx = 0; work_idx < work_len; work_idx++) {
+    auto &item = work[work_idx];
+    string segment_uuid(reinterpret_cast<const char *>(item.segment_uuid),
+                        LANCE_VANE_INDEX_SEGMENT_UUID_SIZE);
+    if (std::all_of(segment_uuid.begin(), segment_uuid.end(),
+                    [](char value) { return value == 0; })) {
+      throw SerializationException("Distributed FTS work has a zero segment");
+    }
+    if (planned.segment_uuids.empty() ||
+        planned.segment_uuids.back() != segment_uuid) {
+      if (!planned.segment_uuids.empty()) {
+        planned.segment_fragment_offsets.push_back(
+            planned.segment_fragment_ids.size());
+      }
+      planned.segment_uuids.push_back(std::move(segment_uuid));
+    }
+    planned.segment_fragment_ids.push_back(item.fragment_id);
+  }
+  planned.segment_fragment_offsets.push_back(
+      planned.segment_fragment_ids.size());
+  result = std::move(planned);
+  return true;
+}
+
 static void
-FreezeVectorFragmentStats(const LanceVanePhysicalCandidate &candidate,
-                          LanceVaneGlobalSearchState &state) {
-  if (state.arguments.kind != LanceVaneSearchKind::VECTOR ||
-      (state.arguments.use_index &&
-       (state.arguments.nprobes == 0 || state.arguments.refine_factor != 0))) {
+FreezeCandidateFragmentStats(const LanceVanePhysicalCandidate &candidate,
+                             LanceVaneGlobalSearchState &state) {
+  auto vector_candidate =
+      state.arguments.kind == LanceVaneSearchKind::VECTOR &&
+      (!state.arguments.use_index ||
+       (state.arguments.nprobes != 0 && state.arguments.refine_factor == 0));
+  LanceVaneFtsWork fts_work;
+  auto fts_candidate =
+      state.arguments.kind == LanceVaneSearchKind::FTS &&
+      !state.arguments.namespace_backed &&
+      state.source_class == LanceVaneSearchSourceClass::DIRECT &&
+      TryPlanFtsWork(state, fts_work) && fts_work.segment_uuids.size() >= 2;
+  if (!vector_candidate && !fts_candidate) {
     return;
   }
   size_t stats_len = 0;
@@ -1206,7 +1423,7 @@ FreezeVectorFragmentStats(const LanceVanePhysicalCandidate &candidate,
                                                               &stats_len);
   if (!stats) {
     throw IOException(
-        "Failed to freeze distributed Lance vector fragment statistics" +
+        "Failed to freeze distributed Lance search fragment statistics" +
         LanceVaneFormatErrorSuffix(candidate.physical_uri,
                                    candidate.private_uri_diagnostics));
   }
@@ -1225,7 +1442,7 @@ FreezeVectorFragmentStats(const LanceVanePhysicalCandidate &candidate,
     if (!state.fragment_ids.empty() &&
         state.fragment_ids.back() == fragment.fragment_id) {
       throw IOException(
-          "Distributed Lance vector fragment identities are not unique");
+          "Distributed Lance search fragment identities are not unique");
     }
     state.fragment_ids.push_back(fragment.fragment_id);
     state.fragment_row_counts.push_back(fragment.num_rows);
@@ -1295,7 +1512,6 @@ LanceVanePrepareGlobalSearchState(const LanceVanePhysicalCandidate &candidate,
     state.schema_fingerprint = candidate.schema_fingerprint;
     state.frozen_snapshot = FreezeSearchSnapshot(candidate);
     ValidateAndMarkFrozenSearchSnapshot(state);
-    FreezeVectorFragmentStats(candidate, state);
     state.namespace_filter_plan =
         BuildNamespaceFilterPlan(candidate, arguments.namespace_filter);
     state.filter_fingerprint =
@@ -1303,6 +1519,7 @@ LanceVanePrepareGlobalSearchState(const LanceVanePhysicalCandidate &candidate,
     state.index_plan =
         BuildIndexPlan(candidate, arguments, *state.frozen_snapshot);
     ValidateAndMarkSearchPlanPayloads(state);
+    FreezeCandidateFragmentStats(candidate, state);
   } catch (Exception &) {
     state = {};
     state.arguments = arguments;
@@ -1496,6 +1713,47 @@ bool LanceVaneTryEnableVectorCandidates(LanceVaneGlobalSearchState &state,
   return true;
 }
 
+bool LanceVaneTryEnableFtsCandidates(LanceVaneGlobalSearchState &state,
+                                     bool has_filter) {
+  ValidateGlobalSearchState(state, true);
+  if (!state.valid || !state.finalized || state.worker_bind ||
+      state.execution_variant != LanceVaneSearchTaskVariant::FINAL_SEARCH ||
+      state.arguments.kind != LanceVaneSearchKind::FTS ||
+      state.arguments.namespace_backed ||
+      state.source_class != LanceVaneSearchSourceClass::DIRECT ||
+      !state.arguments.use_index || has_filter ||
+      !state.final_filter_ir.empty() || !state.namespace_filter_plan.empty() ||
+      state.filter_pushed_down || state.output_names.empty() ||
+      state.output_types.empty() || state.output_names.back() != "_score" ||
+      state.output_types.back() != LogicalType::FLOAT) {
+    return false;
+  }
+
+  uint64_t total_rows = 0;
+  for (auto row_count : state.fragment_row_counts) {
+    if (row_count < 0 || NumericCast<uint64_t>(row_count) >
+                             NumericLimits<uint64_t>::Maximum() - total_rows) {
+      return false;
+    }
+    total_rows += NumericCast<uint64_t>(row_count);
+  }
+  if (total_rows < LANCE_VANE_FTS_CANDIDATE_MIN_ROWS) {
+    return false;
+  }
+
+  LanceVaneFtsWork work;
+  if (!TryPlanFtsWork(state, work) || work.segment_uuids.size() < 2) {
+    return false;
+  }
+  state.fts_segment_uuids = std::move(work.segment_uuids);
+  state.fts_segment_fragment_offsets = std::move(work.segment_fragment_offsets);
+  state.fts_segment_fragment_ids = std::move(work.segment_fragment_ids);
+  state.execution_variant = LanceVaneSearchTaskVariant::FTS_CANDIDATES;
+  state.state_sha256 = LanceVaneSha256(CanonicalSearchStateBytes(state));
+  ValidateGlobalSearchState(state, true);
+  return true;
+}
+
 static DistributedScanSplit
 BuildSearchTaskAssignment(const LanceVaneGlobalSearchState &state,
                           optional_idx fragment_id = optional_idx(),
@@ -1532,32 +1790,37 @@ BuildSearchTaskAssignment(const LanceVaneGlobalSearchState &state,
       split.estimated_bytes = optional_idx(state.fragment_bytes_on_disk[index]);
     }
   } else if (!index_segment_uuid.empty()) {
-    auto segment = std::lower_bound(state.indexed_vector_segment_uuids.begin(),
-                                    state.indexed_vector_segment_uuids.end(),
+    auto &segment_uuids =
+        state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES
+            ? state.fts_segment_uuids
+            : state.indexed_vector_segment_uuids;
+    auto &segment_offsets =
+        state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES
+            ? state.fts_segment_fragment_offsets
+            : state.indexed_vector_segment_fragment_offsets;
+    auto &segment_fragments =
+        state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES
+            ? state.fts_segment_fragment_ids
+            : state.indexed_vector_segment_fragment_ids;
+    auto segment = std::lower_bound(segment_uuids.begin(), segment_uuids.end(),
                                     index_segment_uuid);
-    if (segment == state.indexed_vector_segment_uuids.end() ||
-        *segment != index_segment_uuid) {
+    if (segment == segment_uuids.end() || *segment != index_segment_uuid) {
       throw InternalException(
-          "Cannot build an indexed vector candidate task for an unknown "
-          "segment");
+          "Cannot build a search candidate task for an unknown segment");
     }
-    auto segment_idx = NumericCast<idx_t>(
-        segment - state.indexed_vector_segment_uuids.begin());
-    auto begin = NumericCast<idx_t>(
-        state.indexed_vector_segment_fragment_offsets[segment_idx]);
-    auto end = NumericCast<idx_t>(
-        state.indexed_vector_segment_fragment_offsets[segment_idx + 1]);
+    auto segment_idx = NumericCast<idx_t>(segment - segment_uuids.begin());
+    auto begin = NumericCast<idx_t>(segment_offsets[segment_idx]);
+    auto end = NumericCast<idx_t>(segment_offsets[segment_idx + 1]);
     uint64_t rows = 0;
     uint64_t bytes = 0;
     auto bytes_known = true;
     for (idx_t fragment_idx = begin; fragment_idx < end; fragment_idx++) {
-      auto fragment_id =
-          state.indexed_vector_segment_fragment_ids[fragment_idx];
+      auto fragment_id = segment_fragments[fragment_idx];
       auto fragment = std::lower_bound(state.fragment_ids.begin(),
                                        state.fragment_ids.end(), fragment_id);
       if (fragment == state.fragment_ids.end() || *fragment != fragment_id) {
         throw InternalException(
-            "Indexed vector candidate segment references an unknown fragment");
+            "Search candidate segment references an unknown fragment");
       }
       auto stats_idx =
           NumericCast<idx_t>(fragment - state.fragment_ids.begin());
@@ -1565,7 +1828,7 @@ BuildSearchTaskAssignment(const LanceVaneGlobalSearchState &state,
       if (row_count < 0 || NumericCast<uint64_t>(row_count) >
                                NumericLimits<uint64_t>::Maximum() - rows) {
         throw InternalException(
-            "Indexed vector candidate segment has invalid row statistics");
+            "Search candidate segment has invalid row statistics");
       }
       rows += NumericCast<uint64_t>(row_count);
       auto fragment_bytes = state.fragment_bytes_on_disk[stats_idx];
@@ -1624,6 +1887,14 @@ LanceVaneCreateSearchTaskAssignments(const LanceVaneGlobalSearchState &state) {
     for (auto fragment_id : state.fragment_ids) {
       result.push_back(
           BuildSearchTaskAssignment(state, optional_idx(fragment_id)));
+    }
+    return result;
+  }
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    result.reserve(state.fts_segment_uuids.size());
+    for (auto &segment_uuid : state.fts_segment_uuids) {
+      result.push_back(
+          BuildSearchTaskAssignment(state, optional_idx(), segment_uuid));
     }
     return result;
   }
@@ -1902,6 +2173,11 @@ void LanceVaneSerializeGlobalSearchState(
                            state.indexed_vector_uncovered_fragment_ids);
   serializer.WriteProperty(259, "selected_index_segment_uuids",
                            state.selected_index_segment_uuids);
+  serializer.WriteProperty(260, "fts_segment_uuids", state.fts_segment_uuids);
+  serializer.WriteProperty(261, "fts_segment_fragment_offsets",
+                           state.fts_segment_fragment_offsets);
+  serializer.WriteProperty(262, "fts_segment_fragment_ids",
+                           state.fts_segment_fragment_ids);
 }
 
 LanceVaneGlobalSearchState
@@ -2016,7 +2292,9 @@ LanceVaneDeserializeGlobalSearchState(Deserializer &deserializer) {
                                LanceVaneSearchTaskVariant::VECTOR_CANDIDATES) &&
       execution_variant !=
           static_cast<uint64_t>(
-              LanceVaneSearchTaskVariant::INDEXED_VECTOR_CANDIDATES)) {
+              LanceVaneSearchTaskVariant::INDEXED_VECTOR_CANDIDATES) &&
+      execution_variant !=
+          static_cast<uint64_t>(LanceVaneSearchTaskVariant::FTS_CANDIDATES)) {
     throw SerializationException(
         "Distributed Lance search has an invalid execution variant");
   }
@@ -2045,6 +2323,13 @@ LanceVaneDeserializeGlobalSearchState(Deserializer &deserializer) {
   state.selected_index_segment_uuids =
       deserializer.ReadProperty<vector<string>>(259,
                                                 "selected_index_segment_uuids");
+  state.fts_segment_uuids =
+      deserializer.ReadProperty<vector<string>>(260, "fts_segment_uuids");
+  state.fts_segment_fragment_offsets =
+      deserializer.ReadProperty<vector<uint64_t>>(
+          261, "fts_segment_fragment_offsets");
+  state.fts_segment_fragment_ids = deserializer.ReadProperty<vector<uint64_t>>(
+      262, "fts_segment_fragment_ids");
   if (frozen_snapshot_version != LANCE_VANE_FROZEN_SEARCH_SNAPSHOT_VERSION) {
     throw SerializationException(
         "Distributed Lance search has an unsupported frozen snapshot format");
@@ -2103,6 +2388,8 @@ LanceVaneOpenSearchSnapshot(ClientContext &context,
       (state.execution_variant ==
            LanceVaneSearchTaskVariant::INDEXED_VECTOR_CANDIDATES &&
        state.selected_fragment_ids.empty() &&
+       state.selected_index_segment_uuids.empty()) ||
+      (state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES &&
        state.selected_index_segment_uuids.empty())) {
     throw InvalidInputException(
         "Distributed Lance search execution requires authorized task "
@@ -2116,9 +2403,9 @@ LanceVaneOpenSearchSnapshotForMaterialization(
     ClientContext &context, const LanceVaneGlobalSearchState &state) {
   ValidateGlobalSearchState(state, true);
   if (!state.valid || !state.finalized || state.worker_bind ||
-      !LanceVaneIsVectorCandidateVariant(state.execution_variant)) {
+      !LanceVaneIsCandidateVariant(state.execution_variant)) {
     throw InvalidInputException(
-        "Distributed Lance vector materialization state is contradictory");
+        "Distributed Lance search materialization state is contradictory");
   }
   return OpenValidatedSearchSnapshot(context, state);
 }
@@ -2144,13 +2431,13 @@ void LanceVanePopulateSearchSchema(ClientContext &context,
 void LanceVaneValidateExecutionInput(const TableFunctionInitInput &input,
                                      const LanceVaneGlobalSearchState &state) {
   ValidateGlobalSearchState(state, true);
-  if (LanceVaneIsVectorCandidateVariant(state.execution_variant)) {
+  if (LanceVaneIsCandidateVariant(state.execution_variant)) {
     if (input.column_indexes !=
             vector<ColumnIndex>{ColumnIndex(0), ColumnIndex(1)} ||
         !input.projection_ids.empty() ||
         (input.filters && !input.filters->filters.empty())) {
       throw InvalidInputException(
-          "Distributed Lance vector candidate projection changed after "
+          "Distributed Lance search candidate projection changed after "
           "admission");
     }
     return;
@@ -2174,13 +2461,13 @@ void LanceVaneValidateDistributedInput(
     const TableFunctionDistributedScanInput &input,
     const LanceVaneGlobalSearchState &state) {
   ValidateGlobalSearchState(state, true);
-  if (LanceVaneIsVectorCandidateVariant(state.execution_variant)) {
+  if (LanceVaneIsCandidateVariant(state.execution_variant)) {
     if (input.column_ids !=
             vector<ColumnIndex>{ColumnIndex(0), ColumnIndex(1)} ||
         !input.projection_ids.empty() ||
         (input.table_filters && !input.table_filters->filters.empty())) {
       throw InvalidInputException(
-          "Distributed Lance vector candidate projection changed after "
+          "Distributed Lance search candidate projection changed after "
           "admission");
     }
     return;

@@ -1454,6 +1454,39 @@ def _write_vector_candidate_dataset(
         connection.execute("SET arrow_large_buffer_size = false")
 
 
+def _write_fts_candidate_dataset(
+    connection,
+    path: str | Path,
+    *,
+    start: int,
+    rows: int,
+    mode: str,
+    every_row_matches: bool,
+) -> None:
+    text = (
+        "'puppy'::VARCHAR"
+        if every_row_matches
+        else "CASE WHEN i = 0 THEN "
+        "('puppy ' || repeat('filler ', 32))::VARCHAR "
+        "ELSE 'filler'::VARCHAR END"
+    )
+    connection.execute("SET arrow_output_version = '1.0'")
+    connection.execute("SET arrow_large_buffer_size = true")
+    try:
+        connection.execute(
+            "COPY (SELECT i::BIGINT AS id, "
+            f'{text} AS "text", '
+            "('label-' || i::VARCHAR)::VARCHAR AS label, "
+            "[(i % 4)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT]"
+            "::FLOAT[4] AS vec "
+            f"FROM range({start}, {start + rows}) AS source(i)) "
+            f"TO {_sql_literal(path)} "
+            f"(FORMAT LANCE, MODE '{mode}', MAX_ROWS_PER_FILE 2048)"
+        )
+    finally:
+        connection.execute("SET arrow_large_buffer_size = false")
+
+
 def _zero_vector_sql() -> str:
     return (
         f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), "
@@ -1736,6 +1769,29 @@ def _indexed_vector_candidate_assignment_details(
                 work_kind,
                 parsed_identity,
             )
+        )
+    return result
+
+
+def _fts_candidate_assignment_details(
+    batch: bytes,
+) -> list[tuple[str, bytes, int, int, str]]:
+    result: list[tuple[str, bytes, int, int, str]] = []
+    for task_id, singleton, _ in vane.ray_cxx.split_scan_split_batch(batch):
+        prefix, search_uuid, segment_uuid = task_id.split(":", 2)
+        assert prefix == "fts-candidates"
+        assert len(segment_uuid) == 32
+        singleton = bytes(singleton)
+        variant_marker = b"\x02" + search_uuid.encode()
+        assert singleton.count(variant_marker) == 1
+        variant_offset = singleton.index(variant_marker)
+        digest_offset = variant_offset + len(variant_marker)
+        payload_end = digest_offset + 32 + 16
+        payload = singleton[variant_offset:payload_end]
+        assert len(payload) == 85
+        assert payload[-16:].hex() == segment_uuid
+        result.append(
+            (task_id, singleton, variant_offset, digest_offset, segment_uuid)
         )
     return result
 
@@ -2790,6 +2846,117 @@ def test_indexed_vector_candidates_use_disjoint_segments_and_uncovered_fragments
         assert len(fragment_details) == 1
         assert fragment_details[0][5] == 9
         assert _run(ray_runner, connection.sql(mixed_sql)) == expected
+    finally:
+        connection.close()
+
+
+def test_fts_candidates_use_disjoint_full_coverage_segments_and_global_bm25(
+    tmp_path: Path, ray_cluster: frozenset[str], ray_runner
+) -> None:
+    import ray
+
+    connection = _connect()
+    path = tmp_path / "fts_candidates.lance"
+    path_sql = _sql_literal(path)
+    search_sql = (
+        "SELECT id, label, _score FROM lance_fts("
+        f"{path_sql}, 'text', 'puppy', k = 7) "
+        "ORDER BY _score DESC, id"
+    )
+
+    def assert_final_search(sql: str, name: str) -> None:
+        flattened = [
+            batch
+            for batches in _split_batches(connection, connection.sql(sql)).values()
+            for batch in batches
+        ]
+        assert len(flattened) == 1, name
+        task_id, singleton, variant_offset, _ = _search_task_assignment_details(
+            flattened[0]
+        )
+        assert task_id.startswith("final-search:"), name
+        assert singleton[variant_offset] == 0, name
+
+    try:
+        # The first physical index segment covers two fragments but is still
+        # one work unit, so it remains a singleton search.
+        _write_fts_candidate_dataset(
+            connection,
+            path,
+            start=0,
+            rows=4096,
+            mode="create",
+            every_row_matches=False,
+        )
+        connection.execute(
+            f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED"
+        )
+        assert_final_search(search_sql, "one-full-coverage-segment")
+
+        # Uncovered fragments are not safe independent FTS work because their
+        # scores would not come from the same indexed corpus statistics.
+        _write_fts_candidate_dataset(
+            connection,
+            path,
+            start=4096,
+            rows=1024,
+            mode="append",
+            every_row_matches=True,
+        )
+        assert_final_search(search_sql, "partial-coverage")
+
+        connection.execute(
+            f"ALTER INDEX text_idx ON {path_sql} OPTIMIZE WITH (mode = 'append')"
+        )
+        connection.close()
+        connection = _connect()
+
+        # A computed-score postfilter intentionally keeps this reference on
+        # Lance's singleton path without changing the positive-score result.
+        reference_sql = search_sql.replace(
+            ") ORDER BY", ") WHERE _score >= 0 ORDER BY"
+        )
+        assert_final_search(reference_sql, "native-reference")
+        expected = connection.execute(reference_sql).fetchall()
+        assert [row[0] for row in expected] == list(range(4096, 4103))
+        assert connection.execute(search_sql).fetchall() == expected
+
+        relation = connection.sql(search_sql)
+        details = [
+            detail
+            for batches in _split_batches(connection, relation).values()
+            for batch in batches
+            for detail in _fts_candidate_assignment_details(batch)
+        ]
+        assert len(details) == 2
+        assert len({detail[0] for detail in details}) == len(details)
+        assert len({detail[4] for detail in details}) == len(details)
+        assert all(detail[1][detail[2]] == 2 for detail in details)
+
+        baseline_task_ids = set(_settled_ray_fte_create_task_locations())
+        assert _run(ray_runner, relation) == expected
+        execution_node_ids = _ray_fte_create_task_node_ids(
+            baseline_task_ids, expected_count=WORKER_COUNT
+        )
+        assert execution_node_ids == set(ray_cluster)
+        _assert_vane_worker_topology(ray, ray_runner)
+
+        filtered_sql = (
+            "SELECT id, _score FROM lance_fts("
+            f"{path_sql}, 'text', 'puppy', k = 7, prefilter = true) "
+            "WHERE id >= 4096 ORDER BY _score DESC, id"
+        )
+        assert_final_search(filtered_sql, "prefilter")
+        filtered_expected = connection.execute(filtered_sql).fetchall()
+        assert _run(ray_runner, connection.sql(filtered_sql)) == filtered_expected
+
+        hybrid_sql = (
+            "SELECT id, _hybrid_score FROM lance_hybrid_search("
+            f"{path_sql}, 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], "
+            "'text', 'puppy', k = 3, use_index = false) "
+            "ORDER BY _hybrid_score DESC, id"
+        )
+        assert_final_search(hybrid_sql, "hybrid")
     finally:
         connection.close()
 
