@@ -2533,6 +2533,7 @@ mod tests {
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes.push(0);
+        bytes.push(0);
 
         let generation = CString::new("g").unwrap();
         let other_generation = CString::new("other").unwrap();

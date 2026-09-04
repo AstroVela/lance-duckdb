@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
-use lance::index::scalar::load_segments;
+use lance::index::scalar::{load_segment_params, load_segments};
 use lance::index::DatasetIndexExt;
 use lance::Dataset;
 use lance_index::pb::{VectorIndexDetails, VectorMetricType};
@@ -270,6 +270,7 @@ pub(crate) struct SearchIndexPlan {
     fragments: Vec<u64>,
     vector: Option<BranchPlan>,
     fts: Option<BranchPlan>,
+    fts_segment_params_compatible: bool,
 }
 
 impl SearchIndexPlan {
@@ -284,6 +285,7 @@ impl SearchIndexPlan {
         })?;
         writer.option(self.vector.as_ref(), |writer, branch| branch.encode(writer))?;
         writer.option(self.fts.as_ref(), |writer, branch| branch.encode(writer))?;
+        writer.u8(self.fts_segment_params_compatible.into());
         Ok(writer.finish())
     }
 
@@ -299,6 +301,7 @@ impl SearchIndexPlan {
             fragments: reader.vec(|reader| reader.u64())?,
             vector: reader.option(BranchPlan::decode)?,
             fts: reader.option(BranchPlan::decode)?,
+            fts_segment_params_compatible: reader.bool()?,
         };
         reader.finish()?;
         result.validate_shape()?;
@@ -311,6 +314,11 @@ impl SearchIndexPlan {
         }
         if self.vector.is_none() && self.fts.is_none() {
             bail!("SearchIndexPlan has no search branch");
+        }
+        if self.fts_segment_params_compatible
+            && !self.fts.as_ref().is_some_and(|branch| branch.use_index)
+        {
+            bail!("SearchIndexPlan has compatible FTS segment parameters without an index");
         }
         validate_sorted_unique(&self.fragments, "fragment ids")?;
         for (name, branch) in [("vector", &self.vector), ("fts", &self.fts)] {
@@ -486,7 +494,8 @@ impl SearchIndexPlan {
 
     pub(crate) fn fts_work_fragments(&self) -> Option<Vec<LanceVaneFtsWorkFragment>> {
         let branch = self.fts.as_ref()?;
-        if !branch.use_index
+        if !self.fts_segment_params_compatible
+            || !branch.use_index
             || branch.selected.is_empty()
             || !branch.uncovered_fragments.is_empty()
             || branch.selected.iter().any(|metadata| {
@@ -664,16 +673,17 @@ pub(crate) async fn build_search_index_plan(
         ),
         SearchKind::Fts => None,
     };
-    let fts = match kind {
-        SearchKind::Fts | SearchKind::Hybrid => Some(
-            build_fts_branch(
+    let (fts, fts_segment_params_compatible) = match kind {
+        SearchKind::Fts | SearchKind::Hybrid => {
+            let (branch, compatible) = build_fts_branch(
                 dataset,
                 text_column.ok_or_else(|| anyhow!("missing text column"))?,
                 &fragments,
             )
-            .await?,
-        ),
-        SearchKind::Vector => None,
+            .await?;
+            (Some(branch), compatible)
+        }
+        SearchKind::Vector => (None, false),
     };
     SearchIndexPlan {
         dataset_version: dataset.version_id(),
@@ -681,6 +691,7 @@ pub(crate) async fn build_search_index_plan(
         fragments,
         vector,
         fts,
+        fts_segment_params_compatible,
     }
     .encode()
 }
@@ -718,7 +729,7 @@ async fn build_fts_branch(
     dataset: &Dataset,
     field_name: &str,
     fragments: &[u64],
-) -> Result<BranchPlan> {
+) -> Result<(BranchPlan, bool)> {
     let field_id = dataset.schema().field_id(field_name)?;
     let segments = load_segments(dataset, field_name)
         .await?
@@ -728,7 +739,30 @@ async fn build_fts_branch(
         .into_iter()
         .filter(|metadata| metadata_intersects(metadata, fragments))
         .collect::<Vec<_>>();
-    branch_from_metadata(field_id, field_name, selected, fragments)
+    let params_compatible = fts_segment_params_compatible(dataset, &selected).await?;
+    Ok((
+        branch_from_metadata(field_id, field_name, selected, fragments)?,
+        params_compatible,
+    ))
+}
+
+async fn fts_segment_params_compatible(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+) -> Result<bool> {
+    let Some(first) = segments.first() else {
+        return Ok(false);
+    };
+    // Use Lance's full-fidelity segment loader instead of manifest
+    // InvertedIndexDetails. The latter intentionally omits settings such as
+    // custom stop words, while worker scoring opens the physical parameters.
+    let expected = load_segment_params(dataset, first).await?;
+    for segment in &segments[1..] {
+        if load_segment_params(dataset, segment).await? != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn require_known_fragment_coverage(metadata: &[IndexMetadata], branch: &str) -> Result<()> {
@@ -1119,12 +1153,14 @@ mod tests {
     }
 
     fn plan(vector: Option<BranchPlan>, fts: Option<BranchPlan>) -> SearchIndexPlan {
+        let fts_segment_params_compatible = fts.as_ref().is_some_and(|branch| branch.use_index);
         SearchIndexPlan {
             dataset_version: 7,
             generation: "generation".to_string(),
             fragments: vec![1, 3],
             vector,
             fts,
+            fts_segment_params_compatible,
         }
     }
 
@@ -1342,6 +1378,10 @@ mod tests {
         let mut wrong_type = multiple.clone();
         wrong_type.selected[0].details = Some(vector_index_details(VectorMetricType::L2));
         assert!(plan(None, Some(wrong_type)).fts_work_fragments().is_none());
+
+        let mut incompatible = plan(None, Some(multiple.clone()));
+        incompatible.fts_segment_params_compatible = false;
+        assert!(incompatible.fts_work_fragments().is_none());
 
         let mut zero_uuid = multiple;
         zero_uuid.selected[0].uuid = [0; 16];
