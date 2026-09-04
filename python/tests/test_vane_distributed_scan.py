@@ -851,26 +851,35 @@ def sql_literal(value):
 
 
 def fte_create_task_locations():
-    from ray._private import ray_constants
-    from ray._private.grpc_utils import init_grpc_channel
+    from ray._private.gcs_utils import create_gcs_channel
     from ray.core.generated import gcs_service_pb2_grpc
-    from ray.core.generated.gcs_service_pb2 import GetTaskEventsRequest
+    from ray.core.generated.gcs_service_pb2 import EQUAL, GetTaskEventsRequest
 
-    channel = init_grpc_channel(
-        ray.get_runtime_context().gcs_address,
-        ray_constants.GLOBAL_GRPC_OPTIONS,
-        asynchronous=False,
+    # The unfiltered event stream exceeds gRPC's default 4 MiB limit after a
+    # full distributed test run. Use Ray's GCS channel and filter at source.
+    task_name = "RayWorkerActor.fte_create_task"
+    request = GetTaskEventsRequest(
+        limit=10000,
+        filters=GetTaskEventsRequest.Filters(
+            task_name_filters=[
+                GetTaskEventsRequest.Filters.TaskNameFilter(
+                    predicate=EQUAL,
+                    task_name=task_name,
+                )
+            ]
+        ),
     )
+    channel = create_gcs_channel(ray.get_runtime_context().gcs_address, aio=False)
     try:
         reply = gcs_service_pb2_grpc.TaskInfoGcsServiceStub(channel).GetTaskEvents(
-            GetTaskEventsRequest(limit=10000), timeout=10
+            request, timeout=10
         )
     finally:
         channel.close()
     assert int(reply.status.code) == 0, reply.status.message
     locations = {}
     for event in reply.events_by_task:
-        if not event.task_info.name.endswith(".fte_create_task"):
+        if event.task_info.name != task_name:
             continue
         node_id = event.state_updates.node_id or event.task_info.node_id
         if node_id:
@@ -1994,19 +2003,28 @@ def _assert_vane_worker_topology(ray, runner) -> None:
 
 def _ray_fte_create_task_locations() -> dict[str, str]:
     import ray
-    from ray._private import ray_constants
-    from ray._private.grpc_utils import init_grpc_channel
+    from ray._private.gcs_utils import create_gcs_channel
     from ray.core.generated import gcs_service_pb2_grpc
-    from ray.core.generated.gcs_service_pb2 import GetTaskEventsRequest
+    from ray.core.generated.gcs_service_pb2 import EQUAL, GetTaskEventsRequest
 
-    channel = init_grpc_channel(
-        ray.get_runtime_context().gcs_address,
-        ray_constants.GLOBAL_GRPC_OPTIONS,
-        asynchronous=False,
+    # The unfiltered event stream exceeds gRPC's default 4 MiB limit after a
+    # full distributed test run. Use Ray's GCS channel and filter at source.
+    task_name = "RayWorkerActor.fte_create_task"
+    request = GetTaskEventsRequest(
+        limit=10000,
+        filters=GetTaskEventsRequest.Filters(
+            task_name_filters=[
+                GetTaskEventsRequest.Filters.TaskNameFilter(
+                    predicate=EQUAL,
+                    task_name=task_name,
+                )
+            ]
+        ),
     )
+    channel = create_gcs_channel(ray.get_runtime_context().gcs_address, aio=False)
     try:
         reply = gcs_service_pb2_grpc.TaskInfoGcsServiceStub(channel).GetTaskEvents(
-            GetTaskEventsRequest(limit=10000), timeout=10
+            request, timeout=10
         )
     finally:
         channel.close()
@@ -2015,7 +2033,7 @@ def _ray_fte_create_task_locations() -> dict[str, str]:
 
     locations: dict[str, str] = {}
     for event in reply.events_by_task:
-        if not event.task_info.name.endswith(".fte_create_task"):
+        if event.task_info.name != task_name:
             continue
         node_id = event.state_updates.node_id or event.task_info.node_id
         if node_id:
