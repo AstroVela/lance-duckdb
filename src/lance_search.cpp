@@ -1512,28 +1512,44 @@ static unique_ptr<FunctionData>
 LanceVectorMaterializeBind(ClientContext &, TableFunctionBindInput &,
                            vector<LogicalType> &, vector<string> &) {
   throw BinderException(
-      "__lance_vector_search_materialize is an internal table function");
+      "__lance_search_materialize is an internal table function");
+}
+
+static const char *
+LanceCandidateValueColumn(const LanceVaneGlobalSearchState &state) {
+  if (LanceVaneIsVectorCandidateVariant(state.execution_variant) &&
+      state.arguments.kind == LanceVaneSearchKind::VECTOR) {
+    return "_distance";
+  }
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES &&
+      state.arguments.kind == LanceVaneSearchKind::FTS) {
+    return "_score";
+  }
+  throw SerializationException(
+      "Distributed Lance candidate materialization state is malformed");
 }
 
 static vector<ColumnIndex>
 LanceVectorMaterializeColumns(const LanceVaneGlobalSearchState &state) {
+  auto value_column = LanceCandidateValueColumn(state);
   if (state.output_names.empty() ||
       state.output_names.size() != state.output_types.size() ||
-      state.output_names.back() != "_distance") {
+      state.output_names.back() != value_column ||
+      state.output_types.back() != LogicalType::FLOAT) {
     throw SerializationException(
-        "Distributed Lance vector materialization schema is malformed");
+        "Distributed Lance candidate materialization schema is malformed");
   }
   auto append_column = [&](vector<ColumnIndex> &result,
                            const ColumnIndex &column) {
     if (!column.HasPrimaryIndex() || column.IsVirtualColumn()) {
       throw SerializationException(
-          "Distributed Lance vector materialization cannot reference a "
+          "Distributed Lance candidate materialization cannot reference a "
           "virtual or non-primary column");
     }
     auto column_id = column.GetPrimaryIndex();
     if (column_id >= state.output_names.size()) {
       throw SerializationException(
-          "Distributed Lance vector materialization column is malformed");
+          "Distributed Lance candidate materialization column is malformed");
     }
     result.push_back(column);
   };
@@ -1550,7 +1566,8 @@ LanceVectorMaterializeColumns(const LanceVaneGlobalSearchState &state) {
   for (auto projection_id : state.projection_ids) {
     if (projection_id >= state.column_ids.size()) {
       throw SerializationException(
-          "Distributed Lance vector materialization projection is malformed");
+          "Distributed Lance candidate materialization projection is "
+          "malformed");
     }
     append_column(result, state.column_ids[projection_id]);
   }
@@ -1568,7 +1585,7 @@ struct LanceVectorMaterializeProjection {
 static LanceVectorMaterializeProjection
 LanceBuildVectorMaterializeProjection(const LanceVaneGlobalSearchState &state) {
   auto output_columns = LanceVectorMaterializeColumns(state);
-  auto distance_column_id = state.output_names.size() - 1;
+  auto value_column_id = state.output_names.size() - 1;
   LanceVectorMaterializeProjection result;
   unordered_map<column_t, column_t> arrow_positions;
   // Preserve every DuckDB child path for the output mapping. Only the
@@ -1577,17 +1594,17 @@ LanceBuildVectorMaterializeProjection(const LanceVaneGlobalSearchState &state) {
   result.arrow_column_ids.reserve(output_columns.size());
   for (auto &column : output_columns) {
     auto column_id = column.GetPrimaryIndex();
-    if (column_id == distance_column_id) {
+    if (column_id == value_column_id) {
       if (column.HasChildren()) {
         throw SerializationException(
-            "Distributed Lance vector materialization distance column has "
+            "Distributed Lance candidate materialization value column has "
             "an invalid child path");
       }
       continue;
     }
-    if (column_id > distance_column_id) {
+    if (column_id > value_column_id) {
       throw SerializationException(
-          "Distributed Lance vector materialization column is malformed");
+          "Distributed Lance candidate materialization column is malformed");
     }
     if (arrow_positions.find(column_id) != arrow_positions.end()) {
       continue;
@@ -1598,20 +1615,20 @@ LanceBuildVectorMaterializeProjection(const LanceVaneGlobalSearchState &state) {
     result.arrow_names.push_back(state.output_names[column_id]);
     result.arrow_types.push_back(state.output_types[column_id]);
   }
-  auto distance_arrow_position =
-      NumericCast<column_t>(result.arrow_names.size());
-  result.arrow_names.push_back(state.output_names[distance_column_id]);
-  result.arrow_types.push_back(state.output_types[distance_column_id]);
+  auto value_arrow_position = NumericCast<column_t>(result.arrow_names.size());
+  result.arrow_names.push_back(state.output_names[value_column_id]);
+  result.arrow_types.push_back(state.output_types[value_column_id]);
   for (auto &column : output_columns) {
     auto column_id = column.GetPrimaryIndex();
-    if (column_id == distance_column_id) {
-      result.arrow_column_ids.push_back(distance_arrow_position);
+    if (column_id == value_column_id) {
+      result.arrow_column_ids.push_back(value_arrow_position);
       continue;
     }
     auto position = arrow_positions.find(column_id);
     if (position == arrow_positions.end()) {
       throw InternalException(
-          "Missing distributed Lance vector materialization column mapping");
+          "Missing distributed Lance candidate materialization column "
+          "mapping");
     }
     result.arrow_column_ids.push_back(position->second);
   }
@@ -1635,12 +1652,12 @@ LanceVectorMaterializeOutputTypes(const LanceVaneGlobalSearchState &state) {
     auto column_id = column.GetPrimaryIndex();
     if (column_id >= state.output_types.size()) {
       throw SerializationException(
-          "Distributed Lance vector materialization schema is malformed");
+          "Distributed Lance candidate materialization schema is malformed");
     }
     if (column.IsPushdownExtract()) {
       if (!column.HasType() || !column.HasChildren()) {
         throw SerializationException(
-            "Distributed Lance vector materialization extract is malformed");
+            "Distributed Lance candidate materialization extract is malformed");
       }
       result.push_back(column.GetScanType());
     } else {
@@ -1658,7 +1675,7 @@ static void LanceVectorMaterializeOutputVector(Vector &root,
     // The projection above the scan still expects the complete root value.
     if (root.GetType() != output.GetType()) {
       throw SerializationException(
-          "Distributed Lance vector materialization output type changed");
+          "Distributed Lance candidate materialization output type changed");
     }
     output.Reference(root);
     return;
@@ -1672,21 +1689,21 @@ static void LanceVectorMaterializeOutputVector(Vector &root,
     if (path->ChildIndexCount() != 1 ||
         current->GetType().id() != LogicalTypeId::STRUCT) {
       throw SerializationException(
-          "Distributed Lance vector materialization extract path is "
+          "Distributed Lance candidate materialization extract path is "
           "malformed");
     }
     parent_validity.Combine(FlatVector::Validity(*current), count);
     auto &child = path->GetChildIndex(0);
     if (!child.HasPrimaryIndex() || child.IsVirtualColumn()) {
       throw SerializationException(
-          "Distributed Lance vector materialization extract path must use "
+          "Distributed Lance candidate materialization extract path must use "
           "primary struct indexes");
     }
     auto child_id = child.GetPrimaryIndex();
     auto &entries = StructVector::GetEntries(*current);
     if (child_id >= entries.size()) {
       throw SerializationException(
-          "Distributed Lance vector materialization extract path is out of "
+          "Distributed Lance candidate materialization extract path is out of "
           "range");
     }
     current = entries[child_id].get();
@@ -1695,7 +1712,8 @@ static void LanceVectorMaterializeOutputVector(Vector &root,
   if (!column.HasType() || current->GetType() != column.GetScanType() ||
       current->GetType() != output.GetType()) {
     throw SerializationException(
-        "Distributed Lance vector materialization extract type is malformed");
+        "Distributed Lance candidate materialization extract type is "
+        "malformed");
   }
   output.Reference(*current);
   // A pushed-down child becomes a top-level output vector, so retain the NULL
@@ -1710,7 +1728,7 @@ LanceVectorMaterializeInitGlobal(ClientContext &context,
   auto &bind_data = input.bind_data->Cast<LanceVectorMaterializeBindData>();
   if (input.column_indexes != bind_data.vane_state.column_ids) {
     throw InvalidInputException(
-        "Distributed Lance vector materialization projection changed after "
+        "Distributed Lance candidate materialization projection changed after "
         "admission");
   }
   auto result = make_uniq_base<GlobalTableFunctionState,
@@ -1754,7 +1772,7 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &context,
       input.data[0].GetType() != LogicalType::UBIGINT ||
       input.data[1].GetType() != LogicalType::FLOAT) {
     throw InvalidInputException(
-        "Distributed Lance vector materialization received an invalid "
+        "Distributed Lance candidate materialization received an invalid "
         "candidate schema");
   }
 
@@ -1762,36 +1780,38 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &context,
   auto &global = data.global_state->Cast<LanceVectorMaterializeGlobalState>();
   auto &local = data.local_state->Cast<LanceVectorMaterializeLocalState>();
   UnifiedVectorFormat row_id_format;
-  UnifiedVectorFormat distance_format;
+  UnifiedVectorFormat value_format;
   input.data[0].ToUnifiedFormat(input.size(), row_id_format);
-  input.data[1].ToUnifiedFormat(input.size(), distance_format);
+  input.data[1].ToUnifiedFormat(input.size(), value_format);
   auto row_id_data = UnifiedVectorFormat::GetData<uint64_t>(row_id_format);
-  auto distance_data = UnifiedVectorFormat::GetData<float>(distance_format);
+  auto value_data = UnifiedVectorFormat::GetData<float>(value_format);
   vector<uint64_t> row_ids;
-  vector<float> distances;
+  vector<float> values;
   row_ids.reserve(input.size());
-  distances.reserve(input.size());
+  values.reserve(input.size());
   for (idx_t row = 0; row < input.size(); row++) {
     auto row_id_index = row_id_format.sel->get_index(row);
-    auto distance_index = distance_format.sel->get_index(row);
+    auto value_index = value_format.sel->get_index(row);
     if (!row_id_format.validity.RowIsValid(row_id_index)) {
       throw InvalidInputException(
-          "Distributed Lance vector materialization received a NULL row id");
+          "Distributed Lance candidate materialization received a NULL row "
+          "id");
     }
-    if (!distance_format.validity.RowIsValid(distance_index)) {
+    if (!value_format.validity.RowIsValid(value_index)) {
       throw InvalidInputException(
-          "Distributed Lance vector materialization received a NULL distance");
+          "Distributed Lance candidate materialization received a NULL search "
+          "value");
     }
     auto row_id = row_id_data[row_id_index];
     if (!global.seen_row_ids.insert(row_id).second) {
       throw InvalidInputException(
-          "Distributed Lance vector materialization received duplicate row "
+          "Distributed Lance candidate materialization received duplicate row "
           "id %llu at candidate offset %llu after observing %llu unique "
           "rows",
           row_id, row, global.seen_row_ids.size());
     }
     row_ids.push_back(row_id);
-    distances.push_back(distance_data[distance_index]);
+    values.push_back(value_data[value_index]);
   }
 
   vector<const char *> take_columns;
@@ -1799,15 +1819,22 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &context,
   for (auto &column : bind_data.take_columns) {
     take_columns.push_back(column.c_str());
   }
-  auto *batch = lance_vane_take_vector_rows(
-      global.dataset, row_ids.data(), distances.data(), row_ids.size(),
-      take_columns.data(), take_columns.size());
+  void *batch = nullptr;
+  if (bind_data.vane_state.execution_variant ==
+      LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    batch = lance_vane_take_fts_rows(global.dataset, row_ids.data(),
+                                     values.data(), row_ids.size(),
+                                     take_columns.data(), take_columns.size());
+  } else {
+    batch = lance_vane_take_vector_rows(
+        global.dataset, row_ids.data(), values.data(), row_ids.size(),
+        take_columns.data(), take_columns.size());
+  }
   if (!batch) {
-    throw IOException(
-        "Failed to materialize distributed Lance vector search rows" +
-        LanceVaneFormatErrorSuffix(
-            bind_data.vane_state.physical_uri,
-            bind_data.vane_state.private_uri_diagnostics));
+    throw IOException("Failed to materialize distributed Lance search rows" +
+                      LanceVaneFormatErrorSuffix(
+                          bind_data.vane_state.physical_uri,
+                          bind_data.vane_state.private_uri_diagnostics));
   }
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
   memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
@@ -1817,7 +1844,7 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &context,
                            &batch_schema.arrow_schema) != 0) {
     lance_free_batch(batch);
     throw IOException(
-        "Failed to export distributed Lance vector materialization batch" +
+        "Failed to export distributed Lance candidate materialization batch" +
         LanceVaneFormatErrorSuffix(
             bind_data.vane_state.physical_uri,
             bind_data.vane_state.private_uri_diagnostics));
@@ -1832,7 +1859,7 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &context,
   if (batch_arrow_table.GetNames() != bind_data.names ||
       batch_arrow_table.GetTypes() != bind_data.types) {
     throw SerializationException(
-        "Distributed Lance vector materialization schema changed");
+        "Distributed Lance candidate materialization schema changed");
   }
 
   local.chunk = std::move(new_chunk);
@@ -1846,14 +1873,15 @@ static OperatorResultType LanceVectorMaterializeFunc(ExecutionContext &context,
   if (output.ColumnCount() != local.output_columns.size() ||
       output.ColumnCount() != local.output_arrow_column_ids.size()) {
     throw InternalException(
-        "Distributed Lance vector materialization output mapping changed");
+        "Distributed Lance candidate materialization output mapping changed");
   }
   output.SetCardinality(input.size());
   for (idx_t output_id = 0; output_id < output.ColumnCount(); output_id++) {
     auto arrow_id = local.output_arrow_column_ids[output_id];
     if (arrow_id >= local.materialized_columns.ColumnCount()) {
       throw InternalException(
-          "Distributed Lance vector materialization output is out of range");
+          "Distributed Lance candidate materialization output is out of "
+          "range");
     }
     auto &source = local.materialized_columns.data[arrow_id];
     LanceVectorMaterializeOutputVector(source, local.output_columns[output_id],
@@ -1869,13 +1897,13 @@ LanceVectorMaterializeBatchFunc(ExecutionContext &context,
                                 ExecutionBatch &output) {
   if (input.kind != ExecutionBatchKind::MATERIALIZED_CHUNK) {
     throw InvalidInputException(
-        "Distributed Lance vector materialization requires a native TopN "
+        "Distributed Lance candidate materialization requires a native TopN "
         "batch");
   }
   if (!input.materialized) {
     if (input.rows != 0) {
       throw InvalidInputException(
-          "Distributed Lance vector materialization received a missing "
+          "Distributed Lance candidate materialization received a missing "
           "candidate batch");
     }
     input.materialized = make_uniq<DataChunk>();
@@ -1909,11 +1937,15 @@ LanceVectorMaterializeSerialize(Serializer &serializer,
 static unique_ptr<FunctionData>
 LanceVectorMaterializeDeserialize(Deserializer &deserializer, TableFunction &) {
   auto state = LanceVaneDeserializeGlobalSearchState(deserializer);
-  if (!LanceVaneIsVectorCandidateVariant(state.execution_variant) ||
-      state.arguments.kind != LanceVaneSearchKind::VECTOR ||
-      state.worker_bind) {
+  auto valid_vector =
+      LanceVaneIsVectorCandidateVariant(state.execution_variant) &&
+      state.arguments.kind == LanceVaneSearchKind::VECTOR;
+  auto valid_fts =
+      state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES &&
+      state.arguments.kind == LanceVaneSearchKind::FTS;
+  if ((!valid_vector && !valid_fts) || state.worker_bind) {
     throw SerializationException(
-        "Distributed Lance vector materialization state is malformed");
+        "Distributed Lance candidate materialization state is malformed");
   }
   auto result = make_uniq<LanceVectorMaterializeBindData>();
   result->vane_state = std::move(state);
@@ -1922,10 +1954,10 @@ LanceVectorMaterializeDeserialize(Deserializer &deserializer, TableFunction &) {
 }
 
 static TableFunction LanceVectorMaterializeFunction() {
-  TableFunction result(
-      "__lance_vector_search_materialize", {LogicalType::TABLE}, nullptr,
-      LanceVectorMaterializeBind, LanceVectorMaterializeInitGlobal,
-      LanceVectorMaterializeInitLocal);
+  TableFunction result("__lance_search_materialize", {LogicalType::TABLE},
+                       nullptr, LanceVectorMaterializeBind,
+                       LanceVectorMaterializeInitGlobal,
+                       LanceVectorMaterializeInitLocal);
   result.in_out_function = LanceVectorMaterializeFunc;
   result.in_out_function_batch = LanceVectorMaterializeBatchFunc;
   result.serialize = LanceVectorMaterializeSerialize;
@@ -2095,11 +2127,6 @@ LanceRewriteVectorCandidates(ClientContext &context, Optimizer &optimizer,
   return std::move(materialize_get);
 }
 
-static void LanceVectorCandidatesOptimizer(OptimizerExtensionInput &input,
-                                           unique_ptr<LogicalOperator> &plan) {
-  plan = LanceRewriteVectorCandidates(input.context, input.optimizer,
-                                      std::move(plan), {});
-}
 #endif
 
 static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
@@ -2311,57 +2338,85 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                                      LanceSearchGlobalState &global) {
   if (!local_state.stream) {
 #ifdef LANCE_VANE_DISTRIBUTED
-    if (bind_data.vane_state.worker_bind) {
+    if (bind_data.vane_state.worker_bind ||
+        bind_data.vane_state.execution_variant ==
+            LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
       auto &search = bind_data.vane_state;
-      const uint8_t *filter_ir = search.final_filter_ir.empty()
-                                     ? nullptr
-                                     : reinterpret_cast<const uint8_t *>(
-                                           search.final_filter_ir.data());
-      auto *namespace_filter_plan =
-          search.namespace_filter_plan.empty()
-              ? nullptr
-              : reinterpret_cast<const uint8_t *>(
-                    search.namespace_filter_plan.data());
       auto *index_plan =
           reinterpret_cast<const uint8_t *>(search.index_plan.data());
-      auto create_stream = [&](const uint8_t *ir, size_t ir_len) -> void * {
-        if (search.arguments.kind == LanceVaneSearchKind::FTS) {
-          return lance_vane_create_fts_stream_ir(
+      if (search.execution_variant ==
+          LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+        string segment_uuids;
+        auto &selected_segments = search.worker_bind
+                                      ? search.selected_index_segment_uuids
+                                      : search.fts_segment_uuids;
+        segment_uuids.reserve(selected_segments.size() * 16);
+        for (auto &segment_uuid : selected_segments) {
+          segment_uuids.append(segment_uuid);
+        }
+        local_state.stream = lance_vane_create_fts_candidate_stream_ir(
+            global.vane_dataset, search.dataset_generation_id.c_str(),
+            search.arguments.text_column.c_str(),
+            search.arguments.text_query.c_str(), search.arguments.k, index_plan,
+            search.index_plan.size(),
+            reinterpret_cast<const uint8_t *>(segment_uuids.data()),
+            selected_segments.size());
+        if (!local_state.stream) {
+          throw IOException(
+              "Failed to create distributed Lance FTS candidate stream" +
+              LanceVaneFormatErrorSuffix(search.physical_uri,
+                                         search.private_uri_diagnostics));
+        }
+      } else {
+        const uint8_t *filter_ir = search.final_filter_ir.empty()
+                                       ? nullptr
+                                       : reinterpret_cast<const uint8_t *>(
+                                             search.final_filter_ir.data());
+        auto *namespace_filter_plan =
+            search.namespace_filter_plan.empty()
+                ? nullptr
+                : reinterpret_cast<const uint8_t *>(
+                      search.namespace_filter_plan.data());
+        auto create_stream = [&](const uint8_t *ir, size_t ir_len) -> void * {
+          if (search.arguments.kind == LanceVaneSearchKind::FTS) {
+            return lance_vane_create_fts_stream_ir(
+                global.vane_dataset, search.dataset_generation_id.c_str(),
+                search.arguments.text_column.c_str(),
+                search.arguments.text_query.c_str(), search.arguments.k, ir,
+                ir_len, namespace_filter_plan,
+                search.namespace_filter_plan.size(),
+                search.arguments.prefilter ? 1 : 0, index_plan,
+                search.index_plan.size());
+          }
+          return lance_vane_create_hybrid_stream_ir(
               global.vane_dataset, search.dataset_generation_id.c_str(),
+              search.arguments.vector_column.c_str(),
+              search.arguments.vector_query.data(),
+              search.arguments.vector_query.size(),
               search.arguments.text_column.c_str(),
-              search.arguments.text_query.c_str(), search.arguments.k, ir,
+              search.arguments.text_query.c_str(), search.arguments.k,
+              search.arguments.nprobes, search.arguments.refine_factor, ir,
               ir_len, namespace_filter_plan,
               search.namespace_filter_plan.size(),
-              search.arguments.prefilter ? 1 : 0, index_plan,
+              search.arguments.prefilter ? 1 : 0,
+              search.arguments.use_index ? 1 : 0, search.arguments.alpha,
+              search.arguments.oversample_factor, index_plan,
               search.index_plan.size());
+        };
+        local_state.stream =
+            create_stream(filter_ir, search.final_filter_ir.size());
+        if (!local_state.stream && filter_ir && !search.arguments.prefilter) {
+          global.filter_pushdown_fallbacks.fetch_add(1);
+          global.filter_pushed_down = false;
+          local_state.filter_pushed_down = false;
+          local_state.stream = create_stream(nullptr, 0);
         }
-        return lance_vane_create_hybrid_stream_ir(
-            global.vane_dataset, search.dataset_generation_id.c_str(),
-            search.arguments.vector_column.c_str(),
-            search.arguments.vector_query.data(),
-            search.arguments.vector_query.size(),
-            search.arguments.text_column.c_str(),
-            search.arguments.text_query.c_str(), search.arguments.k,
-            search.arguments.nprobes, search.arguments.refine_factor, ir,
-            ir_len, namespace_filter_plan, search.namespace_filter_plan.size(),
-            search.arguments.prefilter ? 1 : 0,
-            search.arguments.use_index ? 1 : 0, search.arguments.alpha,
-            search.arguments.oversample_factor, index_plan,
-            search.index_plan.size());
-      };
-      local_state.stream =
-          create_stream(filter_ir, search.final_filter_ir.size());
-      if (!local_state.stream && filter_ir && !search.arguments.prefilter) {
-        global.filter_pushdown_fallbacks.fetch_add(1);
-        global.filter_pushed_down = false;
-        local_state.filter_pushed_down = false;
-        local_state.stream = create_stream(nullptr, 0);
-      }
-      if (!local_state.stream) {
-        throw IOException(
-            "Failed to create exact distributed Lance search stream" +
-            LanceVaneFormatErrorSuffix(search.physical_uri,
-                                       search.private_uri_diagnostics));
+        if (!local_state.stream) {
+          throw IOException(
+              "Failed to create exact distributed Lance search stream" +
+              LanceVaneFormatErrorSuffix(search.physical_uri,
+                                         search.private_uri_diagnostics));
+        }
       }
     } else
 #endif
@@ -2893,6 +2948,14 @@ LanceSearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     global.filter_pushed_down = bind_data.vane_state.filter_pushed_down;
     return state;
   }
+  if (bind_data.vane_state.execution_variant ==
+      LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    global.vane_dataset_entry = LanceVaneOpenSearchSnapshotForMaterialization(
+        context, bind_data.vane_state);
+    global.vane_dataset = global.vane_dataset_entry->Handle();
+    global.filter_pushed_down = false;
+    return state;
+  }
 #endif
 
   if (bind_data.namespace_backed) {
@@ -3146,8 +3209,13 @@ static unique_ptr<FunctionData> LanceCreateDistributedSharedWorkerBind(
   result->alpha = state.arguments.alpha;
   result->oversample_factor = state.arguments.oversample_factor;
   result->k = state.arguments.k;
-  result->names = state.output_names;
-  result->types = state.output_types;
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    result->names = {"_rowid", "_score"};
+    result->types = {LogicalType::UBIGINT, LogicalType::FLOAT};
+  } else {
+    result->names = state.output_names;
+    result->types = state.output_types;
+  }
   result->vane_overload = state.arguments.overload;
   result->vane_state = std::move(state);
   return result;
@@ -3206,8 +3274,13 @@ LanceSearchDeserialize(Deserializer &deserializer, TableFunction &) {
   result->alpha = state.arguments.alpha;
   result->oversample_factor = state.arguments.oversample_factor;
   result->k = state.arguments.k;
-  result->names = state.output_names;
-  result->types = state.output_types;
+  if (state.execution_variant == LanceVaneSearchTaskVariant::FTS_CANDIDATES) {
+    result->names = {"_rowid", "_score"};
+    result->types = {LogicalType::UBIGINT, LogicalType::FLOAT};
+  } else {
+    result->names = state.output_names;
+    result->types = state.output_types;
+  }
   result->vane_overload = state.arguments.overload;
   result->vane_state = std::move(state);
   auto &context = deserializer.Get<ClientContext &>();
@@ -3221,6 +3294,126 @@ LanceSharedDistributedSearchCallbacks() {
   return LanceVaneSearchTaskCallbacks(LancePlanDistributedSharedSearch,
                                       LanceCreateDistributedSharedWorkerBind,
                                       LanceApplyDistributedSharedSearch);
+}
+
+static unique_ptr<LogicalOperator>
+LanceRewriteFtsCandidates(ClientContext &context, Optimizer &optimizer,
+                          unique_ptr<LogicalOperator> op,
+                          bool ancestor_has_filter) {
+  ancestor_has_filter =
+      ancestor_has_filter || op->type == LogicalOperatorType::LOGICAL_FILTER;
+  for (auto &child : op->children) {
+    child = LanceRewriteFtsCandidates(context, optimizer, std::move(child),
+                                      ancestor_has_filter);
+  }
+  if (op->type != LogicalOperatorType::LOGICAL_GET) {
+    return op;
+  }
+
+  auto &get = op->Cast<LogicalGet>();
+  if (get.function.name != "lance_fts" || !get.bind_data ||
+      !get.children.empty()) {
+    return op;
+  }
+  auto &bind_data = get.bind_data->Cast<LanceSearchBindData>();
+  if (bind_data.mode != LanceSearchMode::Fts || !bind_data.vane_state.valid ||
+      bind_data.vane_state.worker_bind ||
+      bind_data.vane_state.execution_variant !=
+          LanceVaneSearchTaskVariant::FINAL_SEARCH) {
+    return op;
+  }
+  for (auto &column : get.GetColumnIds()) {
+    if (column.IsEmptyColumn()) {
+      return op;
+    }
+  }
+
+  auto has_filter = ancestor_has_filter || !get.table_filters.filters.empty() ||
+                    !bind_data.lance_pushed_filter_ir_parts.empty() ||
+                    bind_data.complex_filter_pushdown_failed ||
+                    !bind_data.namespace_filter.empty();
+  if (has_filter) {
+    return op;
+  }
+
+  TableFunctionDistributedScanInput distributed_input(
+      get.bind_data.get(), get.parameters, get.GetColumnIds(),
+      get.projection_ids, &get.table_filters, get.estimated_cardinality);
+  auto state = LanceVaneFinalizeGlobalSearchState(
+      distributed_input, bind_data.vane_state,
+      bind_data.lance_pushed_filter_ir_parts,
+      bind_data.complex_filter_pushdown_failed);
+  if (!LanceVaneTryEnableFtsCandidates(state, false)) {
+    return op;
+  }
+
+  vector<string> candidate_names = {"_rowid", "_score"};
+  vector<LogicalType> candidate_types = {LogicalType::UBIGINT,
+                                         LogicalType::FLOAT};
+  auto candidate_bind = bind_data.Copy();
+  auto &candidate_data = candidate_bind->Cast<LanceSearchBindData>();
+  candidate_data.column_ids = {0, 1};
+  candidate_data.names = candidate_names;
+  candidate_data.types = candidate_types;
+  candidate_data.arrow_table = ArrowTableSchema();
+  candidate_data.lance_pushed_filter_ir_parts.clear();
+  candidate_data.complex_filter_pushdown_failed = false;
+  candidate_data.vane_state = state;
+  LanceVanePopulateSearchSchema(context, candidate_names, candidate_types,
+                                candidate_data.schema_root,
+                                candidate_data.arrow_table);
+
+  auto candidate_table_index = optimizer.binder.GenerateTableIndex();
+  auto candidate_get = make_uniq<LogicalGet>(
+      candidate_table_index, get.function, std::move(candidate_bind),
+      candidate_types, candidate_names);
+  candidate_get->parameters = get.parameters;
+  candidate_get->named_parameters = get.named_parameters;
+  candidate_get->SetColumnIds(
+      vector<ColumnIndex>{ColumnIndex(0), ColumnIndex(1)});
+  auto max_cardinality = NumericLimits<idx_t>::Maximum();
+  auto k = NumericCast<idx_t>(state.arguments.k);
+  auto work_count = state.fts_segment_uuids.size();
+  auto candidate_cardinality =
+      work_count > 0 && k > max_cardinality / work_count ? max_cardinality
+                                                         : k * work_count;
+  candidate_get->SetEstimatedCardinality(candidate_cardinality);
+
+  vector<BoundOrderByNode> orders;
+  orders.emplace_back(
+      OrderType::DESCENDING, OrderByNullType::NULLS_LAST,
+      make_uniq<BoundColumnRefExpression>(
+          LogicalType::FLOAT, ColumnBinding(candidate_table_index, 1)));
+  orders.emplace_back(
+      OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+      make_uniq<BoundColumnRefExpression>(
+          LogicalType::UBIGINT, ColumnBinding(candidate_table_index, 0)));
+  auto top_k = make_uniq<LogicalTopN>(std::move(orders), k, 0);
+  top_k->children.push_back(std::move(candidate_get));
+  top_k->SetEstimatedCardinality(k);
+
+  auto materialize_bind = make_uniq<LanceVectorMaterializeBindData>();
+  materialize_bind->vane_state = state;
+  LancePrepareVectorMaterializeBindData(*materialize_bind);
+  auto materialize_get = make_uniq<LogicalGet>(
+      get.table_index, LanceVectorMaterializeFunction(),
+      std::move(materialize_bind), state.output_types, state.output_names);
+  materialize_get->SetColumnIds(vector<ColumnIndex>(get.GetColumnIds().begin(),
+                                                    get.GetColumnIds().end()));
+  materialize_get->projection_ids = get.projection_ids;
+  materialize_get->input_table_types = candidate_types;
+  materialize_get->input_table_names = candidate_names;
+  materialize_get->children.push_back(std::move(top_k));
+  materialize_get->SetEstimatedCardinality(k);
+  return std::move(materialize_get);
+}
+
+static void LanceSearchCandidatesOptimizer(OptimizerExtensionInput &input,
+                                           unique_ptr<LogicalOperator> &plan) {
+  plan = LanceRewriteVectorCandidates(input.context, input.optimizer,
+                                      std::move(plan), {});
+  plan = LanceRewriteFtsCandidates(input.context, input.optimizer,
+                                   std::move(plan), false);
 }
 #endif
 
@@ -3299,7 +3492,7 @@ void RegisterLanceSearch(ExtensionLoader &loader) {
 #ifdef LANCE_VANE_DISTRIBUTED
 void RegisterLanceSearchOptimizer(DBConfig &config) {
   OptimizerExtension extension;
-  extension.optimize_function = LanceVectorCandidatesOptimizer;
+  extension.optimize_function = LanceSearchCandidatesOptimizer;
   OptimizerExtension::Register(config, std::move(extension));
 }
 #endif

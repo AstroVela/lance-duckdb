@@ -170,6 +170,14 @@ int32_t lance_vane_plan_indexed_vector_work(
     LanceVaneIndexedVectorWorkFragment **out_work, size_t *out_len);
 void lance_vane_free_indexed_vector_work(
     LanceVaneIndexedVectorWorkFragment *work, size_t len);
+typedef struct LanceVaneFtsWorkFragment {
+  uint8_t segment_uuid[16];
+  uint64_t fragment_id;
+} LanceVaneFtsWorkFragment;
+int32_t lance_vane_plan_fts_work(const uint8_t *data, size_t len,
+                                 LanceVaneFtsWorkFragment **out_work,
+                                 size_t *out_len);
+void lance_vane_free_fts_work(LanceVaneFtsWorkFragment *work, size_t len);
 int32_t lance_vane_validate_namespace_filter_plan(const uint8_t *data,
                                                   size_t len);
 void *lance_vane_create_knn_stream_ir(
@@ -192,12 +200,20 @@ void *lance_vane_take_vector_rows(void *dataset, const uint64_t *row_ids,
                                   const float *distances, size_t len,
                                   const char *const *columns,
                                   size_t columns_len);
+void *lance_vane_take_fts_rows(void *dataset, const uint64_t *row_ids,
+                               const float *scores, size_t len,
+                               const char *const *columns, size_t columns_len);
 void *lance_vane_create_fts_stream_ir(
     void *dataset, const char *generation, const char *text_column,
     const char *query, uint64_t k, const uint8_t *filter_ir,
     size_t filter_ir_len, const uint8_t *namespace_filter_plan,
     size_t namespace_filter_plan_len, uint8_t prefilter,
     const uint8_t *index_plan, size_t index_plan_len);
+void *lance_vane_create_fts_candidate_stream_ir(
+    void *dataset, const char *generation, const char *text_column,
+    const char *query, uint64_t k, const uint8_t *index_plan,
+    size_t index_plan_len, const uint8_t *index_segment_uuids,
+    size_t index_segment_count);
 void *lance_vane_create_hybrid_stream_ir(
     void *dataset, const char *generation, const char *vector_column,
     const float *query_values, size_t query_len, const char *text_column,

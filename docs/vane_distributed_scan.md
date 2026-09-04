@@ -72,11 +72,12 @@ after loading the statically linked extension on each worker database.
 ## Global search contract
 
 Vector, full-text, and hybrid search are admitted as global operations. The
-`lance.search-task` version 1 split codec has three executable variants in this
+`lance.search-task` version 1 split codec has four executable variants in this
 phase. `FINAL_SEARCH` contains the search-node UUID and the SHA-256 identity of
 the serialized global search state. `VECTOR_CANDIDATES` additionally identifies
 one Lance fragment. `INDEXED_VECTOR_CANDIDATES` identifies either one frozen
-physical index segment or one uncovered flat fragment.
+physical index segment or one uncovered flat fragment. `FTS_CANDIDATES`
+identifies one frozen inverted-index segment.
 
 An exact vector search is planned as `VECTOR_CANDIDATES` only when
 `use_index = false`, the filter is absent or is applied as a prefilter, the
@@ -98,14 +99,23 @@ segment is assigned once by UUID; fragments outside those segments are assigned
 once as flat work. Workers retain Lance's native partition selection and return
 local top-k candidates to the same global `TopN` and materialization path.
 
-Small searches, adaptive-probe indexed searches, refinement, vector
-post-filters, full-text searches, and hybrid searches are deliberately planned
-as one authenticated `FINAL_SEARCH` assignment. Full-text candidates and hybrid
-global normalization and reranking are later phases of
-[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). The indexed
-admission boundary and executable adaptive-probe counterexample are documented
-in the
-[indexed vector candidate contract](vane_indexed_vector_candidates.md).
+An indexed full-text search is planned as `FTS_CANDIDATES` only when the direct
+dataset has at least two disjoint frozen inverted-index segments that together
+cover the complete snapshot, no filter is present, the fragment row counts are
+known, and the dataset has at least 4096 rows. Each worker searches its assigned
+segment with local k, but Lance scores every segment with the same corpus-wide
+BM25 statistics frozen for the query. Vane orders the union by
+`_score DESC, _rowid ASC`, retains the global k, and uses the same batched Lance
+take materializer as vector candidates.
+
+Small searches, adaptive-probe indexed vector searches, refinement, all search
+post-filters, incomplete or single-segment FTS indexes, namespace-backed FTS,
+and hybrid searches are deliberately planned as one authenticated
+`FINAL_SEARCH` assignment. Hybrid global normalization and reranking remain a
+later phase of [Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
+The vector and full-text admission boundaries are documented in the
+[indexed vector candidate contract](vane_indexed_vector_candidates.md) and the
+[FTS candidate contract](vane_fts_candidates.md).
 
 Unknown variants, malformed payload sizes, foreign state identities, duplicate
 or overlapping work assignments, and changed retry assignments fail closed. An
@@ -248,7 +258,7 @@ each fragment split. The official DuckDB build retains these pushdowns.
 | Ordinary Lance scan | One split per fragment, scheduled across workers | The physical dataset and frozen snapshot must be replayable by every worker. |
 | `rowid`/`_rowid` point lookup | Ordered take splits, scheduled across workers | Duplicate `IN` candidates are normalized; final row order still requires `ORDER BY`. |
 | `lance_vector_search` | Exact flat and eligible fixed-probe indexed searches use disjoint candidate assignments, Vane native global `TopN`, and one batched Lance take | Exact work is assigned by fragment. Indexed work is assigned by frozen physical segment plus uncovered flat fragment, and additionally requires explicit positive `nprobs` with no refinement. Both paths require no post-filter, at least two work units with known row counts, and enough estimated work. Other vector searches use one `FINAL_SEARCH` assignment. |
-| `lance_fts` | One authenticated `FINAL_SEARCH` task on one worker | Global score ordering remains one Lance operation in this phase. |
+| `lance_fts` | Eligible full-coverage indexed searches use one candidate assignment per frozen inverted-index segment, Vane native global `TopN`, and one batched Lance take | Requires a direct dataset, at least two disjoint segments covering the complete snapshot, no filters, at least 4096 known rows, and one corpus-wide BM25 scorer. Other FTS searches use one `FINAL_SEARCH` assignment. |
 | `lance_hybrid_search` | One authenticated `FINAL_SEARCH` task on one worker | Vector/text retrieval, normalization, and reranking remain one global Lance operation in this phase. |
 | Directory namespace reads | Resolved to a frozen replayable physical URI | Attach-time and planning-time storage state must agree. |
 | Standard REST namespace reads | Coordinator resolves the bound version; workers read the physical snapshot | Requires a materialized table URI plus detailed version and schema metadata; workers do not use the REST control plane. |
@@ -260,10 +270,11 @@ each fragment split. The official DuckDB build retains these pushdowns.
 The scan integration covers read-only table scans, including filters,
 projections, point lookups, aggregates, sampling, global limits, empty datasets,
 directory namespace tables, exact flat vector candidates, fixed-probe indexed
-vector candidates, singleton search modes outside those admission boundaries,
-full-text search, hybrid search, and standard REST tables that provide a stable
-replayable physical snapshot. Later candidate and reranking phases remain
-tracked in [Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
+vector candidates, full-coverage indexed FTS candidates, singleton search modes
+outside those admission boundaries, hybrid search, and standard REST tables
+that provide a stable replayable physical snapshot. Later candidate and
+reranking phases remain tracked in
+[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9).
 Distributed writes have a separate
 [write contract](./vane_distributed_write.md). Distributed replay of
 `TYPE LANCE` secret catalog entries is not part of either contract.
@@ -283,10 +294,12 @@ global limits, fixed snapshots, replacement detection, empty scans, directory
 namespaces, and MinIO-backed S3 session replay, including static and
 temporary-profile credentials. Advanced-read coverage also compares vector,
 full-text, and hybrid results with native execution; verifies exact flat vector
-candidate partitioning, deterministic global top-k, phase-one singleton routing,
-partial index coverage, frozen selected-index segments, retry identity, and
-stale-state rejection; and proves standard REST scans and searches continue from
-their physical snapshot after the namespace service is unavailable.
+candidate partitioning, fixed-probe indexed vector work, full-coverage indexed
+FTS segment work with corpus-wide BM25 scoring, deterministic global top-k,
+singleton routing outside each admission boundary, partial index coverage,
+frozen selected-index segments, retry identity, and stale-state rejection; and
+proves standard REST scans and searches continue from their physical snapshot
+after the namespace service is unavailable.
 The [frozen snapshot benchmark](../benches/vane_frozen_snapshot/README.md)
 reports cold and warm planning and execution latency, serialized plan and split
 sizes, and observed manifest `HEAD`/`GET` requests for 1, 8, and 32 workers.
