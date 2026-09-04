@@ -161,6 +161,15 @@ int32_t lance_vane_validate_search_index_plan(
     const uint8_t *data, size_t len, uint64_t dataset_version,
     const char *generation, uint8_t search_kind, const char *vector_column,
     const char *text_column, uint8_t use_vector_index);
+typedef struct LanceVaneIndexedVectorWorkFragment {
+  uint8_t segment_uuid[16];
+  uint64_t fragment_id;
+} LanceVaneIndexedVectorWorkFragment;
+int32_t lance_vane_plan_indexed_vector_work(
+    const uint8_t *data, size_t len,
+    LanceVaneIndexedVectorWorkFragment **out_work, size_t *out_len);
+void lance_vane_free_indexed_vector_work(
+    LanceVaneIndexedVectorWorkFragment *work, size_t len);
 int32_t lance_vane_validate_namespace_filter_plan(const uint8_t *data,
                                                   size_t len);
 void *lance_vane_create_knn_stream_ir(
@@ -172,11 +181,13 @@ void *lance_vane_create_knn_stream_ir(
     size_t index_plan_len);
 void *lance_vane_create_vector_candidate_stream_ir(
     void *dataset, const char *generation, const char *vector_column,
-    const float *query_values, size_t query_len, uint64_t k,
+    const float *query_values, size_t query_len, uint64_t k, uint64_t nprobes,
     const uint8_t *filter_ir, size_t filter_ir_len,
     const uint8_t *namespace_filter_plan, size_t namespace_filter_plan_len,
-    uint8_t prefilter, const uint8_t *index_plan, size_t index_plan_len,
-    const uint64_t *fragment_ids, size_t fragment_ids_len);
+    uint8_t prefilter, uint8_t use_index, const uint8_t *index_plan,
+    size_t index_plan_len, const uint8_t *index_segment_uuids,
+    size_t index_segment_count, const uint64_t *fragment_ids,
+    size_t fragment_ids_len);
 void *lance_vane_take_vector_rows(void *dataset, const uint64_t *row_ids,
                                   const float *distances, size_t len,
                                   const char *const *columns,

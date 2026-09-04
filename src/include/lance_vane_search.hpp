@@ -25,8 +25,15 @@ enum class LanceVaneSearchKind : uint8_t { VECTOR = 0, FTS = 1, HYBRID = 2 };
 enum class LanceVaneSearchTaskVariant : uint8_t {
   FINAL_SEARCH = 0,
   VECTOR_CANDIDATES = 1,
-  FTS_CANDIDATES = 2
+  FTS_CANDIDATES = 2,
+  INDEXED_VECTOR_CANDIDATES = 3
 };
+
+inline bool
+LanceVaneIsVectorCandidateVariant(LanceVaneSearchTaskVariant variant) {
+  return variant == LanceVaneSearchTaskVariant::VECTOR_CANDIDATES ||
+         variant == LanceVaneSearchTaskVariant::INDEXED_VECTOR_CANDIDATES;
+}
 enum class LanceVaneSearchOverload : uint8_t {
   VECTOR_FLOAT = 0,
   VECTOR_DOUBLE = 1,
@@ -108,6 +115,10 @@ struct LanceVaneGlobalSearchState {
   vector<uint64_t> fragment_ids;
   vector<int64_t> fragment_row_counts;
   vector<uint64_t> fragment_bytes_on_disk;
+  vector<string> indexed_vector_segment_uuids;
+  vector<uint64_t> indexed_vector_segment_fragment_offsets;
+  vector<uint64_t> indexed_vector_segment_fragment_ids;
+  vector<uint64_t> indexed_vector_uncovered_fragment_ids;
   string state_sha256;
 
   bool worker_bind = false;
@@ -117,6 +128,7 @@ struct LanceVaneGlobalSearchState {
   vector<string> authorized_task_ids;
   vector<string> authorized_task_payloads;
   vector<uint64_t> selected_fragment_ids;
+  vector<string> selected_index_segment_uuids;
 };
 
 void LanceVaneCapturePhysicalCandidate(
@@ -143,8 +155,8 @@ LanceVaneGlobalSearchState LanceVaneFinalizeGlobalSearchState(
     const vector<string> &pushed_filter_ir_parts,
     bool complex_filter_pushdown_failed);
 
-bool LanceVaneTryEnableExactVectorCandidates(LanceVaneGlobalSearchState &state,
-                                             bool has_postfilter);
+bool LanceVaneTryEnableVectorCandidates(LanceVaneGlobalSearchState &state,
+                                        bool has_postfilter);
 
 vector<DistributedScanSplit>
 LanceVaneCreateSearchTaskAssignments(const LanceVaneGlobalSearchState &state);

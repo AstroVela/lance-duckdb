@@ -1,10 +1,9 @@
 # Vane Indexed Vector Candidate Contract
 
 This document defines the semantic boundary for the indexed-vector phase of
-[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). It is a design
-and test contract, not an enabled distributed execution path. Indexed vector
-searches continue to use one `FINAL_SEARCH` assignment until every admission
-condition below is implemented and verified.
+[Issue #9](https://github.com/AstroVela/lance-duckdb/issues/9). Indexed vector
+candidate execution is enabled only for the admission boundary below. Every
+other indexed vector search continues to use one `FINAL_SEARCH` assignment.
 
 ## Why fragment-local index searches are not generally equivalent
 
@@ -33,16 +32,17 @@ checks that fragment-local union matches the dataset-wide result for two fixed
 probe counts in the constructed dataset. This is a necessary condition for
 distributed indexed candidates, but it is not sufficient by itself.
 
-## Initial admission boundary
+## Admission boundary
 
-The first production implementation of indexed vector candidates must admit a
-query only when all of these conditions hold:
+Indexed vector candidates admit a query only when all of these conditions hold:
 
 - `use_index = true` and `nprobs` is explicitly set to a positive value;
 - `refine_factor` is absent;
 - there is no post-filter, and any filter is applied as a prefilter;
 - the coordinator has frozen and validated the exact vector index segment
   identities and their fragment coverage for the query snapshot;
+- every frozen segment exposes the same supported logical distance metric
+  (`L2`, `Cosine`, or `Dot`);
 - work assignments are disjoint across selected index segments and uncovered
   flat fragments;
 - at least two useful work assignments exist and the existing scheduling
@@ -55,20 +55,26 @@ query is admitted, malformed state, changed index metadata, overlapping work,
 or an execution failure must fail closed. It must not silently rerun as a
 singleton or a flat search.
 
-The coordinator should reuse the existing frozen `SearchIndexPlan`. Covered
-work is identified by physical index segment UUID, while fragments outside the
-selected segments form separate flat work. A worker returns at most local k
-rows as `(_rowid, _distance)`. Vane then applies the existing deterministic
-global ordering `(_distance ASC, _rowid ASC)` and the existing batched Lance
-take materializer.
+The coordinator reuses the existing frozen `SearchIndexPlan`. Covered work is
+identified by physical index segment UUID, while fragments outside the
+selected segments form separate flat work. Pairwise overlapping physical
+segment coverage is not admitted. The plan already freezes each segment's
+`VectorIndexDetails`; workers validate those details and explicitly apply the
+single frozen metric to both indexed segment work and uncovered flat work. A
+legacy, malformed, unsupported, or mixed-metric layout remains singleton. A
+worker combines only the tasks assigned to that worker, passes the selected
+UUIDs through Lance's native `with_index_segments` API, and returns at most
+local k rows as `(_rowid, _distance)`. Vane then applies the existing
+deterministic global ordering `(_distance ASC, _rowid ASC)` and the existing
+batched Lance take materializer.
 
 The current Lance scanner can select frozen index segments and restrict
-fragments, but it does not expose a public hook for injecting one
-coordinator-selected set of IVF partitions while retaining Lance's native
-filter, deletion, and index execution pipeline. The implementation must not
-copy or recreate that pipeline in the extension. If disjoint segment work is
-not available for a particular index layout, that layout remains singleton
-until an upstream Lance mechanism can express it directly.
+fragments. It does not expose a public hook for injecting one
+coordinator-selected set of IVF partitions, so the extension deliberately
+keeps partition selection inside Lance and requires an explicit fixed
+`nprobs`. The extension does not copy or recreate Lance's filter, deletion, or
+index execution pipeline. If disjoint segment work is not available for a
+particular index layout, that layout remains singleton.
 
 ## Refinement is a separate phase
 
@@ -81,13 +87,14 @@ is implemented, every indexed query with refinement remains singleton.
 
 ## Required validation matrix
 
-Before indexed candidates can be enabled, integration tests must compare the
-distributed result with the same snapshot's native Lance result for:
+Integration tests compare the distributed result with the same snapshot's
+native Lance result for:
 
 - fixed `nprobs` values below, equal to, and above the available partition
   count;
 - one and multiple physical index segments;
 - full and partial index coverage, including newly appended fragments;
+- partial coverage with `Cosine` and `Dot` metrics;
 - deleted rows and stale index entries;
 - absent, empty, and selective prefilters;
 - equal-distance rows with deterministic `_rowid` tie-breaking;

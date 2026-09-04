@@ -851,26 +851,35 @@ def sql_literal(value):
 
 
 def fte_create_task_locations():
-    from ray._private import ray_constants
-    from ray._private.grpc_utils import init_grpc_channel
+    from ray._private.gcs_utils import create_gcs_channel
     from ray.core.generated import gcs_service_pb2_grpc
-    from ray.core.generated.gcs_service_pb2 import GetTaskEventsRequest
+    from ray.core.generated.gcs_service_pb2 import EQUAL, GetTaskEventsRequest
 
-    channel = init_grpc_channel(
-        ray.get_runtime_context().gcs_address,
-        ray_constants.GLOBAL_GRPC_OPTIONS,
-        asynchronous=False,
+    # The unfiltered event stream exceeds gRPC's default 4 MiB limit after a
+    # full distributed test run. Use Ray's GCS channel and filter at source.
+    task_name = "RayWorkerActor.fte_create_task"
+    request = GetTaskEventsRequest(
+        limit=10000,
+        filters=GetTaskEventsRequest.Filters(
+            task_name_filters=[
+                GetTaskEventsRequest.Filters.TaskNameFilter(
+                    predicate=EQUAL,
+                    task_name=task_name,
+                )
+            ]
+        ),
     )
+    channel = create_gcs_channel(ray.get_runtime_context().gcs_address, aio=False)
     try:
         reply = gcs_service_pb2_grpc.TaskInfoGcsServiceStub(channel).GetTaskEvents(
-            GetTaskEventsRequest(limit=10000), timeout=10
+            request, timeout=10
         )
     finally:
         channel.close()
     assert int(reply.status.code) == 0, reply.status.message
     locations = {}
     for event in reply.events_by_task:
-        if not event.task_info.name.endswith(".fte_create_task"):
+        if event.task_info.name != task_name:
             continue
         node_id = event.state_updates.node_id or event.task_info.node_id
         if node_id:
@@ -1414,7 +1423,14 @@ def _write_dataset(
     )
 
 
-def _write_vector_candidate_dataset(connection, path: str | Path) -> None:
+def _write_vector_candidate_dataset(
+    connection,
+    path: str | Path,
+    *,
+    start: int = 0,
+    rows: int = VECTOR_CANDIDATE_ROWS,
+    mode: str = "create",
+) -> None:
     # Persist the label as Arrow LargeUtf8, then restore the regular-offset
     # setting before search. This keeps the physical Lance layout different
     # from a schema synthesized from DuckDB's VARCHAR logical type.
@@ -1429,9 +1445,9 @@ def _write_vector_candidate_dataset(connection, path: str | Path) -> None:
             f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> "
             "CASE WHEN x = 0 THEN (i % 8)::FLOAT ELSE 0.0::FLOAT END)"
             f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}] AS vec "
-            f"FROM range({VECTOR_CANDIDATE_ROWS}) AS source(i)) "
+            f"FROM range({start}, {start + rows}) AS source(i)) "
             f"TO {_sql_literal(path)} "
-            "(FORMAT LANCE, MODE 'create', "
+            f"(FORMAT LANCE, MODE '{mode}', "
             f"MAX_ROWS_PER_FILE {VECTOR_CANDIDATE_ROWS_PER_FRAGMENT})"
         )
     finally:
@@ -1681,6 +1697,46 @@ def _vector_candidate_assignment_details(
         assert len(payload) == 77
         assert int.from_bytes(payload[-8:], "little") == fragment_id
         result.append((task_id, singleton, variant_offset, digest_offset, fragment_id))
+    return result
+
+
+def _indexed_vector_candidate_assignment_details(
+    batch: bytes,
+) -> list[tuple[str, bytes, int, int, str, str | int]]:
+    result: list[tuple[str, bytes, int, int, str, str | int]] = []
+    for task_id, singleton, _ in vane.ray_cxx.split_scan_split_batch(batch):
+        prefix, search_uuid, work_kind, identity = task_id.split(":", 3)
+        assert prefix == "indexed-vector-candidates"
+        assert work_kind in {"segment", "fragment"}
+        singleton = bytes(singleton)
+        variant_marker = b"\x03" + search_uuid.encode()
+        assert singleton.count(variant_marker) == 1
+        variant_offset = singleton.index(variant_marker)
+        digest_offset = variant_offset + len(variant_marker)
+        payload_end = digest_offset + 32 + 17
+        payload = singleton[variant_offset:payload_end]
+        assert len(payload) == 86
+        encoded_kind = payload[-17]
+        encoded_identity = payload[-16:]
+        if work_kind == "segment":
+            assert encoded_kind == 0
+            assert encoded_identity.hex() == identity
+            parsed_identity: str | int = identity
+        else:
+            assert encoded_kind == 1
+            assert encoded_identity[8:] == bytes(8)
+            parsed_identity = int(identity)
+            assert int.from_bytes(encoded_identity[:8], "little") == parsed_identity
+        result.append(
+            (
+                task_id,
+                singleton,
+                variant_offset,
+                digest_offset,
+                work_kind,
+                parsed_identity,
+            )
+        )
     return result
 
 
@@ -1947,19 +2003,28 @@ def _assert_vane_worker_topology(ray, runner) -> None:
 
 def _ray_fte_create_task_locations() -> dict[str, str]:
     import ray
-    from ray._private import ray_constants
-    from ray._private.grpc_utils import init_grpc_channel
+    from ray._private.gcs_utils import create_gcs_channel
     from ray.core.generated import gcs_service_pb2_grpc
-    from ray.core.generated.gcs_service_pb2 import GetTaskEventsRequest
+    from ray.core.generated.gcs_service_pb2 import EQUAL, GetTaskEventsRequest
 
-    channel = init_grpc_channel(
-        ray.get_runtime_context().gcs_address,
-        ray_constants.GLOBAL_GRPC_OPTIONS,
-        asynchronous=False,
+    # The unfiltered event stream exceeds gRPC's default 4 MiB limit after a
+    # full distributed test run. Use Ray's GCS channel and filter at source.
+    task_name = "RayWorkerActor.fte_create_task"
+    request = GetTaskEventsRequest(
+        limit=10000,
+        filters=GetTaskEventsRequest.Filters(
+            task_name_filters=[
+                GetTaskEventsRequest.Filters.TaskNameFilter(
+                    predicate=EQUAL,
+                    task_name=task_name,
+                )
+            ]
+        ),
     )
+    channel = create_gcs_channel(ray.get_runtime_context().gcs_address, aio=False)
     try:
         reply = gcs_service_pb2_grpc.TaskInfoGcsServiceStub(channel).GetTaskEvents(
-            GetTaskEventsRequest(limit=10000), timeout=10
+            request, timeout=10
         )
     finally:
         channel.close()
@@ -1968,7 +2033,7 @@ def _ray_fte_create_task_locations() -> dict[str, str]:
 
     locations: dict[str, str] = {}
     for event in reply.events_by_task:
-        if not event.task_info.name.endswith(".fte_create_task"):
+        if event.task_info.name != task_name:
             continue
         node_id = event.state_updates.node_id or event.task_info.node_id
         if node_id:
@@ -2503,6 +2568,306 @@ def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
         connection.close()
 
 
+def test_indexed_vector_candidates_use_disjoint_segments_and_uncovered_fragments(
+    tmp_path: Path, ray_cluster: frozenset[str], ray_runner
+) -> None:
+    import ray
+
+    connection = _connect()
+    path = tmp_path / "indexed_vector_candidates.lance"
+    path_sql = _sql_literal(path)
+    query = _zero_vector_sql()
+
+    def candidate_details(sql: str):
+        return [
+            detail
+            for batches in _split_batches(connection, connection.sql(sql)).values()
+            for batch in batches
+            for detail in _indexed_vector_candidate_assignment_details(batch)
+        ]
+
+    def assert_final_search(sql: str, name: str) -> None:
+        flattened = [
+            batch
+            for batches in _split_batches(connection, connection.sql(sql)).values()
+            for batch in batches
+        ]
+        assert len(flattened) == 1, name
+        task_id, singleton, variant_offset, _ = _search_task_assignment_details(
+            flattened[0]
+        )
+        assert task_id.startswith("final-search:"), name
+        assert singleton[variant_offset] == 0, name
+
+    try:
+        # Exactly 2**20 distance values meets the existing scheduling threshold.
+        # One full-coverage physical segment is still only one useful work unit.
+        _write_vector_candidate_dataset(connection, path, rows=4096)
+        connection.execute(
+            f"CREATE INDEX vec_idx ON {path_sql} (vec) "
+            "USING IVF_FLAT WITH (num_partitions=4, metric_type='l2')"
+        )
+        full_coverage_sql = (
+            "SELECT id, label, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', {query}, k = 17, nprobs = 1, "
+            "use_index = true) ORDER BY _distance, id"
+        )
+        assert_final_search(full_coverage_sql, "one-full-coverage-segment")
+
+        # The appended fragment is not covered by the first segment. It becomes
+        # a separate flat work unit rather than being searched by every worker.
+        _write_vector_candidate_dataset(
+            connection, path, start=4096, rows=512, mode="append"
+        )
+        connection.execute(
+            f"ATTACH {_sql_literal(tmp_path)} AS indexed_vector_ns "
+            "(TYPE LANCE, READ_ONLY false)"
+        )
+        connection.execute(
+            "DELETE FROM indexed_vector_ns.main.indexed_vector_candidates "
+            "WHERE id IN (0, 4096)"
+        )
+
+        searches = (
+            (
+                "probes-below-partitions",
+                "SELECT id, label, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 17, nprobs = 1, "
+                "use_index = true) ORDER BY _distance, id",
+                "SELECT id, label, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 17, nprobs = 1, "
+                "use_index = true) WHERE _distance >= 0 "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "probes-equal-partitions",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 17, nprobs = 4, "
+                "use_index = true) ORDER BY _distance, id",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 17, nprobs = 4, "
+                "use_index = true) WHERE _distance >= 0 "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "probes-above-partitions",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 17, nprobs = 8, "
+                "use_index = true) ORDER BY _distance, id",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 17, nprobs = 8, "
+                "use_index = true) WHERE _distance >= 0 "
+                "ORDER BY _distance, id",
+            ),
+            (
+                "selective-prefilter",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, nprobs = 4, "
+                "prefilter = true, use_index = true) WHERE keep "
+                "ORDER BY _distance, id",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, nprobs = 4, "
+                "prefilter = true, use_index = true) "
+                "WHERE keep AND _distance >= 0 ORDER BY _distance, id",
+            ),
+            (
+                "empty-prefilter",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, nprobs = 4, "
+                "prefilter = true, use_index = true) WHERE id < 0 "
+                "ORDER BY _distance, id",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, nprobs = 4, "
+                "prefilter = true, use_index = true) "
+                "WHERE id < 0 AND _distance >= 0 ORDER BY _distance, id",
+            ),
+            (
+                "fewer-than-k",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, nprobs = 4, "
+                "prefilter = true, use_index = true) WHERE id = 25 "
+                "ORDER BY _distance, id",
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 33, nprobs = 4, "
+                "prefilter = true, use_index = true) "
+                "WHERE id = 25 AND _distance >= 0 ORDER BY _distance, id",
+            ),
+        )
+
+        for name, sql, native_sql in searches:
+            assert_final_search(native_sql, f"{name}-native-reference")
+            expected = connection.execute(native_sql).fetchall()
+            if name == "fewer-than-k":
+                assert 0 < len(expected) < 33
+            assert connection.execute(sql).fetchall() == expected, f"{name}-local"
+            details = candidate_details(sql)
+            assert len(details) == 2, name
+            assert [detail[4] for detail in details].count("segment") == 1, name
+            fragment_details = [detail for detail in details if detail[4] == "fragment"]
+            assert len(fragment_details) == 1, name
+            assert fragment_details[0][5] == 8, name
+            assert len({detail[0] for detail in details}) == len(details), name
+            assert all(detail[1][detail[2]] == 3 for detail in details), name
+
+            baseline_task_ids = set(_settled_ray_fte_create_task_locations())
+            assert _run(ray_runner, connection.sql(sql)) == expected, name
+            if name == "probes-below-partitions":
+                execution_node_ids = _ray_fte_create_task_node_ids(
+                    baseline_task_ids, expected_count=WORKER_COUNT
+                )
+                assert execution_node_ids == set(ray_cluster)
+                _assert_vane_worker_topology(ray, ray_runner)
+
+        for name, sql in (
+            (
+                "default-probes",
+                "SELECT id FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 8, use_index = true)",
+            ),
+            (
+                "refinement",
+                "SELECT id FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 8, nprobs = 1, "
+                "refine_factor = 2, use_index = true)",
+            ),
+            (
+                "postfilter",
+                "SELECT id FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 8, nprobs = 1, "
+                "prefilter = false, use_index = true) WHERE keep",
+            ),
+        ):
+            assert_final_search(sql, name)
+
+        # Lance's append optimizer creates a second physical segment for the
+        # previously uncovered fragment. Both segment identities are now
+        # independent candidate work, even with full index coverage.
+        connection.execute(
+            f"ALTER INDEX vec_idx ON {path_sql} OPTIMIZE WITH (mode = 'append')"
+        )
+        # Reopen after maintenance so this assertion observes the newly
+        # committed physical index topology instead of a pre-maintenance
+        # dataset handle retained by the connection-local cache.
+        connection.close()
+        connection = _connect()
+        multiple_segment_sql = (
+            "SELECT id, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', {query}, k = 17, nprobs = 4, "
+            "use_index = true) ORDER BY _distance, id"
+        )
+        multiple_segment_native_sql = multiple_segment_sql.replace(
+            ") ORDER BY", ") WHERE _distance >= 0 ORDER BY"
+        )
+        assert_final_search(multiple_segment_native_sql, "multiple-segment-native")
+        expected = connection.execute(multiple_segment_native_sql).fetchall()
+        assert connection.execute(multiple_segment_sql).fetchall() == expected
+        details = candidate_details(multiple_segment_sql)
+        assert len(details) == 2
+        assert all(detail[4] == "segment" for detail in details)
+        assert len({detail[5] for detail in details}) == 2
+        assert _run(ray_runner, connection.sql(multiple_segment_sql)) == expected
+
+        # A later append yields both frozen segment work and one uncovered flat
+        # fragment in the same distributed query.
+        _write_vector_candidate_dataset(
+            connection, path, start=4608, rows=512, mode="append"
+        )
+        mixed_sql = (
+            "SELECT id, label, _distance FROM lance_vector_search("
+            f"{path_sql}, 'vec', {query}, k = 17, nprobs = 4, "
+            "use_index = true) ORDER BY _distance, id"
+        )
+        mixed_native_sql = mixed_sql.replace(
+            ") ORDER BY", ") WHERE _distance >= 0 ORDER BY"
+        )
+        assert_final_search(mixed_native_sql, "mixed-native")
+        expected = connection.execute(mixed_native_sql).fetchall()
+        assert connection.execute(mixed_sql).fetchall() == expected
+        details = candidate_details(mixed_sql)
+        assert len(details) == 3
+        assert [detail[4] for detail in details].count("segment") == 2
+        fragment_details = [detail for detail in details if detail[4] == "fragment"]
+        assert len(fragment_details) == 1
+        assert fragment_details[0][5] == 9
+        assert _run(ray_runner, connection.sql(mixed_sql)) == expected
+    finally:
+        connection.close()
+
+
+def test_indexed_vector_candidates_preserve_metric_for_uncovered_fragments(
+    tmp_path: Path, ray_runner
+) -> None:
+    connection = _connect()
+    query = (
+        f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> "
+        "CASE WHEN x = 0 THEN 1.0::FLOAT ELSE 0.0::FLOAT END)"
+        f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}]"
+    )
+
+    def vector(first: float, second: float) -> str:
+        return (
+            f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> CASE "
+            f"WHEN x = 0 THEN {first}::FLOAT "
+            f"WHEN x = 1 THEN {second}::FLOAT ELSE 0.0::FLOAT END)"
+            f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}]"
+        )
+
+    try:
+        for metric, covered, uncovered in (
+            ("cosine", vector(2.0, 1.0), vector(2.0, 0.0)),
+            ("dot", vector(2.0, 0.0), vector(100.0, 0.0)),
+        ):
+            path = tmp_path / f"indexed_{metric}_partial_coverage.lance"
+            path_sql = _sql_literal(path)
+            # The indexed fragment alone reaches the distributed scheduling
+            # threshold. The later fragment remains outside the index segment.
+            connection.execute(
+                f"COPY (SELECT i::BIGINT AS id, {covered} AS vec "
+                "FROM range(4096) AS source(i)) "
+                f"TO {path_sql} (FORMAT LANCE, MODE 'create', "
+                "MAX_ROWS_PER_FILE 4096)"
+            )
+            connection.execute(
+                f"CREATE INDEX {metric}_vec_idx ON {path_sql} (vec) "
+                "USING IVF_FLAT WITH (num_partitions=1, "
+                f"metric_type='{metric}')"
+            )
+            connection.execute(
+                f"COPY (SELECT i::BIGINT AS id, {uncovered} AS vec "
+                "FROM range(4096, 4608) AS source(i)) "
+                f"TO {path_sql} (FORMAT LANCE, MODE 'append', "
+                "MAX_ROWS_PER_FILE 512)"
+            )
+
+            sql = (
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 1, nprobs = 1, "
+                "use_index = true) ORDER BY _distance, id"
+            )
+            # Native Lance applies the index metric to its uncovered flat scan.
+            # With L2 on that fragment, each data shape below instead selects an
+            # indexed row, making this a direct regression for metric drift.
+            expected = connection.execute(sql).fetchall()
+            assert len(expected) == 1, metric
+            assert expected[0][0] == 4096, metric
+
+            relation = connection.sql(sql)
+            details = [
+                detail
+                for batches in _split_batches(connection, relation).values()
+                for batch in batches
+                for detail in _indexed_vector_candidate_assignment_details(batch)
+            ]
+            assert len(details) == 2, metric
+            assert [detail[4] for detail in details].count("segment") == 1, metric
+            fragment_details = [detail for detail in details if detail[4] == "fragment"]
+            assert len(fragment_details) == 1, metric
+            assert fragment_details[0][5] == 1, metric
+            assert _run(ray_runner, relation) == expected, metric
+    finally:
+        connection.close()
+
+
 def test_namespace_vector_outer_filter_remains_after_top_k(
     tmp_path: Path, ray_runner
 ) -> None:
@@ -2565,7 +2930,7 @@ def test_namespace_vector_outer_filter_remains_after_top_k(
         connection.close()
 
 
-def test_large_vector_searches_outside_phase_one_remain_final_search(
+def test_large_vector_searches_outside_candidate_boundaries_remain_final_search(
     tmp_path: Path,
 ) -> None:
     connection = _connect()
