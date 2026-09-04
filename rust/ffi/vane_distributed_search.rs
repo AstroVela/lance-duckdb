@@ -8,9 +8,12 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::Float32Builder;
 use arrow_array::{Float32Array, UInt64Array};
-use datafusion::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
+use datafusion::physical_plan::{
+    with_new_children_if_necessary, ExecutionPlan, SendableRecordBatchStream,
+};
 use datafusion_expr::Expr;
 use datafusion_proto::bytes::Serializeable;
+use futures::TryStreamExt;
 use lance::dataset::ProjectionRequest;
 use lance::index::DatasetIndexInternalExt;
 use lance::io::exec::fts::{FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec};
@@ -65,23 +68,6 @@ impl VectorCandidateStream {
             DISTANCE_COLUMN,
             "vector",
         )?))
-    }
-}
-
-pub(crate) struct FtsCandidateStream {
-    inner: DataFusionStream,
-}
-
-impl FtsCandidateStream {
-    fn new(inner: DataFusionStream) -> Self {
-        Self { inner }
-    }
-
-    pub(crate) fn next(&mut self) -> anyhow::Result<Option<RecordBatch>> {
-        let Some(batch) = self.inner.next()? else {
-            return Ok(None);
-        };
-        Ok(Some(reorder_candidate_batch(batch, SCORE_COLUMN, "FTS")?))
     }
 }
 
@@ -915,11 +901,12 @@ fn rewrite_fts_plan(
     plan: Arc<dyn ExecutionPlan>,
     segments: &[lance_table::format::IndexMetadata],
     base_scorer: Option<&Arc<MemBM25Scorer>>,
+    leaf_limit: Option<usize>,
 ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
     let children = plan
         .children()
         .into_iter()
-        .map(|child| rewrite_fts_plan(child.clone(), segments, base_scorer))
+        .map(|child| rewrite_fts_plan(child.clone(), segments, base_scorer, leaf_limit))
         .collect::<datafusion_common::Result<Vec<_>>>()?;
     let plan = with_new_children_if_necessary(plan, children)?;
 
@@ -929,10 +916,14 @@ fn rewrite_fts_plan(
                 "indexed FTS plan has no frozen index segments".to_string(),
             ));
         }
+        let params = leaf_limit.map_or_else(
+            || exec.params().clone(),
+            |limit| exec.params().clone().with_limit(Some(limit)),
+        );
         let mut replacement = MatchQueryExec::new_with_segments(
             exec.dataset().clone(),
             exec.query().clone(),
-            exec.params().clone(),
+            params,
             exec.prefilter_source().clone(),
             segments.to_vec(),
         );
@@ -946,10 +937,14 @@ fn rewrite_fts_plan(
             return Ok(plan);
         }
         let input = plan.children()[0].clone();
+        let params = leaf_limit.map_or_else(
+            || exec.params().clone(),
+            |limit| exec.params().clone().with_limit(Some(limit)),
+        );
         let mut replacement = FlatMatchQueryExec::new_with_segments(
             exec.dataset().clone(),
             exec.query().clone(),
-            exec.params().clone(),
+            params,
             input,
             segments.to_vec(),
         );
@@ -1039,6 +1034,118 @@ async fn build_corpus_fts_scorer(
     ))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FtsCandidate {
+    row_id: u64,
+    score: f32,
+}
+
+fn fts_score_cmp(left: f32, right: f32) -> Ordering {
+    match left.partial_cmp(&right) {
+        Some(ordering) => ordering,
+        None if left.is_nan() && right.is_nan() => Ordering::Equal,
+        None if left.is_nan() => Ordering::Greater,
+        None => Ordering::Less,
+    }
+}
+
+fn fts_candidate_cmp(left: &FtsCandidate, right: &FtsCandidate) -> Ordering {
+    fts_score_cmp(left.score, right.score).then_with(|| right.row_id.cmp(&left.row_id))
+}
+
+fn append_fts_candidates(
+    candidates: &mut Vec<FtsCandidate>,
+    batch: RecordBatch,
+) -> anyhow::Result<()> {
+    let batch = reorder_candidate_batch(batch, SCORE_COLUMN, "FTS")?;
+    let row_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("candidate schema was validated");
+    let scores = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("candidate schema was validated");
+    if row_ids.null_count() != 0 || scores.null_count() != 0 {
+        anyhow::bail!("FTS candidate stream returned NULL row IDs or scores");
+    }
+    candidates.extend(
+        row_ids
+            .values()
+            .iter()
+            .copied()
+            .zip(scores.values().iter().copied())
+            .map(|(row_id, score)| FtsCandidate { row_id, score }),
+    );
+    Ok(())
+}
+
+fn build_fts_candidate_batch(candidates: &[FtsCandidate]) -> anyhow::Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+        Field::new(SCORE_COLUMN, DataType::Float32, false),
+    ]));
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from_iter_values(
+                candidates.iter().map(|candidate| candidate.row_id),
+            )),
+            Arc::new(Float32Array::from_iter_values(
+                candidates.iter().map(|candidate| candidate.score),
+            )),
+        ],
+    )?)
+}
+
+fn fts_candidate_boundary_complete(candidates: &[FtsCandidate], k: usize, fetch: usize) -> bool {
+    candidates.len() < fetch
+        || candidates.len() <= k
+        || fts_score_cmp(
+            candidates[k - 1].score,
+            candidates[candidates.len() - 1].score,
+        ) != Ordering::Equal
+}
+
+async fn execute_fts_candidate_top_k(
+    plan: Arc<dyn ExecutionPlan>,
+    segments: &[lance_table::format::IndexMetadata],
+    base_scorer: &Arc<MemBM25Scorer>,
+    k: usize,
+) -> anyhow::Result<RecordBatch> {
+    // Lance 9 ranks ScoredDoc values by score alone. Fetch one row beyond the
+    // requested boundary and expand only while that boundary is tied. Once a
+    // lower score is visible, every candidate tied at rank k is present and
+    // the worker can safely apply DuckDB's score/row-id total order. A corpus
+    // whose entire boundary group is tied necessarily requires reading that
+    // whole group; no fixed oversampling factor can preserve the row-id key.
+    let mut fetch = k.saturating_add(1);
+    loop {
+        let attempt = rewrite_fts_plan(plan.clone(), segments, Some(base_scorer), Some(fetch))?;
+        let stream = execute_plan(attempt, LanceExecutionOptions::default())?;
+        let batches = stream.try_collect::<Vec<_>>().await?;
+        let mut candidates = Vec::new();
+        for batch in batches {
+            append_fts_candidates(&mut candidates, batch)?;
+        }
+        candidates.sort_unstable_by(|left, right| fts_candidate_cmp(right, left));
+
+        let boundary_complete = fts_candidate_boundary_complete(&candidates, k, fetch);
+        if boundary_complete || fetch == usize::MAX {
+            candidates.truncate(k);
+            return build_fts_candidate_batch(&candidates);
+        }
+        fetch = fetch.saturating_mul(2);
+    }
+}
+
+enum FtsExecution {
+    Candidates(RecordBatch),
+    Stream(SendableRecordBatchStream),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_exact_fts_stream(
     handle: &DatasetHandle,
@@ -1101,28 +1208,35 @@ fn create_exact_fts_stream(
     })?;
     scan.scan_in_order(false);
 
-    // `execute_plan` starts DataFusion operators immediately.  Some of those
-    // operators spawn Tokio tasks during `ExecutionPlan::execute`, so both
-    // plan creation and stream construction must run while the Lance runtime
-    // is entered.  `DataFusionStream` retains that runtime's handle for later
-    // polling from the synchronous Arrow C stream callbacks.
-    let stream = runtime::block_on(async {
+    // `execute_plan` starts DataFusion operators immediately. Some of those
+    // operators spawn Tokio tasks during `ExecutionPlan::execute`, so plan
+    // creation and stream construction must run while the Lance runtime is
+    // entered. Candidate execution is drained here because a tied boundary
+    // may require another native search with a larger leaf limit. Ordinary FTS
+    // retains the runtime handle and is polled by Arrow C stream callbacks.
+    let execution = runtime::block_on(async {
         let plan = scan
             .create_plan()
             .await
             .map_err(|err| format!("create FTS plan: {err}"))?;
-        let base_scorer = match scorer_segments {
-            Some(segments) => Some(
-                build_corpus_fts_scorer(&plan, &segments)
+        match scorer_segments {
+            Some(scorer_segments) => {
+                let base_scorer = build_corpus_fts_scorer(&plan, &scorer_segments)
                     .await
-                    .map_err(|err| format!("build corpus-wide FTS scorer: {err}"))?,
-            ),
-            None => None,
-        };
-        let plan = rewrite_fts_plan(plan, &index_segments, base_scorer.as_ref())
-            .map_err(|err| format!("freeze FTS segments: {err}"))?;
-        execute_plan(plan, LanceExecutionOptions::default())
-            .map_err(|err| format!("execute distributed FTS plan: {err}"))
+                    .map_err(|err| format!("build corpus-wide FTS scorer: {err}"))?;
+                let batch = execute_fts_candidate_top_k(plan, &index_segments, &base_scorer, k)
+                    .await
+                    .map_err(|err| format!("execute distributed FTS candidates: {err}"))?;
+                Ok::<FtsExecution, String>(FtsExecution::Candidates(batch))
+            }
+            None => {
+                let plan = rewrite_fts_plan(plan, &index_segments, None, None)
+                    .map_err(|err| format!("freeze FTS segments: {err}"))?;
+                let stream = execute_plan(plan, LanceExecutionOptions::default())
+                    .map_err(|err| format!("execute distributed FTS plan: {err}"))?;
+                Ok::<FtsExecution, String>(FtsExecution::Stream(stream))
+            }
+        }
     })
     .map_err(|err| {
         FfiError::new(
@@ -1131,16 +1245,17 @@ fn create_exact_fts_stream(
         )
     })?
     .map_err(|err| FfiError::new(ErrorCode::FtsStreamCreate, err))?;
-    let stream = DataFusionStream::try_new(stream).map_err(|err| {
-        FfiError::new(
-            ErrorCode::FtsStreamCreate,
-            format!("distributed FTS stream: {err}"),
-        )
-    })?;
-    if candidate_output {
-        Ok(StreamHandle::FtsCandidates(FtsCandidateStream::new(stream)))
-    } else {
-        Ok(StreamHandle::DataFusion(stream))
+    match execution {
+        FtsExecution::Candidates(batch) => Ok(StreamHandle::Batches(vec![batch].into_iter())),
+        FtsExecution::Stream(stream) => {
+            let stream = DataFusionStream::try_new(stream).map_err(|err| {
+                FfiError::new(
+                    ErrorCode::FtsStreamCreate,
+                    format!("distributed FTS stream: {err}"),
+                )
+            })?;
+            Ok(StreamHandle::DataFusion(stream))
+        }
     }
 }
 
@@ -2286,6 +2401,36 @@ mod tests {
                 &[0.25, 0.5]
             );
         }
+    }
+
+    #[test]
+    fn fts_candidate_boundary_preserves_the_row_id_tie_break() {
+        let mut tied = vec![
+            FtsCandidate {
+                row_id: 100,
+                score: 1.0,
+            },
+            FtsCandidate {
+                row_id: 5,
+                score: 1.0,
+            },
+        ];
+        tied.sort_unstable_by(|left, right| fts_candidate_cmp(right, left));
+        assert_eq!(
+            tied.iter()
+                .map(|candidate| candidate.row_id)
+                .collect::<Vec<_>>(),
+            vec![5, 100]
+        );
+        assert!(!fts_candidate_boundary_complete(&tied, 1, 2));
+
+        tied.push(FtsCandidate {
+            row_id: 1,
+            score: 0.5,
+        });
+        tied.sort_unstable_by(|left, right| fts_candidate_cmp(right, left));
+        assert!(fts_candidate_boundary_complete(&tied, 1, 3));
+        assert!(fts_candidate_boundary_complete(&tied[..2], 1, 3));
     }
 
     #[test]

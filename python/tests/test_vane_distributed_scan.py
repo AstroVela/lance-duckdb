@@ -1463,11 +1463,14 @@ def _write_fts_candidate_dataset(
     mode: str,
     every_row_matches: bool,
 ) -> None:
+    last_row = start + rows - 1
     text = (
-        "'puppy'::VARCHAR"
+        f"CASE WHEN i = {last_row} THEN 'puppy tie'::VARCHAR "
+        "ELSE 'puppy'::VARCHAR END"
         if every_row_matches
         else "CASE WHEN i = 0 THEN "
         "('puppy ' || repeat('filler ', 32))::VARCHAR "
+        f"WHEN i = {last_row} THEN 'filler tie'::VARCHAR "
         "ELSE 'filler'::VARCHAR END"
     )
     connection.execute("SET arrow_output_version = '1.0'")
@@ -2934,6 +2937,61 @@ def test_fts_candidates_use_disjoint_full_coverage_segments_and_global_bm25(
         )
         assert execution_node_ids == set(ray_cluster)
         _assert_vane_worker_topology(ray, ray_runner)
+
+        # Add a third, much smaller segment containing another equal-score
+        # match. There are now more FTS work units than workers and more
+        # tied matches than k. A bind selecting multiple segments must retain
+        # the lower row ID regardless of segment completion order.
+        _write_fts_candidate_dataset(
+            connection,
+            path,
+            start=5120,
+            rows=1,
+            mode="append",
+            every_row_matches=True,
+        )
+        connection.execute(
+            f"ALTER INDEX text_idx ON {path_sql} OPTIMIZE WITH (mode = 'append')"
+        )
+        connection.close()
+        connection = _connect()
+
+        tie_sql = (
+            "SELECT id FROM lance_fts("
+            f"{path_sql}, 'text', 'tie', k = 1) "
+            "ORDER BY _score DESC, id"
+        )
+        tie_relation = connection.sql(tie_sql)
+        tie_physical = _physical_plan(connection, tie_relation)
+        tie_split_map = tie_physical.scan_split_batch_map()
+        assert len(tie_split_map) == 1
+        _, tie_batches = next(iter(tie_split_map.items()))
+        tie_details = [
+            detail
+            for batch in tie_batches
+            for detail in _fts_candidate_assignment_details(bytes(batch))
+        ]
+        assert len(tie_details) == 3
+        assert len(tie_details) > WORKER_COUNT
+
+        tie_group = connection.execute(
+            "SELECT id, _score FROM lance_fts("
+            f"{path_sql}, 'text', 'tie', k = 3) "
+            "ORDER BY _score DESC, id"
+        ).fetchall()
+        assert [row[0] for row in tie_group] == [4095, 5119, 5120]
+        assert len({row[1] for row in tie_group}) == 1
+
+        # Local execution selects all three candidate assignments in one bind,
+        # exercising the same multi-segment leaf path a worker batch uses.
+        assert connection.execute(tie_sql).fetchall() == [(4095,)]
+
+        baseline_task_ids = set(_settled_ray_fte_create_task_locations())
+        assert _run(ray_runner, tie_relation) == [(4095,)]
+        execution_node_ids = _ray_fte_create_task_node_ids(
+            baseline_task_ids, expected_count=len(tie_details)
+        )
+        assert execution_node_ids == set(ray_cluster)
 
         filtered_sql = (
             "SELECT id, _score FROM lance_fts("

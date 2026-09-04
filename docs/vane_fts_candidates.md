@@ -16,11 +16,13 @@ both scores and the final ranking.
 Before executing segment work, every worker opens the complete frozen segment
 set and uses Lance's native global BM25 scorer builder. It then injects that one
 scorer into the native Lance search for the segments assigned to the worker.
-The worker returns at most local k rows as `(_rowid, _score)`. Vane applies the
-deterministic global ordering `(_score DESC, _rowid ASC)` and retains k rows.
-Because physical segment coverage is disjoint and every worker uses the same
-scoring function, the union of segment-local top-k sets contains the global
-top-k.
+Lance 9's internal FTS heap compares scores without a row-ID tie-break, so the
+worker initially requests one candidate beyond k and expands the native leaf
+limit while the kth-score boundary remains tied. It then applies the complete
+`(_score DESC, _rowid ASC)` order and returns at most local k rows. Vane applies
+the same order globally and retains k rows. Because physical segment coverage
+is disjoint and every worker uses the same scoring function and total order,
+the union of segment-local top-k sets contains the global top-k.
 
 ## Admission boundary
 
