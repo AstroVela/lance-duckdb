@@ -1790,9 +1790,7 @@ def _fts_candidate_assignment_details(
         payload = singleton[variant_offset:payload_end]
         assert len(payload) == 85
         assert payload[-16:].hex() == segment_uuid
-        result.append(
-            (task_id, singleton, variant_offset, digest_offset, segment_uuid)
-        )
+        result.append((task_id, singleton, variant_offset, digest_offset, segment_uuid))
     return result
 
 
@@ -2888,9 +2886,7 @@ def test_fts_candidates_use_disjoint_full_coverage_segments_and_global_bm25(
             mode="create",
             every_row_matches=False,
         )
-        connection.execute(
-            f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED"
-        )
+        connection.execute(f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED")
         assert_final_search(search_sql, "one-full-coverage-segment")
 
         # Uncovered fragments are not safe independent FTS work because their
@@ -2913,9 +2909,7 @@ def test_fts_candidates_use_disjoint_full_coverage_segments_and_global_bm25(
 
         # A computed-score postfilter intentionally keeps this reference on
         # Lance's singleton path without changing the positive-score result.
-        reference_sql = search_sql.replace(
-            ") ORDER BY", ") WHERE _score >= 0 ORDER BY"
-        )
+        reference_sql = search_sql.replace(") ORDER BY", ") WHERE _score >= 0 ORDER BY")
         assert_final_search(reference_sql, "native-reference")
         expected = connection.execute(reference_sql).fetchall()
         assert [row[0] for row in expected] == list(range(4096, 4103))
