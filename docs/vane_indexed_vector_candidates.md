@@ -41,6 +41,8 @@ Indexed vector candidates admit a query only when all of these conditions hold:
 - there is no post-filter, and any filter is applied as a prefilter;
 - the coordinator has frozen and validated the exact vector index segment
   identities and their fragment coverage for the query snapshot;
+- every frozen segment exposes the same supported logical distance metric
+  (`L2`, `Cosine`, or `Dot`);
 - work assignments are disjoint across selected index segments and uncovered
   flat fragments;
 - at least two useful work assignments exist and the existing scheduling
@@ -56,12 +58,15 @@ singleton or a flat search.
 The coordinator reuses the existing frozen `SearchIndexPlan`. Covered work is
 identified by physical index segment UUID, while fragments outside the
 selected segments form separate flat work. Pairwise overlapping physical
-segment coverage is not admitted. A worker combines only the tasks assigned to
-that worker, passes the selected UUIDs through Lance's native
-`with_index_segments` API, and returns at most local k rows as
-`(_rowid, _distance)`. Vane then applies the existing deterministic global
-ordering `(_distance ASC, _rowid ASC)` and the existing batched Lance take
-materializer.
+segment coverage is not admitted. The plan already freezes each segment's
+`VectorIndexDetails`; workers validate those details and explicitly apply the
+single frozen metric to both indexed segment work and uncovered flat work. A
+legacy, malformed, unsupported, or mixed-metric layout remains singleton. A
+worker combines only the tasks assigned to that worker, passes the selected
+UUIDs through Lance's native `with_index_segments` API, and returns at most
+local k rows as `(_rowid, _distance)`. Vane then applies the existing
+deterministic global ordering `(_distance ASC, _rowid ASC)` and the existing
+batched Lance take materializer.
 
 The current Lance scanner can select frozen index segments and restrict
 fragments. It does not expose a public hook for injecting one
@@ -89,6 +94,7 @@ native Lance result for:
   count;
 - one and multiple physical index segments;
 - full and partial index coverage, including newly appended fragments;
+- partial coverage with `Cosine` and `Dot` metrics;
 - deleted rows and stale index entries;
 - absent, empty, and selective prefilters;
 - equal-distance rows with deterministic `_rowid` tie-breaking;

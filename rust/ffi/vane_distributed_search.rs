@@ -16,6 +16,7 @@ use lance::io::exec::fts::{FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryEx
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::planner::Planner;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_linalg::distance::DistanceType;
 use lance_table::format::pb;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -728,6 +729,7 @@ fn create_vector_stream(
     filter: Option<Expr>,
     prefilter: bool,
     use_index: bool,
+    metric_type: Option<DistanceType>,
     fragments: Vec<lance_table::format::Fragment>,
     index_segments: Vec<lance_table::format::IndexMetadata>,
     project_row_id_only: bool,
@@ -749,6 +751,9 @@ fn create_vector_stream(
             format!("distributed vector nearest: {err}"),
         )
     })?;
+    if let Some(metric_type) = metric_type {
+        scan.distance_metric(metric_type);
+    }
     // Lance rejects `nearest` when a fragment restriction was installed
     // first for a post-filter query.  Install the already-validated frozen
     // fragment set after `nearest`; Lance then uses it both to restrict the
@@ -1002,6 +1007,7 @@ pub unsafe extern "C" fn lance_vane_create_knn_stream_ir(
             filter,
             prefilter != 0,
             use_index != 0,
+            validated.vector_metric,
             validated.fragments,
             validated.vector_segments,
             false,
@@ -1149,6 +1155,17 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
             ));
         }
 
+        let metric_type = if use_index {
+            Some(validated.vector_metric.ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "SearchIndexPlan does not expose one supported vector metric",
+                )
+            })?)
+        } else {
+            None
+        };
+
         let (selected_segment_metadata, selected_fragment_ids) = if use_index {
             let work = validated
                 .indexed_vector_work_fragments
@@ -1247,6 +1264,7 @@ pub unsafe extern "C" fn lance_vane_create_vector_candidate_stream_ir(
                 filter,
                 prefilter != 0,
                 !selected_segment_metadata.is_empty(),
+                metric_type,
                 selected,
                 selected_segment_metadata,
                 true,
@@ -1507,6 +1525,7 @@ fn create_exact_hybrid_batch(
     validated: super::vane_search_plan::ValidatedSearchIndexPlan,
 ) -> FfiResult<RecordBatch> {
     let oversample = k.saturating_mul(oversample_factor.max(1) as usize).max(k);
+    let vector_metric = validated.vector_metric;
     let mut vector_stream = StreamHandle::Lance(create_vector_stream(
         handle,
         vector_column,
@@ -1517,6 +1536,7 @@ fn create_exact_hybrid_batch(
         filter.clone(),
         prefilter,
         use_index,
+        vector_metric,
         validated.fragments.clone(),
         validated.vector_segments,
         true,
@@ -1719,6 +1739,7 @@ mod tests {
     use std::ffi::CString;
     use std::path::PathBuf;
 
+    use super::*;
     use arrow_array::{FixedSizeListArray, Int64Array, RecordBatchIterator};
     use lance::dataset::WriteParams;
     use lance::index::{vector::VectorIndexParams, DatasetIndexExt};
@@ -1726,9 +1747,6 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::IndexType;
-    use lance_linalg::distance::DistanceType;
-
-    use super::*;
 
     struct TestDatasetDir(PathBuf);
 
@@ -1769,6 +1787,7 @@ mod tests {
             None,
             false,
             true,
+            Some(DistanceType::L2),
             fragments,
             index_segments,
             true,

@@ -2794,6 +2794,80 @@ def test_indexed_vector_candidates_use_disjoint_segments_and_uncovered_fragments
         connection.close()
 
 
+def test_indexed_vector_candidates_preserve_metric_for_uncovered_fragments(
+    tmp_path: Path, ray_runner
+) -> None:
+    connection = _connect()
+    query = (
+        f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> "
+        "CASE WHEN x = 0 THEN 1.0::FLOAT ELSE 0.0::FLOAT END)"
+        f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}]"
+    )
+
+    def vector(first: float, second: float) -> str:
+        return (
+            f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> CASE "
+            f"WHEN x = 0 THEN {first}::FLOAT "
+            f"WHEN x = 1 THEN {second}::FLOAT ELSE 0.0::FLOAT END)"
+            f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}]"
+        )
+
+    try:
+        for metric, covered, uncovered in (
+            ("cosine", vector(2.0, 1.0), vector(2.0, 0.0)),
+            ("dot", vector(2.0, 0.0), vector(100.0, 0.0)),
+        ):
+            path = tmp_path / f"indexed_{metric}_partial_coverage.lance"
+            path_sql = _sql_literal(path)
+            # The indexed fragment alone reaches the distributed scheduling
+            # threshold. The later fragment remains outside the index segment.
+            connection.execute(
+                f"COPY (SELECT i::BIGINT AS id, {covered} AS vec "
+                "FROM range(4096) AS source(i)) "
+                f"TO {path_sql} (FORMAT LANCE, MODE 'create', "
+                "MAX_ROWS_PER_FILE 4096)"
+            )
+            connection.execute(
+                f"CREATE INDEX {metric}_vec_idx ON {path_sql} (vec) "
+                "USING IVF_FLAT WITH (num_partitions=1, "
+                f"metric_type='{metric}')"
+            )
+            connection.execute(
+                f"COPY (SELECT i::BIGINT AS id, {uncovered} AS vec "
+                "FROM range(4096, 4608) AS source(i)) "
+                f"TO {path_sql} (FORMAT LANCE, MODE 'append', "
+                "MAX_ROWS_PER_FILE 512)"
+            )
+
+            sql = (
+                "SELECT id, _distance FROM lance_vector_search("
+                f"{path_sql}, 'vec', {query}, k = 1, nprobs = 1, "
+                "use_index = true) ORDER BY _distance, id"
+            )
+            # Native Lance applies the index metric to its uncovered flat scan.
+            # With L2 on that fragment, each data shape below instead selects an
+            # indexed row, making this a direct regression for metric drift.
+            expected = connection.execute(sql).fetchall()
+            assert len(expected) == 1, metric
+            assert expected[0][0] == 4096, metric
+
+            relation = connection.sql(sql)
+            details = [
+                detail
+                for batches in _split_batches(connection, relation).values()
+                for batch in batches
+                for detail in _indexed_vector_candidate_assignment_details(batch)
+            ]
+            assert len(details) == 2, metric
+            assert [detail[4] for detail in details].count("segment") == 1, metric
+            fragment_details = [detail for detail in details if detail[4] == "fragment"]
+            assert len(fragment_details) == 1, metric
+            assert fragment_details[0][5] == 1, metric
+            assert _run(ray_runner, relation) == expected, metric
+    finally:
+        connection.close()
+
+
 def test_namespace_vector_outer_filter_remains_after_top_k(
     tmp_path: Path, ray_runner
 ) -> None:
