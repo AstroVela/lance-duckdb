@@ -1,0 +1,8 @@
+# Complete provider matrix and current TestPyPI per-file upload budget.
+interpreters = ["cp310", "cp311", "cp312", "cp313", "cp314"]
+platforms = ["manylinux_2_28_x86_64"]
+max_wheel_bytes = 100000000
+
+[providers.lance]
+distribution = "vane-extension-lance"
+dependencies = []

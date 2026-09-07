@@ -3,9 +3,10 @@
 # DuckDB builds.
 
 VANE_EXTENSION_ROOT ?= $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
-VANE_CI_TOOLS_VERSION := 28c253d71645b627e90307a8c0f42bf74bda0046
-VANE_CI_TOOLS_REPOSITORY := https://github.com/AstroVela/vane-extension-ci-tools.git
-VANE_CI_TOOLS_DIR ?= $(VANE_EXTENSION_ROOT)/build/vane-extension-ci-tools
+override VANE_CI_TOOLS_DIR := $(VANE_EXTENSION_ROOT)/vane-extension-ci-tools
+override _VANE_EXPECTED_CI_TOOLS_VERSION := $(shell \
+	git -C "$(VANE_EXTENSION_ROOT)" \
+		rev-parse "HEAD:vane-extension-ci-tools" 2>/dev/null)
 VANE_MANIFEST ?= $(VANE_EXTENSION_ROOT)/vane-extension.toml
 VANE_SOURCE_DIR ?= $(VANE_EXTENSION_ROOT)/build/vane-source
 VANE_NATIVE_BUILD_DIR ?= $(VANE_EXTENSION_ROOT)/build/vane-native
@@ -24,42 +25,13 @@ VANE_EXTENSION_COMMAND = $(VANE_PYTHON) \
 	--manifest "$(VANE_MANIFEST)" \
 	--extension-root "$(VANE_EXTENSION_ROOT)"
 
-.PHONY: vane_ci_tools vane_verify_ci_tools vane_validate vane_prepare vane_identity \
+.PHONY: vane_verify_ci_tools vane_validate vane_prepare vane_identity \
 	vane_native vane_ci vane_wheel_dependencies vane_wheel
 
-vane_ci_tools:
-	@set -eu; \
-	if test ! -d "$(VANE_CI_TOOLS_DIR)/.git"; then \
-		test ! -e "$(VANE_CI_TOOLS_DIR)" || { \
-			printf '%s exists but is not a Git checkout\n' "$(VANE_CI_TOOLS_DIR)" >&2; \
-			exit 2; \
-		}; \
-		mkdir -p "$(dir $(VANE_CI_TOOLS_DIR))"; \
-		tmp_dir=$$(mktemp -d "$(dir $(VANE_CI_TOOLS_DIR)).vane-ci-tools.XXXXXX"); \
-		trap 'rm -rf "$$tmp_dir"' EXIT; \
-		git init --quiet "$$tmp_dir"; \
-		git -C "$$tmp_dir" remote add origin "$(VANE_CI_TOOLS_REPOSITORY)"; \
-		git -C "$$tmp_dir" fetch --quiet --depth=1 origin "$(VANE_CI_TOOLS_VERSION)"; \
-		git -C "$$tmp_dir" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD; \
-		mv "$$tmp_dir" "$(VANE_CI_TOOLS_DIR)"; \
-		trap - EXIT; \
-	fi; \
-	actual=$$(git -C "$(VANE_CI_TOOLS_DIR)" rev-parse HEAD); \
-	test "$$actual" = "$(VANE_CI_TOOLS_VERSION)" || { \
-		printf 'Vane CI tools revision mismatch: expected %s, got %s\n' \
-			"$(VANE_CI_TOOLS_VERSION)" "$$actual" >&2; \
-		exit 2; \
-	}; \
-	ci_tools_status=$$(git -C "$(VANE_CI_TOOLS_DIR)" status --porcelain); \
-	test -z "$$ci_tools_status" || { \
-		echo "VANE_CI_TOOLS_DIR must be a clean checkout" >&2; \
-		exit 2; \
-	}
-
-vane_verify_ci_tools: vane_ci_tools
+vane_verify_ci_tools:
 	$(VANE_EXTENSION_COMMAND) verify-ci-tools \
 		--ci-tools-source "$(VANE_CI_TOOLS_DIR)" \
-		--expected-sha "$(VANE_CI_TOOLS_VERSION)"
+		--expected-sha "$(_VANE_EXPECTED_CI_TOOLS_VERSION)"
 
 vane_validate: vane_verify_ci_tools
 	$(VANE_EXTENSION_COMMAND) manifest
@@ -90,15 +62,15 @@ vane_wheel_dependencies: vane_prepare
 		{ echo "Vane wheel builds require 64-bit x86 Linux" >&2; exit 2; }
 	@set -eu; \
 	extension_vcpkg_commit=$$("$(VANE_PYTHON)" -c \
-		'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["vcpkg_commit"])' \
+		'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["vcpkg"]["revision"])' \
 		"$(VANE_MANIFEST)"); \
 	case "$$extension_vcpkg_commit" in \
 		''|*[!0-9a-f]*) \
-			echo "vcpkg_commit must be a full lowercase commit SHA" >&2; \
+			echo "vcpkg.revision must be a full lowercase commit SHA" >&2; \
 			exit 2 ;; \
 	esac; \
 	test "$${#extension_vcpkg_commit}" -eq 40 || { \
-		echo "vcpkg_commit must be a full lowercase commit SHA" >&2; \
+		echo "vcpkg.revision must be a full lowercase commit SHA" >&2; \
 		exit 2; \
 	}; \
 	if test -e "$(VANE_EXTENSION_VCPKG_ROOT)" && \

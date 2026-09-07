@@ -176,10 +176,17 @@ def _vcpkg_revision(extension_root: Path) -> str:
             extension_root / "vane-extension.toml", "Vane extension manifest"
         ).read_text(encoding="utf-8")
     )
-    revision = manifest.get("vcpkg_commit")
+    vcpkg = manifest.get("vcpkg")
+    if manifest.get("schema_version") != 2 or not isinstance(vcpkg, dict):
+        raise QualificationError(
+            "vane-extension.toml must use schema 2 with an explicit [vcpkg] table"
+        )
+    if vcpkg.get("repository") != "microsoft/vcpkg":
+        raise QualificationError("vcpkg.repository must be microsoft/vcpkg")
+    revision = vcpkg.get("revision")
     if not isinstance(revision, str) or _REVISION_RE.fullmatch(revision) is None:
         raise QualificationError(
-            "vane-extension.toml must contain one complete vcpkg_commit"
+            "vane-extension.toml must contain one complete vcpkg.revision"
         )
     return revision
 

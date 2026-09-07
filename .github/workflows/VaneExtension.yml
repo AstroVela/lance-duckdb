@@ -35,55 +35,19 @@ jobs:
     timeout-minutes: 10
     env:
       DUCKDB_CI_TOOLS_VERSION: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
-      VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
     steps:
       - name: Checkout CI inputs
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - name: Checkout exact Vane CI tools
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: AstroVela/vane-extension-ci-tools
-          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
-          path: vane-ci-tools
-          persist-credentials: false
+      - name: Initialize pinned Vane CI tools
+        run: git submodule update --init vane-extension-ci-tools
 
       - name: Validate manifests and pins
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import re
-          import tomllib
-          from pathlib import Path
-
-          full_sha = re.compile(r"[0-9a-f]{40}")
-          manifest = tomllib.loads(Path("vane-extension.toml").read_text())
-          if manifest.get("schema_version") != 1:
-              raise SystemExit("vane-extension.toml schema_version must be 1")
-          vane = manifest.get("vane")
-          if not isinstance(vane, dict):
-              raise SystemExit("vane-extension.toml must contain a [vane] table")
-          if vane.get("repository") != "AstroVela/vane":
-              raise SystemExit("vane.repository must be AstroVela/vane")
-          revision = vane.get("revision")
-          if not isinstance(revision, str) or not full_sha.fullmatch(revision):
-              raise SystemExit("vane.revision must be a full lowercase commit SHA")
-          vcpkg_commit = manifest.get("vcpkg_commit")
-          if not isinstance(vcpkg_commit, str) or not full_sha.fullmatch(vcpkg_commit):
-              raise SystemExit(
-                  "vcpkg_commit must be a full lowercase commit SHA"
-              )
-          for key in ("extension_config", "native_test_selection"):
-              value = manifest.get(key)
-              if not isinstance(value, str) or not Path(value).is_file():
-                  raise SystemExit(f"{key} must identify a repository file")
-
-          print(f"Vane revision: {revision}")
-          print(f"Vane vcpkg commit: {vcpkg_commit}")
-          PY
 
           verify_gitlink() {
             local path="$1"
@@ -98,12 +62,12 @@ jobs:
           }
           verify_gitlink extension-ci-tools "${DUCKDB_CI_TOOLS_VERSION}"
 
-          python3 vane-ci-tools/scripts/vane_extension.py \
+          python3 vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "${GITHUB_WORKSPACE}/vane-extension.toml" \
             --extension-root "${GITHUB_WORKSPACE}" \
             verify-ci-tools \
-            --ci-tools-source "${GITHUB_WORKSPACE}/vane-ci-tools" \
-            --expected-sha "${VANE_CI_TOOLS_VERSION}"
+            --ci-tools-source "${GITHUB_WORKSPACE}/vane-extension-ci-tools" \
+            --expected-sha "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD:vane-extension-ci-tools)"
 
   rust-quality:
     name: Rust code quality
@@ -193,12 +157,10 @@ jobs:
           python -m pip install "black==24.10.0"
           python -m black --check \
             python/tests \
-            scripts/build_vane_dynamic_wheel.py \
-            scripts/validate_vane_provider_release.py
+            scripts/build_vane_dynamic_wheel.py
           python -m compileall -q \
             python/tests \
-            scripts/build_vane_dynamic_wheel.py \
-            scripts/validate_vane_provider_release.py
+            scripts/build_vane_dynamic_wheel.py
 
   vane-provider-release-tooling:
     if: inputs.operation != 'testpypi-dev'
@@ -215,6 +177,9 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Initialize pinned Vane CI tools
+        run: git submodule update --init vane-extension-ci-tools
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -222,7 +187,8 @@ jobs:
 
       - name: Exercise the immutable release validator
         run: |
-          python -m pip install --disable-pip-version-check packaging pytest
+          python -m pip install --disable-pip-version-check \
+            -r vane-extension-ci-tools/requirements-release.txt pytest pyyaml
           python -m pytest -q \
             python/tests/test_vane_dynamic_wheel.py \
             python/tests/test_vane_provider_release.py
@@ -238,7 +204,6 @@ jobs:
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 750M
       VANE_BUILD_JOBS: "8"
-      VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
       DUCKDB_CI_TOOLS_VERSION: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
       VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
       VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
@@ -283,13 +248,9 @@ jobs:
           path: extension/extension-ci-tools
           persist-credentials: false
 
-      - name: Checkout exact Vane CI tools
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: AstroVela/vane-extension-ci-tools
-          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
-          path: vane-ci-tools
-          persist-credentials: false
+      - name: Initialize pinned Vane CI tools
+        working-directory: extension
+        run: git submodule update --init vane-extension-ci-tools
 
       - name: Verify exact official Vane CI tools
         shell: bash
@@ -298,12 +259,12 @@ jobs:
           test "$(git -C "$VANE_EXTENSION_ROOT/extension-ci-tools" rev-parse HEAD)" = \
             "$DUCKDB_CI_TOOLS_VERSION"
           test -d "$VANE_EXTENSION_ROOT/extension-ci-tools/vcpkg_ports"
-          python3 vane-ci-tools/scripts/vane_extension.py \
+          python3 extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             verify-ci-tools \
-            --ci-tools-source "${GITHUB_WORKSPACE}/vane-ci-tools" \
-            --expected-sha "$VANE_CI_TOOLS_VERSION"
+            --ci-tools-source "${GITHUB_WORKSPACE}/extension/vane-extension-ci-tools" \
+            --expected-sha "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)"
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -313,7 +274,7 @@ jobs:
       - name: Read integration manifest
         id: manifest
         run: |
-          python vane-ci-tools/scripts/vane_extension.py \
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             manifest \
@@ -330,7 +291,7 @@ jobs:
 
       - name: Validate Vane identity
         run: |
-          python vane-ci-tools/scripts/vane_extension.py \
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             identity \
@@ -343,27 +304,34 @@ jobs:
             ccache
           python -m pip install "cmake>=3.29" "ninja>=1.10"
 
-      - name: Read Vane vcpkg commit
-        id: vcpkg
-        shell: bash
-        run: |
-          set -euo pipefail
-          commit="$(python -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["vcpkg_commit"])' "$VANE_MANIFEST")"
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-
       - name: Set up native vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
-          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.commit }}
+          vcpkgGitCommitId: ${{ steps.manifest.outputs.vcpkg_revision }}
           vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Remove verified run-vcpkg state marker
+        shell: bash
+        env:
+          VANE_EXTENSION_VCPKG_REVISION: ${{ steps.manifest.outputs.vcpkg_revision }}
+          VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          set -euo pipefail
+          marker="$VANE_EXTENSION_VCPKG_ROOT/vcpkgLastBuiltCommitId"
+          test -f "$marker"
+          test ! -L "$marker"
+          test "$(wc -c < "$marker")" -eq 40
+          test "$(<"$marker")" = "$VANE_EXTENSION_VCPKG_REVISION"
+          rm -- "$marker"
+          vcpkg_status="$(git -C "$VANE_EXTENSION_VCPKG_ROOT" status --porcelain --untracked-files=all)"
+          test -z "$vcpkg_status"
 
       - name: Restore Vane native compiler cache
         id: native-ccache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/.cache/vane-native-ccache
-          key: vane-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ steps.manifest.outputs.vane_revision }}
+          key: vane-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}
 
       - name: Build and test extension against Vane DuckDB
         env:
@@ -373,7 +341,7 @@ jobs:
         run: |
           set -euo pipefail
           ccache --zero-stats
-          python vane-ci-tools/scripts/vane_extension.py \
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             native \
@@ -402,7 +370,6 @@ jobs:
       CCACHE_MAXSIZE: 750M
       DUCKDB_CI_TOOLS_VERSION: de54d6cef550b4b54cc3e817eeb8c4415faf6c35
       VANE_BUILD_JOBS: "8"
-      VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
       VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
       VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
       VANE_SOURCE_DIR: ${{ github.workspace }}/vane
@@ -449,13 +416,9 @@ jobs:
           path: extension/extension-ci-tools
           persist-credentials: false
 
-      - name: Checkout exact Vane CI tools
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: AstroVela/vane-extension-ci-tools
-          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
-          path: vane-ci-tools
-          persist-credentials: false
+      - name: Initialize pinned Vane CI tools
+        working-directory: extension
+        run: git submodule update --init vane-extension-ci-tools
 
       - name: Verify exact CI tools
         shell: bash
@@ -464,12 +427,12 @@ jobs:
           test "$(git -C "$VANE_EXTENSION_ROOT/extension-ci-tools" rev-parse HEAD)" = \
             "$DUCKDB_CI_TOOLS_VERSION"
           test -d "$VANE_EXTENSION_ROOT/extension-ci-tools/vcpkg_ports"
-          python3 vane-ci-tools/scripts/vane_extension.py \
+          python3 extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             verify-ci-tools \
-            --ci-tools-source "${GITHUB_WORKSPACE}/vane-ci-tools" \
-            --expected-sha "$VANE_CI_TOOLS_VERSION"
+            --ci-tools-source "${GITHUB_WORKSPACE}/extension/vane-extension-ci-tools" \
+            --expected-sha "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)"
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -479,7 +442,7 @@ jobs:
       - name: Read integration manifest
         id: manifest
         run: |
-          python vane-ci-tools/scripts/vane_extension.py \
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             manifest \
@@ -496,7 +459,7 @@ jobs:
 
       - name: Validate Vane identity
         run: |
-          python vane-ci-tools/scripts/vane_extension.py \
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             identity \
@@ -527,20 +490,27 @@ jobs:
             "scikit-build-core>=0.11.4" \
             "setuptools-scm>=9.2.0"
 
-      - name: Read Vane vcpkg commit
-        id: vcpkg
-        shell: bash
-        run: |
-          set -euo pipefail
-          commit="$(python -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["vcpkg_commit"])' "$VANE_MANIFEST")"
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-
       - name: Set up extension vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
-          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.commit }}
+          vcpkgGitCommitId: ${{ steps.manifest.outputs.vcpkg_revision }}
           vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Remove verified run-vcpkg state marker
+        shell: bash
+        env:
+          VANE_EXTENSION_VCPKG_REVISION: ${{ steps.manifest.outputs.vcpkg_revision }}
+          VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          set -euo pipefail
+          marker="$VANE_EXTENSION_VCPKG_ROOT/vcpkgLastBuiltCommitId"
+          test -f "$marker"
+          test ! -L "$marker"
+          test "$(wc -c < "$marker")" -eq 40
+          test "$(<"$marker")" = "$VANE_EXTENSION_VCPKG_REVISION"
+          rm -- "$marker"
+          vcpkg_status="$(git -C "$VANE_EXTENSION_VCPKG_ROOT" status --porcelain --untracked-files=all)"
+          test -z "$vcpkg_status"
 
       - name: Bootstrap exact Vane wheel dependencies
         env:
@@ -578,7 +548,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/.cache/vane-wheel-ccache
-          key: vane-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ steps.manifest.outputs.vane_revision }}
+          key: vane-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}
 
       - name: Build and verify extension-bearing Vane wheel
         env:
@@ -589,7 +559,7 @@ jobs:
         run: |
           set -euo pipefail
           ccache --zero-stats
-          python vane-ci-tools/scripts/vane_extension.py \
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             wheel \
@@ -907,14 +877,6 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Checkout exact Vane CI tools
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: AstroVela/vane-extension-ci-tools
-          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
-          path: vane-ci-tools
-          persist-credentials: false
-
       - name: Select manylinux CPython
         shell: bash
         run: |
@@ -927,7 +889,7 @@ jobs:
       - name: Read integration manifest
         id: manifest
         run: |
-          python vane-ci-tools/scripts/vane_extension.py \
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             manifest \
@@ -955,7 +917,7 @@ jobs:
             build \
             "cmake>=3.29" \
             "ninja>=1.10" \
-            packaging \
+            -r extension/vane-extension-ci-tools/requirements-release.txt \
             "patchelf>=0.17.2" \
             "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4" \
@@ -1010,15 +972,15 @@ jobs:
           set -euo pipefail
           test "$(git -C extension/extension-ci-tools rev-parse HEAD)" = \
             de54d6cef550b4b54cc3e817eeb8c4415faf6c35
-          test "$(git -C vane-ci-tools rev-parse HEAD)" = \
-            28c253d71645b627e90307a8c0f42bf74bda0046
-          python vane-ci-tools/scripts/vane_extension.py \
+          test "$(git -C extension/vane-extension-ci-tools rev-parse HEAD)" = \
+            "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)"
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             verify-ci-tools \
-            --ci-tools-source "$GITHUB_WORKSPACE/vane-ci-tools" \
-            --expected-sha 28c253d71645b627e90307a8c0f42bf74bda0046
-          python vane-ci-tools/scripts/vane_extension.py \
+            --ci-tools-source "$GITHUB_WORKSPACE/extension/vane-extension-ci-tools" \
+            --expected-sha "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)"
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             identity \
@@ -1029,7 +991,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: vane-lance-provider-v1-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json') }}
+          key: vane-lance-provider-v1-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json') }}
 
       - name: Bootstrap exact Vane dependencies
         run: |
@@ -1039,7 +1001,6 @@ jobs:
           make -f extension/makefiles/vane_extension.Makefile \
             vane_wheel_dependencies \
             VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
-            VANE_CI_TOOLS_DIR="$GITHUB_WORKSPACE/vane-ci-tools" \
             VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
             VANE_EXTENSION_VCPKG_ROOT="$VANE_EXTENSION_VCPKG_ROOT" \
             VANE_MANIFEST="$VANE_MANIFEST" \
@@ -1221,18 +1182,10 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Checkout exact Vane CI tools
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: AstroVela/vane-extension-ci-tools
-          ref: 28c253d71645b627e90307a8c0f42bf74bda0046
-          path: vane-ci-tools
-          persist-credentials: false
-
       - name: Read integration manifest
         id: manifest
         run: |
-          "$VANE_PYTHON" vane-ci-tools/scripts/vane_extension.py \
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             manifest \
@@ -1260,7 +1213,7 @@ jobs:
             build \
             "cmake>=3.29" \
             "ninja>=1.10" \
-            packaging \
+            -r extension/vane-extension-ci-tools/requirements-release.txt \
             "patchelf>=0.17.2" \
             "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4" \
@@ -1316,15 +1269,15 @@ jobs:
           set -euo pipefail
           test "$(git -C extension/extension-ci-tools rev-parse HEAD)" = \
             de54d6cef550b4b54cc3e817eeb8c4415faf6c35
-          test "$(git -C vane-ci-tools rev-parse HEAD)" = \
-            28c253d71645b627e90307a8c0f42bf74bda0046
-          "$VANE_PYTHON" vane-ci-tools/scripts/vane_extension.py \
+          test "$(git -C extension/vane-extension-ci-tools rev-parse HEAD)" = \
+            "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)"
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             verify-ci-tools \
-            --ci-tools-source "$GITHUB_WORKSPACE/vane-ci-tools" \
-            --expected-sha 28c253d71645b627e90307a8c0f42bf74bda0046
-          "$VANE_PYTHON" vane-ci-tools/scripts/vane_extension.py \
+            --ci-tools-source "$GITHUB_WORKSPACE/extension/vane-extension-ci-tools" \
+            --expected-sha "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)"
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
             --manifest "$VANE_MANIFEST" \
             --extension-root "$VANE_EXTENSION_ROOT" \
             identity \
@@ -1337,7 +1290,7 @@ jobs:
           path: |
             ${{ env.CCACHE_DIR }}
             ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vane-lance-testpypi-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json') }}
+          key: vane-lance-testpypi-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json') }}
 
       - name: Bootstrap exact Vane dependencies
         run: |
@@ -1348,7 +1301,6 @@ jobs:
           make -f extension/makefiles/vane_extension.Makefile \
             vane_wheel_dependencies \
             VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
-            VANE_CI_TOOLS_DIR="$GITHUB_WORKSPACE/vane-ci-tools" \
             VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
             VANE_EXTENSION_VCPKG_ROOT="$VANE_EXTENSION_VCPKG_ROOT" \
             VANE_MANIFEST="$VANE_MANIFEST" \
@@ -1437,7 +1389,10 @@ jobs:
         id: release
         shell: bash
         run: |
-          "$VANE_PYTHON" extension/scripts/validate_vane_provider_release.py validate \
+          "$VANE_PYTHON" -I extension/vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" --ci-tools-version "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)" \
+            --config "$VANE_EXTENSION_ROOT/vane-provider-release.toml" \
             --directory "$VANE_DYNAMIC_DIST_DIR" \
             --vane-version "${{ steps.vane-candidate.outputs.version }}" \
             --require-testpypi-publishable \
@@ -1484,8 +1439,27 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Initialize pinned Vane CI tools
+        run: git submodule update --init vane-extension-ci-tools
+
       - name: Install release validation tooling
-        run: python -m pip install --disable-pip-version-check packaging
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read integration manifest
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Download Lance provider wheels
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -1495,7 +1469,10 @@ jobs:
 
       - name: Revalidate the complete release set
         run: |
-          python scripts/validate_vane_provider_release.py validate \
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane --ci-tools-version "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml \
             --directory packages \
             --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
             --require-testpypi-publishable
@@ -1593,8 +1570,27 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Initialize pinned Vane CI tools
+        run: git submodule update --init vane-extension-ci-tools
+
       - name: Install release validation tooling
-        run: python -m pip install --disable-pip-version-check packaging
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read integration manifest
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Download Lance distributions
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -1604,7 +1600,10 @@ jobs:
 
       - name: Compare the immutable indexed release
         run: |
-          python scripts/validate_vane_provider_release.py verify-index \
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane --ci-tools-version "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --provider lance \
             --directory dist \
             --version "${{ needs.assemble-testpypi-lance.outputs.lance_version }}"
 
