@@ -19,7 +19,7 @@ Prepare the pinned tools and run the lightweight consumer checks with Python
 ```bash
 git submodule update --init vane-extension-ci-tools
 python -m pip install -r vane-extension-ci-tools/requirements-release.txt pytest pyyaml
-python -m pytest -q python/tests/test_vane_dynamic_wheel.py python/tests/test_vane_provider_release.py
+python -m pytest -q python/tests/test_vane_dynamic_wheel.py python/tests/test_vane_dynamic_signing.py python/tests/test_vane_provider_release.py
 ```
 
 For a locally assembled TestPyPI candidate set:
@@ -30,7 +30,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --vane-source ../vane \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
-  --directory build/vane-testpypi-provider-dist \
+  --directory build/vane-provider-dist \
   --vane-version 0.2.0.dev612 --channel testpypi-dev \
   --require-publishable-on testpypi
 ```
@@ -87,23 +87,41 @@ The release channel reuses the existing candidate jobs:
 1. Validate the dispatch, exact sources, canonical runtime version, production-key
    ancestry, and the complete published runtime matrix before native builds or
    signing-key access.
-2. Build the native artifact once and sign it once with the production key. Both
-   testing-key CMake switches are explicitly disabled. The builder requires an
-   owned temporary private-key file, consumes it, verifies the public DER
-   fingerprint, and rejects a locally packaged production runtime.
-3. Verify the artifact against every exact indexed runtime and assemble the full
+2. Build the native artifact once in a job with no environment, private key, or
+   OIDC permission. Both testing-key CMake switches are explicitly disabled for
+   production. Upload only unsigned native data and license records.
+3. A separate protected signing job reads the committed exact manifest and uses
+   the exact official Vane standard-library-only signing utility. It installs no
+   dependencies and never builds or loads native code. It checks the bounded
+   regular unsigned artifact and public DER key fingerprint, removes the key
+   from the environment, and destroys its private temporary file after signing.
+   The only output is the signed native artifact.
+4. In a fresh job without secrets or OIDC, package those signed bytes without a
+   native rebuild. Verify against every exact indexed runtime and assemble the full
    provider wheel matrix. Preserve provenance, checksums, licenses, and SBOM
    evidence. Validate availability on both indexes without overwriting files.
-4. Upload the candidate wheels to TestPyPI. Verify the complete indexed filename
+5. Upload the candidate wheels to TestPyPI. Verify the complete indexed filename
    and SHA-256 set, then install from TestPyPI into fresh local and two-worker Ray
    test environments. Both tests compare the downloaded provider bytes with the
    expected build artifact; the exact production runtime comes only from PyPI.
-5. After both tests pass, wait for the `pypi` environment approval. Recheck the
-   complete candidate set with the shared `verify-promotion` gate and upload those
-   **same wheels** to PyPI. No rebuild, re-signing, or version rewrite occurs.
-6. Verify the complete PyPI filename and SHA-256 set against those local files.
+6. After both tests pass, wait for the `pypi` environment approval. Recheck the
+   complete candidate set with the shared `verify-promotion` gate in a read-only
+   job without OIDC permission. The separate minimal publisher uses the same
+   protected environment, so GitHub may require another approval. That job only
+   downloads the original immutable artifact and uploads those **same wheels**
+   using pinned actions; it does not check out code or install validation tools.
+   No rebuild, re-signing, or version rewrite occurs.
+7. A separate read-only job verifies the complete PyPI filename and SHA-256 set
+   against those original files.
 
-Every artifact download fails on a digest mismatch. `skip-existing` is used only
+Both publishing operations use this prepare/sign/package isolation; CI-only
+builds retain the `full` phase with the repository's public test-key fixture and
+locally built runtime. Published builder phases reject key arguments and local
+runtime packaging. There is no combined build-and-sign publishing path.
+
+Every release stage downloads the original producer's immutable artifact ID, not
+a mutable name or a verifier-selected replacement. Every artifact download fails
+on a digest mismatch. `skip-existing` is used only
 for retries: the shared gate must first prove that any existing index files are
 byte-identical. Retry failed jobs in the same run to preserve the original
 candidate artifacts; do not rebuild a partially published version. An expired

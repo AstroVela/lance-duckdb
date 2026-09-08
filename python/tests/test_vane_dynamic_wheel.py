@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import shlex
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -99,13 +99,8 @@ def test_provider_builder_reads_the_selected_manifest_vcpkg_pin(tmp_path) -> Non
 def test_production_signing_requires_exact_indexed_public_runtime_wheels(
     version,
 ) -> None:
-    builder._require_signing_policy(
-        "production",
-        consume=True,
-        package_local_runtime=False,
-        runtime_wheels=[
-            Path(f"vane_ai-{version}-cp312-cp312-manylinux_2_28_x86_64.whl")
-        ],
+    builder._require_production_runtime_wheels(
+        [Path(f"vane_ai-{version}-cp312-cp312-manylinux_2_28_x86_64.whl")],
     )
 
 
@@ -121,20 +116,75 @@ def test_production_signing_rejects_unreleased_or_noncanonical_runtime_versions(
         )
 
 
+def _phase_arguments(phase: str, profile: str, **overrides) -> SimpleNamespace:
+    arguments = {
+        "phase": phase,
+        "signing_profile": profile,
+        "package_local_runtime": phase == "full",
+        "signing_private_key": Path("ci-fixture.pem") if phase == "full" else None,
+        "runtime_python": [Path(sys.executable)] if phase == "package" else [],
+        "runtime_wheel": (
+            [Path("vane_ai-0.2.0-cp312-cp312-manylinux_2_28_x86_64.whl")]
+            if phase == "package"
+            else []
+        ),
+        "bundle_directory": Path("prepared") if phase == "package" else None,
+        "signed_artifact": (
+            Path("signed/lance.duckdb_extension") if phase == "package" else None
+        ),
+        "vane_vcpkg_installed": None if phase == "package" else Path("vcpkg-installed"),
+        "vcpkg_toolchain": None if phase == "package" else Path("vcpkg.cmake"),
+        "cargo_about": None if phase == "package" else Path("cargo-about"),
+    }
+    arguments.update(overrides)
+    return SimpleNamespace(**arguments)
+
+
 @pytest.mark.parametrize(
-    "consume,package_local_runtime",
-    [(False, False), (True, True)],
+    "phase,profile",
+    [
+        ("full", "ci-test"),
+        ("prepare", "production"),
+        ("prepare", "testpypi"),
+        ("package", "production"),
+        ("package", "testpypi"),
+    ],
 )
-def test_production_signing_cannot_keep_keys_or_package_a_local_runtime(
-    consume, package_local_runtime
+def test_builder_phases_are_explicit_and_valid(phase, profile) -> None:
+    builder._validate_phase(_phase_arguments(phase, profile))
+
+
+@pytest.mark.parametrize("phase", ["prepare", "package"])
+@pytest.mark.parametrize("profile", ["production", "testpypi"])
+@pytest.mark.parametrize(
+    "override",
+    [{"signing_private_key": Path("private.pem")}, {"package_local_runtime": True}],
+)
+def test_publishing_phases_cannot_take_keys_or_local_runtimes(
+    phase, profile, override
 ) -> None:
+    with pytest.raises(builder.QualificationError, match="cannot access signing keys"):
+        builder._validate_phase(_phase_arguments(phase, profile, **override))
+
+
+@pytest.mark.parametrize("profile", ["production", "testpypi"])
+def test_full_build_cannot_sign_a_publishing_profile(profile) -> None:
+    with pytest.raises(builder.QualificationError, match="only for CI"):
+        builder._validate_phase(_phase_arguments("full", profile))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"runtime_python": []},
+        {"bundle_directory": None},
+        {"signed_artifact": None},
+        {"cargo_about": Path("cargo-about")},
+    ],
+)
+def test_package_rejects_incomplete_inputs_and_native_tools(override) -> None:
     with pytest.raises(builder.QualificationError):
-        builder._require_signing_policy(
-            "production",
-            consume=consume,
-            package_local_runtime=package_local_runtime,
-            runtime_wheels=[],
-        )
+        builder._validate_phase(_phase_arguments("package", "production", **override))
 
 
 def test_production_runtime_wheels_cannot_mix_versions() -> None:
@@ -147,30 +197,116 @@ def test_production_runtime_wheels_cannot_mix_versions() -> None:
         )
 
 
-def test_production_key_fingerprint_is_checked_without_logging_key_material(
-    monkeypatch, capsys
+def test_package_main_returns_before_native_tools_or_key_access(
+    tmp_path, monkeypatch
 ) -> None:
-    assert builder.PRODUCTION_PUBLIC_KEY_SHA256 == (
-        "8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb"
+    arguments = _phase_arguments(
+        "package",
+        "production",
+        jobs=1,
+        extension_root=tmp_path,
+        vane_source=tmp_path,
+        vane_revision="a" * 40,
+        build_directory=tmp_path / "build",
+        output_directory=tmp_path / "dist",
     )
-    private = bytearray(b"synthetic private key, not a real signing key")
-    public = b"synthetic public DER"
-    result = subprocess.CompletedProcess([], 0, public, b"")
-    run = Mock(return_value=result)
-    monkeypatch.setattr(builder.subprocess, "run", run)
-    with pytest.raises(builder.QualificationError, match="trust root"):
-        builder._require_production_signing_key(private)
+    monkeypatch.setattr(builder, "_parse_arguments", lambda: arguments)
+    monkeypatch.setattr(builder, "_require_git_revision", Mock())
+    package = Mock(return_value=0)
+    monkeypatch.setattr(builder, "_package_signed", package)
+    native = Mock(side_effect=AssertionError("native build must not run"))
+    key = Mock(side_effect=AssertionError("private key must not be read"))
+    monkeypatch.setattr(builder, "_require_vcpkg_toolchain", native)
+    monkeypatch.setattr(builder, "_read_signing_private_key", key)
+    assert builder.main() == 0
+    package.assert_called_once_with(
+        arguments, tmp_path, tmp_path / "build", tmp_path / "dist"
+    )
+    native.assert_not_called()
+    key.assert_not_called()
+
+
+def test_prepare_emits_only_unsigned_native_data_and_licenses(
+    tmp_path, monkeypatch
+) -> None:
+    build = tmp_path / "build"
+    unsigned = build / "duckdb/extension/lance/lance.duckdb_extension"
+    unsigned.parent.mkdir(parents=True)
+    unsigned.write_bytes(b"unsigned native data" * 32 + b"\0" * 256)
+    license_file = tmp_path / "license.txt"
+    license_file.write_text("data only\n")
+    cargo_about = tmp_path / "cargo-about"
+    cargo_about.touch(mode=0o700)
+    arguments = _phase_arguments(
+        "prepare",
+        "production",
+        jobs=1,
+        extension_root=tmp_path,
+        vane_source=tmp_path,
+        vane_revision="a" * 40,
+        manifest=tmp_path / "manifest.toml",
+        vane_vcpkg_installed=tmp_path,
+        cargo_about=cargo_about,
+        build_directory=build,
+        output_directory=tmp_path / "bundle",
+    )
+    monkeypatch.setattr(builder, "_parse_arguments", lambda: arguments)
+    for name in (
+        "_require_git_revision",
+        "_require_self_contained_artifact",
+        "_require_base_wheel_free_of_lance",
+        "_run",
+    ):
+        monkeypatch.setattr(builder, name, Mock())
+    monkeypatch.setattr(builder, "_vcpkg_revision", lambda path: "b" * 40)
     monkeypatch.setattr(
-        builder, "PRODUCTION_PUBLIC_KEY_SHA256", hashlib.sha256(public).hexdigest()
+        builder, "_require_vcpkg_toolchain", lambda path, revision: path
     )
-    builder._require_production_signing_key(private)
-    assert run.call_args.kwargs["input"] is private
-    assert "synthetic" not in capsys.readouterr().out
-    result.returncode = 1
-    result.stderr = bytes(private)
-    with pytest.raises(builder.QualificationError, match="trust root"):
-        builder._require_production_signing_key(private)
-    assert "synthetic" not in capsys.readouterr().err
+    monkeypatch.setattr(builder, "_platform_tag", lambda: builder.PROVIDER_PLATFORM_TAG)
+    monkeypatch.setattr(builder, "_build_environment", Mock(return_value={}))
+    monkeypatch.setattr(builder, "_one_wheel", Mock(return_value=tmp_path / "base.whl"))
+    monkeypatch.setattr(
+        builder, "_stage_license_files", Mock(return_value=(license_file,))
+    )
+    key = Mock(side_effect=AssertionError("prepare cannot read a signing key"))
+    package = Mock(side_effect=AssertionError("prepare cannot package wheels"))
+    monkeypatch.setattr(builder, "_read_signing_private_key", key)
+    monkeypatch.setattr(builder, "_build_provider_matrix", package)
+    assert builder.main() == 0
+    assert {
+        str(path.relative_to(arguments.output_directory))
+        for path in arguments.output_directory.rglob("*")
+        if path.is_file()
+    } == {"artifacts/lance.duckdb_extension", "licenses/lance/license.txt"}
+    assert (
+        arguments.output_directory / "artifacts/lance.duckdb_extension"
+    ).read_bytes() == unsigned.read_bytes()
+    key.assert_not_called()
+    package.assert_not_called()
+
+
+def test_prepared_licenses_are_exact_bounded_regular_data(tmp_path) -> None:
+    directory = tmp_path / "licenses/lance"
+    directory.mkdir(parents=True)
+    names = (
+        "Lance-DuckDB-Apache-2.0.txt",
+        "Vane-runtime-licenses.txt",
+        "Rust-third-party-licenses.txt",
+        "Rust-standard-library-licenses.html",
+    )
+    for name in names:
+        (directory / name).write_text("license data\n")
+    assert tuple(path.name for path in builder._prepared_licenses(tmp_path)) == names
+    unexpected = directory / "executable.py"
+    unexpected.touch()
+    with pytest.raises(builder.QualificationError, match="exact expected files"):
+        builder._prepared_licenses(tmp_path)
+    unexpected.unlink()
+    path = directory / names[0]
+    path.unlink()
+    path.symlink_to(directory / names[1])
+    with pytest.raises(builder.QualificationError, match="bounded regular data"):
+        builder._prepared_licenses(tmp_path)
 
 
 @pytest.mark.parametrize("profile", ["production", "ci-test", "testpypi"])

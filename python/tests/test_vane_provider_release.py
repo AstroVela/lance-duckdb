@@ -229,7 +229,11 @@ def test_workflow_uses_only_the_committed_tools_submodule() -> None:
             if step.get("with", {}).get("submodules") == "recursive":
                 initialized = True
             command = step.get("run", "")
-            if "git submodule update --init vane-extension-ci-tools" in command:
+            if (
+                "git submodule update --init vane-extension-ci-tools" in command
+                or "git -C extension submodule update --init vane-extension-ci-tools"
+                in command
+            ):
                 initialized = True
             if (
                 "vane-extension-ci-tools/scripts/" not in command
@@ -244,11 +248,13 @@ def test_workflow_uses_only_the_committed_tools_submodule() -> None:
         "vane-native-build",
         "vane-wheel-build",
         "vane-dynamic-provider-build",
+        "vane-provider-prepare",
         "vane-testpypi-wheels",
         "provider-release-preflight",
         "assemble-testpypi-lance",
         "verify-testpypi-lance",
-        "publish-pypi-lance",
+        "verify-pypi-promotion",
+        "verify-pypi-lance",
     }
 
 
@@ -290,7 +296,8 @@ def test_release_workflow_supplies_exact_sources_and_shared_config() -> None:
         "vane-testpypi-wheels",
         "assemble-testpypi-lance",
         "verify-testpypi-lance",
-        "publish-pypi-lance",
+        "verify-pypi-promotion",
+        "verify-pypi-lance",
     }
     assert "--provider lance" in commands["verify-testpypi-lance"]
     for job in ("vane-testpypi-wheels", "assemble-testpypi-lance"):
@@ -362,36 +369,162 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
     assert "inputs.operation != 'release'" in jobs["preflight"]["if"]
     preflight = jobs["provider-release-preflight"]
     assert "environment" not in preflight
-    assert "secrets." not in str(preflight)
-    assert jobs["vane-testpypi-wheels"]["needs"] == "provider-release-preflight"
-    assert "production-signing" in jobs["vane-testpypi-wheels"]["environment"]["name"]
-    publish = jobs["publish-pypi-lance"]
-    assert publish["if"] == "inputs.operation == 'release'"
-    assert set(publish["needs"]) == {
+    assert "secrets" not in str(preflight)
+    assert jobs["vane-provider-prepare"]["needs"] == "provider-release-preflight"
+    assert jobs["vane-provider-sign"]["needs"] == "vane-provider-prepare"
+    assert set(jobs["vane-testpypi-wheels"]["needs"]) == {
+        "provider-release-preflight",
+        "vane-provider-prepare",
+        "vane-provider-sign",
+    }
+    promotion = jobs["verify-pypi-promotion"]
+    assert promotion["if"] == "inputs.operation == 'release'"
+    assert set(promotion["needs"]) == {
         "assemble-testpypi-lance",
         "testpypi-local-lance-integration",
         "testpypi-ray-lance-integration",
     }
+    assert promotion["environment"]["name"] == "pypi"
+    assert promotion["permissions"] == {"contents": "read"}
+    assert any(
+        "verify-promotion" in step.get("run", "") and "--directory dist" in step["run"]
+        for step in promotion["steps"]
+    )
+    publish = jobs["publish-pypi-lance"]
+    assert publish["if"] == "inputs.operation == 'release'"
+    assert set(publish["needs"]) == {"assemble-testpypi-lance", "verify-pypi-promotion"}
     assert publish["environment"]["name"] == "pypi"
+    assert publish["permissions"] == {"contents": "read", "id-token": "write"}
     steps = publish["steps"]
-    promotion = next(
-        i for i, step in enumerate(steps) if "verify-promotion" in step.get("run", "")
+    assert len(steps) == 2
+    assert (
+        steps[0]["uses"]
+        == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
     )
-    upload = next(
-        i
-        for i, step in enumerate(steps)
-        if "gh-action-pypi-publish" in step.get("uses", "")
+    assert (
+        steps[1]["uses"]
+        == "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
     )
-    indexed = next(
-        i for i, step in enumerate(steps) if "--index pypi" in step.get("run", "")
+    assert all("run" not in step for step in steps)
+    assert steps[1]["with"]["packages-dir"] == "dist"
+    assert steps[1]["with"]["repository-url"] == "https://upload.pypi.org/legacy/"
+    indexed = jobs["verify-pypi-lance"]
+    assert set(indexed["needs"]) == {"assemble-testpypi-lance", "publish-pypi-lance"}
+    assert indexed["permissions"] == {"contents": "read"}
+    assert "environment" not in indexed
+    assert any("--index pypi" in step.get("run", "") for step in indexed["steps"])
+
+
+def test_publishing_native_jobs_isolate_keys_from_build_and_package_code() -> None:
+    jobs = yaml.safe_load((ROOT / ".github/workflows/VaneExtension.yml").read_text())[
+        "jobs"
+    ]
+    for name, phase in (
+        ("vane-provider-prepare", "prepare"),
+        ("vane-testpypi-wheels", "package"),
+    ):
+        job = jobs[name]
+        assert "environment" not in job
+        assert job["permissions"] == {"contents": "read"}
+        assert "secrets[" not in str(job) and "secrets." not in str(job)
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        assert f"--phase {phase}" in commands
+        assert "--signing-private-key" not in commands
+        assert "--package-local-runtime" not in commands
+        if phase == "package":
+            for forbidden in (
+                "cargo-about",
+                "cmake --build",
+                "--vcpkg-toolchain",
+                "vane_wheel_dependencies",
+                "rust-toolchain",
+            ):
+                assert forbidden not in str(job)
+    sign = jobs["vane-provider-sign"]
+    assert sign["permissions"] == {"contents": "read"}
+    assert (
+        sign["environment"]
+        == "${{ inputs.operation == 'release' && 'production-signing' || 'testpypi' }}"
     )
-    assert promotion < upload < indexed
-    assert "--directory dist" in steps[promotion]["run"]
-    assert steps[upload]["with"]["packages-dir"] == "dist"
-    assert steps[upload]["with"]["repository-url"] == "https://upload.pypi.org/legacy/"
-    assert not any(
-        "build_vane_dynamic_wheel.py" in step.get("run", "") for step in steps
+    for step in sign["steps"]:
+        if "run" in step:
+            assert (
+                "/usr/bin/python3 -I -S extension/scripts/sign_vane_dynamic_bundle.py"
+                in step["run"]
+            )
+        else:
+            assert step["uses"] in {
+                "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+                "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            }
+    source = next(
+        step for step in sign["steps"] if step.get("with", {}).get("path") == "vane"
     )
+    assert source["with"]["repository"] == "AstroVela/vane"
+    assert source["with"]["ref"] == "${{ steps.manifest.outputs.vane_revision }}"
+    assert "needs." not in source["with"]["ref"]
+    assert "pip install" not in str(sign)
+    assert "setup-python" not in str(sign)
+    key_steps = [step for step in sign["steps"] if "secrets[" in str(step)]
+    assert len(key_steps) == 1
+    assert (
+        key_steps[0]["env"]["VANE_PROVIDER_SIGNING_PRIVATE_KEY"]
+        == "${{ secrets[inputs.operation == 'release' && 'VANE_EXTENSION_SIGNING_PRIVATE_KEY' || 'VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY'] }}"
+    )
+    uploads = [
+        step
+        for step in sign["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1
+    assert uploads[0]["with"]["path"] == "signed/lance.duckdb_extension"
+
+
+def test_every_release_stage_downloads_the_original_immutable_artifact_ids() -> None:
+    jobs = yaml.safe_load((ROOT / ".github/workflows/VaneExtension.yml").read_text())[
+        "jobs"
+    ]
+    producers = {
+        "vane-provider-prepare": "bundle",
+        "vane-provider-sign": "signed",
+        "vane-testpypi-wheels": "candidate",
+        "assemble-testpypi-lance": "distributions",
+    }
+    for job, step in producers.items():
+        assert (
+            jobs[job]["outputs"]["artifact_id"]
+            == "${{ steps." + step + ".outputs.artifact-id }}"
+        )
+    transfers = {
+        "vane-provider-sign": {"vane-provider-prepare"},
+        "vane-testpypi-wheels": {"vane-provider-prepare", "vane-provider-sign"},
+        "assemble-testpypi-lance": {"vane-testpypi-wheels"},
+        **{
+            name: {"assemble-testpypi-lance"}
+            for name in (
+                "publish-testpypi-lance",
+                "verify-testpypi-lance",
+                "testpypi-local-lance-integration",
+                "testpypi-ray-lance-integration",
+                "verify-pypi-promotion",
+                "publish-pypi-lance",
+                "verify-pypi-lance",
+            )
+        },
+    }
+    for consumer, sources in transfers.items():
+        downloads = [
+            step["with"]
+            for step in jobs[consumer]["steps"]
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        assert {step["artifact-ids"] for step in downloads} == {
+            "${{ needs." + source + ".outputs.artifact_id }}" for source in sources
+        }
+        assert all(
+            step["merge-multiple"] is True and "name" not in step for step in downloads
+        )
 
 
 @pytest.mark.parametrize("runner", ["local", "ray"])
