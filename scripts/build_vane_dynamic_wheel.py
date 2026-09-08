@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import platform
 import re
@@ -22,6 +23,7 @@ from pathlib import Path
 
 import tomllib
 from packaging.tags import sys_tags
+from packaging.utils import parse_wheel_filename
 
 EXTENSION_NAME = "lance"
 PROVIDER_PLATFORM_TAG = "manylinux_2_28_x86_64"
@@ -32,7 +34,11 @@ SIGNING_PROFILES = {
         "astrovela/vane-testpypi",
         "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY",
     ),
+    "production": ("astrovela/vane", None),
 }
+PRODUCTION_PUBLIC_KEY_SHA256 = (
+    "8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb"
+)
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND "
     "BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND CC0-1.0 AND "
@@ -132,6 +138,65 @@ def _read_signing_private_key(path: Path, *, consume: bool) -> bytearray:
     return contents
 
 
+def _require_production_signing_key(contents: bytearray) -> None:
+    # OpenSSL returns only public DER. Never log key bytes or OpenSSL's
+    # diagnostics, which may contain private-key input on malformed input.
+    result = subprocess.run(
+        ("openssl", "pkey", "-pubout", "-outform", "DER", "-passin", "pass:"),
+        input=contents,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    if (
+        result.returncode != 0
+        or hashlib.sha256(result.stdout).hexdigest() != PRODUCTION_PUBLIC_KEY_SHA256
+    ):
+        raise QualificationError(
+            "production signing key does not match the astrovela/vane trust root"
+        )
+
+
+def _require_production_runtime_wheels(wheels: Sequence[Path]) -> None:
+    versions = set()
+    for wheel in wheels:
+        distribution, version, _, _ = parse_wheel_filename(wheel.name)
+        if (
+            distribution != "vane-ai"
+            or wheel.name.split("-")[1] != str(version)
+            or version.is_devrelease
+            or version.local is not None
+            or version.epoch != 0
+            or len(version.release) != 3
+        ):
+            raise QualificationError(
+                "production signing requires one exact non-dev Vane runtime release"
+            )
+        versions.add(version)
+    if len(versions) != 1:
+        raise QualificationError("production runtime wheels must use one exact version")
+
+
+def _require_signing_policy(
+    profile: str,
+    *,
+    consume: bool,
+    package_local_runtime: bool,
+    runtime_wheels: Sequence[Path],
+) -> None:
+    if profile in {"testpypi", "production"} and not consume:
+        raise QualificationError(
+            "published signing profiles require --consume-signing-private-key"
+        )
+    if profile == "production":
+        if package_local_runtime:
+            raise QualificationError(
+                "production signing cannot package a locally built runtime"
+            )
+        _require_production_runtime_wheels(runtime_wheels)
+
+
 def _require_git_revision(source: Path, expected: str, description: str) -> None:
     if _REVISION_RE.fullmatch(expected) is None:
         raise QualificationError(
@@ -170,23 +235,23 @@ def _platform_tag() -> str:
     return PROVIDER_PLATFORM_TAG
 
 
-def _vcpkg_revision(extension_root: Path) -> str:
+def _vcpkg_revision(manifest_path: Path) -> str:
     manifest = tomllib.loads(
-        _require_file(
-            extension_root / "vane-extension.toml", "Vane extension manifest"
-        ).read_text(encoding="utf-8")
+        _require_file(manifest_path, "Vane extension manifest").read_text(
+            encoding="utf-8"
+        )
     )
     vcpkg = manifest.get("vcpkg")
     if manifest.get("schema_version") != 2 or not isinstance(vcpkg, dict):
         raise QualificationError(
-            "vane-extension.toml must use schema 2 with an explicit [vcpkg] table"
+            "Vane extension manifest must use schema 2 with an explicit [vcpkg] table"
         )
     if vcpkg.get("repository") != "microsoft/vcpkg":
         raise QualificationError("vcpkg.repository must be microsoft/vcpkg")
     revision = vcpkg.get("revision")
     if not isinstance(revision, str) or _REVISION_RE.fullmatch(revision) is None:
         raise QualificationError(
-            "vane-extension.toml must contain one complete vcpkg.revision"
+            "Vane extension manifest must contain one complete vcpkg.revision"
         )
     return revision
 
@@ -248,7 +313,7 @@ def _build_environment(
     vane_vcpkg_installed: Path,
     vcpkg_toolchain: Path,
     jobs: int,
-    signing_cmake_option: str,
+    signing_cmake_option: str | None,
 ) -> dict[str, str]:
     target_triplet = "x64-linux"
     dependency_prefix = vane_vcpkg_installed / target_triplet
@@ -271,7 +336,9 @@ def _build_environment(
         "-DEXTENSION_STATIC_BUILD=ON",
         "-DLANCE_VANE_DISTRIBUTED=ON",
         "-DLANCE_VANE_DYNAMIC_PROVIDER=ON",
-        f"-D{signing_cmake_option}=ON",
+        "-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=OFF",
+        "-DVANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY=OFF",
+        *([f"-D{signing_cmake_option}=ON"] if signing_cmake_option else []),
         f"-DDUCKDB_EXTENSION_CONFIGS={extension_config}",
         "-DVCPKG_BUILD=ON",
         f"-DCMAKE_TOOLCHAIN_FILE={vcpkg_toolchain}",
@@ -541,6 +608,7 @@ def _build_provider_wheel(
 def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--extension-root", required=True, type=Path)
+    parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--vane-source", required=True, type=Path)
     parser.add_argument("--vane-revision", required=True)
     parser.add_argument("--vane-vcpkg-installed", required=True, type=Path)
@@ -577,6 +645,12 @@ def main() -> int:
         )
     if not arguments.package_local_runtime and not arguments.runtime_python:
         raise QualificationError("at least one indexed runtime pair is required")
+    _require_signing_policy(
+        arguments.signing_profile,
+        consume=arguments.consume_signing_private_key,
+        package_local_runtime=arguments.package_local_runtime,
+        runtime_wheels=arguments.runtime_wheel,
+    )
 
     extension_root = _require_directory(arguments.extension_root, "extension root")
     vane_source = _require_directory(arguments.vane_source, "Vane source")
@@ -587,13 +661,6 @@ def main() -> int:
     if not os.access(cargo_about, os.X_OK):
         raise QualificationError(f"cargo-about is not executable: {cargo_about}")
     trust_identity, signing_cmake_option = SIGNING_PROFILES[arguments.signing_profile]
-    if (
-        arguments.signing_profile == "testpypi"
-        and not arguments.consume_signing_private_key
-    ):
-        raise QualificationError(
-            "the TestPyPI signing profile requires --consume-signing-private-key"
-        )
     indexed_runtimes = tuple(
         (
             _require_file(interpreter, "runtime Python interpreter"),
@@ -607,7 +674,7 @@ def main() -> int:
         raise QualificationError("one runtime Python interpreter is not executable")
 
     vcpkg_toolchain = _require_vcpkg_toolchain(
-        arguments.vcpkg_toolchain, _vcpkg_revision(extension_root)
+        arguments.vcpkg_toolchain, _vcpkg_revision(arguments.manifest)
     )
     build_directory = arguments.build_directory.expanduser().resolve()
     output_directory = arguments.output_directory.expanduser().resolve()
@@ -632,6 +699,8 @@ def main() -> int:
     )
 
     try:
+        if arguments.signing_profile == "production":
+            _require_production_signing_key(signing_private_key_contents)
         with tempfile.TemporaryDirectory(
             prefix="vane-base-wheel-", dir=build_directory.parent
         ) as base_output_value:

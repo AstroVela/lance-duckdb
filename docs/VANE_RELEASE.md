@@ -31,25 +31,103 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-provider-dist \
-  --vane-version 0.2.0.dev612 --require-testpypi-publishable
+  --vane-version 0.2.0.dev612 --channel testpypi-dev \
+  --require-publishable-on testpypi
 ```
 
 The Vane checkout must already exist at the exact manifest revision. The shared
 gate verifies the official Vane and tools revisions and rejects dirty or
 mismatched checkouts before inspecting the wheel set. Assembly and post-upload
 verification use shallow checkouts of the same Vane revision without building
-native code. `verify-index --provider lance` then requires the exact indexed
-wheel filenames and SHA-256 digests. Generic release edge cases are tested in
+native code. `verify-index --index testpypi --provider lance` then requires the
+exact indexed wheel filenames and SHA-256 digests. Generic release edge cases are tested in
 the shared repository; Lance keeps real-config, CLI/output, and workflow checks.
 
 The existing Rust/C++ build adapter, pinned Cargo/Bison/license tooling,
 artifact security verification, signing identities, and local/two-worker Ray
-tests remain in this repository. The final upload still runs in the top-level
-`VaneExtension.yml` with the existing `testpypi` environment and Trusted
-Publisher; no publisher or signing-key reconfiguration is needed.
+tests remain in this repository. Uploads run in the top-level `VaneExtension.yml`
+so that each index can identify its GitHub Trusted Publisher directly.
 
 Shared native tools require manifest schema 2 with an explicit `[vcpkg]` table.
 Both native and provider builders retain the existing integration manifest's
 exact vcpkg revision; `vcpkg.json` does not select a separate baseline. This
-migration does not change Vane's source revision, native dependency versions,
+migration does not change the development Vane source revision, native dependency versions,
 package versioning, or runtime behavior.
+
+## Development and production channels
+
+`VaneExtension.yml` keeps `build-only` as its default operation. Pushes, pull
+requests, and build-only dispatches cannot reach provider publishing or private
+signing keys. They continue to build against `vane-extension.toml`, which remains
+byte-for-byte pinned to the existing `vane-ai==0.2.0.dev612` runtime.
+
+Both publishing operations require a manual dispatch on the protected
+`AstroVela/lance-duckdb` `main_vane` branch. No provider tag is required or created:
+the workflow uses the reviewed dispatch commit, its exact tools gitlink, and its
+committed exact Vane revision.
+
+| Operation | Runtime manifest and index | Native signature |
+| --- | --- | --- |
+| `testpypi-dev` | `vane-extension.toml`, TestPyPI only | `astrovela/vane-testpypi` |
+| `release` | `vane-extension-release.toml`, PyPI only | `astrovela/vane` |
+
+The production manifest currently selects preparation commit
+`033b549afcb498633fd6669b26c054c00363004e`. **This is not a published Vane release.**
+Production dispatch deliberately fails its secret-free preflight until a reviewed
+PR changes that manifest to a canonical non-development Vane release with the
+complete CPython 3.10–3.14 runtime matrix on PyPI. The selected source must include
+the production-key commit. Development versions, local versions, missing or
+yanked runtime wheels, and a different source/tool identity fail closed. There is
+no fallback runtime, index, or signing key.
+
+## One build, two indexes
+
+The release channel reuses the existing candidate jobs:
+
+1. Validate the dispatch, exact sources, canonical runtime version, production-key
+   ancestry, and the complete published runtime matrix before native builds or
+   signing-key access.
+2. Build the native artifact once and sign it once with the production key. Both
+   testing-key CMake switches are explicitly disabled. The builder requires an
+   owned temporary private-key file, consumes it, verifies the public DER
+   fingerprint, and rejects a locally packaged production runtime.
+3. Verify the artifact against every exact indexed runtime and assemble the full
+   provider wheel matrix. Preserve provenance, checksums, licenses, and SBOM
+   evidence. Validate availability on both indexes without overwriting files.
+4. Upload the candidate wheels to TestPyPI. Verify the complete indexed filename
+   and SHA-256 set, then install from TestPyPI into fresh local and two-worker Ray
+   test environments. Both tests compare the downloaded provider bytes with the
+   expected build artifact; the exact production runtime comes only from PyPI.
+5. After both tests pass, wait for the `pypi` environment approval. Recheck the
+   complete candidate set with the shared `verify-promotion` gate and upload those
+   **same wheels** to PyPI. No rebuild, re-signing, or version rewrite occurs.
+6. Verify the complete PyPI filename and SHA-256 set against those local files.
+
+Every artifact download fails on a digest mismatch. `skip-existing` is used only
+for retries: the shared gate must first prove that any existing index files are
+byte-identical. Retry failed jobs in the same run to preserve the original
+candidate artifacts; do not rebuild a partially published version. An expired
+artifact or conflicting indexed file requires a new candidate, not an overwrite.
+
+## Required production configuration
+
+This preparation change does not configure GitHub environments or Trusted
+Publishers, upload private keys, create tags, or publish packages.
+
+- Keep the existing `testpypi` environment, TestPyPI Trusted Publisher, and
+  `VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY` for development candidates.
+- Configure a protected `production-signing` environment, restricted to
+  `main_vane`, with required reviewer approval. Store the production private key
+  there as `VANE_EXTENSION_SIGNING_PRIVATE_KEY`; never commit or attach it to a PR.
+- Configure a protected `pypi` environment with required reviewer approval and
+  `main_vane` as its allowed deployment branch. Prevent self-review and bypass
+  where supported, so publication approval remains a separate release decision.
+- Register the PyPI Trusted Publisher for project `vane-extension-lance`: owner
+  `AstroVela`, repository `lance-duckdb`, workflow `VaneExtension.yml`, environment
+  `pypi`. The existing TestPyPI publisher remains the staging publisher.
+
+The production native trust identity is `astrovela/vane`. Its public
+SubjectPublicKeyInfo DER SHA-256 fingerprint is
+`8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
+This native-signature key is distinct from the TestPyPI key and from the GitHub
+OIDC identity used for package-index uploads and provenance attestations.

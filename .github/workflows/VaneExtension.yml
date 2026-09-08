@@ -12,24 +12,25 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Run CI only or publish the pinned Lance provider candidate to TestPyPI
+        description: Run CI, publish a dev candidate, or stage and promote a production provider
         type: choice
         options:
           - build-only
           - testpypi-dev
+          - release
         default: build-only
         required: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ inputs.operation || 'ci' }}
-  cancel-in-progress: ${{ inputs.operation != 'testpypi-dev' }}
+  cancel-in-progress: ${{ inputs.operation != 'testpypi-dev' && inputs.operation != 'release' }}
 
 permissions:
   contents: read
 
 jobs:
   preflight:
-    if: inputs.operation != 'testpypi-dev'
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     name: CI contract preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -157,13 +158,13 @@ jobs:
           python -m pip install "black==24.10.0"
           python -m black --check \
             python/tests \
-            scripts/build_vane_dynamic_wheel.py
+            scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py
           python -m compileall -q \
             python/tests \
-            scripts/build_vane_dynamic_wheel.py
+            scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py
 
   vane-provider-release-tooling:
-    if: inputs.operation != 'testpypi-dev'
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     name: Validate Lance provider release tooling
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -596,8 +597,9 @@ jobs:
           persist-credentials: false
 
       - name: Download the verified static wheel
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-lance-wheel
           path: ${{ runner.temp }}/vane-lance-wheel
 
@@ -654,8 +656,9 @@ jobs:
           persist-credentials: false
 
       - name: Download the verified static wheel
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-lance-wheel
           path: ${{ runner.temp }}/vane-lance-wheel
 
@@ -757,8 +760,9 @@ jobs:
           persist-credentials: false
 
       - name: Download the verified static wheel
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-lance-wheel
           path: ${{ runner.temp }}/vane-lance-wheel
 
@@ -1014,6 +1018,7 @@ jobs:
         run: |
           python -I extension/scripts/build_vane_dynamic_wheel.py \
             --extension-root "$VANE_EXTENSION_ROOT" \
+            --manifest "$VANE_MANIFEST" \
             --vane-source "$VANE_SOURCE_DIR" \
             --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
             --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
@@ -1063,8 +1068,9 @@ jobs:
           persist-credentials: false
 
       - name: Download dynamic wheels
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-lance-dynamic-wheels
           path: wheels
 
@@ -1107,8 +1113,9 @@ jobs:
           persist-credentials: false
 
       - name: Download dynamic wheels
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-lance-dynamic-wheels
           path: wheels
 
@@ -1130,14 +1137,78 @@ jobs:
           python -m pytest -q \
             python/tests/test_vane_distributed_scan.py::test_fragment_scan_uses_both_ray_execution_nodes
 
+  provider-release-preflight:
+    if: inputs.operation == 'testpypi-dev' || inputs.operation == 'release'
+    name: Verify the protected provider release inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      vane_version: ${{ steps.release.outputs.vane_version }}
+    env:
+      VANE_MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+    steps:
+      - name: Require the protected official release branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = AstroVela/lance-duckdb
+          test "$GITHUB_REF" = refs/heads/main_vane
+          test "$GITHUB_REF_PROTECTED" = true
+
+      - name: Checkout release inputs
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize pinned Vane CI tools
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release preflight tooling
+        run: python -m pip install -r vane-extension-ci-tools/requirements-release.txt "setuptools-scm>=9.2.0"
+
+      - name: Read the selected exact integration manifest
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source including version history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reject invalid release inputs before native builds or key access
+        id: release
+        env:
+          RELEASE_CHANNEL: ${{ inputs.operation }}
+        run: |
+          python -I scripts/vane_release_preflight.py \
+            --channel "$RELEASE_CHANNEL" \
+            --manifest "$VANE_MANIFEST" --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --github-output "$GITHUB_OUTPUT"
+
   vane-testpypi-wheels:
-    if: inputs.operation == 'testpypi-dev'
-    name: Build signed TestPyPI Lance provider wheels
+    name: Build signed Lance provider candidate wheels
+    needs: provider-release-preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     environment:
-      name: testpypi
-      url: https://test.pypi.org/p/vane-extension-lance
+      name: ${{ inputs.operation == 'release' && 'production-signing' || 'testpypi' }}
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
     permissions:
@@ -1157,7 +1228,7 @@ jobs:
       VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-testpypi-provider-dist
       VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
       VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_MANIFEST: ${{ github.workspace }}/extension/${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
       VANE_PYTHON: /opt/python/cp312-cp312/bin/python
       VANE_RUNTIME_WHEEL_DIR: ${{ github.workspace }}/build/vane-testpypi-runtime-wheels
       VANE_SOURCE_DIR: ${{ github.workspace }}/vane
@@ -1173,6 +1244,8 @@ jobs:
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_REF" = refs/heads/main_vane
+          test "$GITHUB_REPOSITORY" = AstroVela/lance-duckdb
+          test "$GITHUB_REF_PROTECTED" = true
 
       - name: Checkout extension and submodules
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -1313,19 +1386,13 @@ jobs:
         id: vane-candidate
         shell: bash
         env:
-          INDEX_URL: https://test.pypi.org/simple/
+          INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+          VANE_VERSION: ${{ needs.provider-release-preflight.outputs.vane_version }}
         run: |
           set -euo pipefail
-          version="$(cd "$VANE_SOURCE_DIR" && "$VANE_PYTHON" -m setuptools_scm)"
-          "$VANE_PYTHON" - "$version" <<'PY'
-          import sys
-          from packaging.version import Version
-
-          raw = sys.argv[1]
-          version = Version(raw)
-          if str(version) != raw or not version.is_devrelease or version.local is not None:
-              raise SystemExit(f"Vane source has no canonical public development version: {raw!r}")
-          PY
+          unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS
+          export PIP_CONFIG_FILE=/dev/null
+          version="$VANE_VERSION"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           mkdir -p "$VANE_RUNTIME_WHEEL_DIR"
           for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
@@ -1345,19 +1412,20 @@ jobs:
       - name: Build, sign, and verify the Lance provider wheel matrix
         shell: bash
         env:
-          VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY: ${{ secrets.VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY }}
+          VANE_PROVIDER_SIGNING_PRIVATE_KEY: ${{ secrets[inputs.operation == 'release' && 'VANE_EXTENSION_SIGNING_PRIVATE_KEY' || 'VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY'] }}
+          SIGNING_PROFILE: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
           VCPKG_TOOLCHAIN_PATH: ${{ env.VANE_EXTENSION_VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
         run: |
           set -euo pipefail
-          test -n "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY"
-          signing_key="$RUNNER_TEMP/vane-testpypi-extension-signing.pem"
+          test -n "$VANE_PROVIDER_SIGNING_PRIVATE_KEY"
+          signing_key="$RUNNER_TEMP/vane-provider-extension-signing.pem"
           cleanup() {
             shred --force --remove "$signing_key" 2>/dev/null || true
           }
           trap cleanup EXIT
           umask 077
-          printf '%s' "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY" > "$signing_key"
-          unset VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY
+          printf '%s' "$VANE_PROVIDER_SIGNING_PRIVATE_KEY" > "$signing_key"
+          unset VANE_PROVIDER_SIGNING_PRIVATE_KEY
 
           runtime_arguments=()
           for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
@@ -1372,6 +1440,7 @@ jobs:
 
           "$VANE_PYTHON" -I extension/scripts/build_vane_dynamic_wheel.py \
             --extension-root "$VANE_EXTENSION_ROOT" \
+            --manifest "$VANE_MANIFEST" \
             --vane-source "$VANE_SOURCE_DIR" \
             --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
             --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
@@ -1380,7 +1449,7 @@ jobs:
             --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
             --output-directory "$VANE_DYNAMIC_DIST_DIR" \
             --jobs "$VANE_BUILD_JOBS" \
-            --signing-profile testpypi \
+            --signing-profile "$SIGNING_PROFILE" \
             --signing-private-key "$signing_key" \
             --consume-signing-private-key \
             "${runtime_arguments[@]}"
@@ -1388,14 +1457,22 @@ jobs:
       - name: Validate the immutable publishable release set
         id: release
         shell: bash
+        env:
+          RELEASE_CHANNEL: ${{ inputs.operation }}
         run: |
+          set -euo pipefail
+          publish_arguments=(--require-publishable-on testpypi)
+          if [ "$RELEASE_CHANNEL" = release ]; then
+            publish_arguments+=(--require-publishable-on pypi)
+          fi
           "$VANE_PYTHON" -I extension/vane-extension-ci-tools/scripts/vane_provider_release.py validate \
             --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
             --vane-source "$VANE_SOURCE_DIR" --ci-tools-version "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)" \
             --config "$VANE_EXTENSION_ROOT/vane-provider-release.toml" \
             --directory "$VANE_DYNAMIC_DIST_DIR" \
             --vane-version "${{ steps.vane-candidate.outputs.version }}" \
-            --require-testpypi-publishable \
+            --channel "$RELEASE_CHANNEL" \
+            "${publish_arguments[@]}" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Report compiler cache
@@ -1426,6 +1503,8 @@ jobs:
     outputs:
       lance_version: ${{ needs.vane-testpypi-wheels.outputs.lance_version }}
       vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
+    env:
+      VANE_MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
 
     steps:
       - name: Checkout release tooling
@@ -1449,7 +1528,7 @@ jobs:
         id: manifest
         run: |
           python -I vane-extension-ci-tools/scripts/vane_extension.py \
-            --manifest vane-extension.toml --extension-root . \
+            --manifest "$VANE_MANIFEST" --extension-root . \
             manifest --github-output "$GITHUB_OUTPUT"
 
       - name: Checkout exact Vane source for release verification
@@ -1462,20 +1541,29 @@ jobs:
           persist-credentials: false
 
       - name: Download Lance provider wheels
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-testpypi-lance-wheels
           path: packages
 
       - name: Revalidate the complete release set
+        env:
+          RELEASE_CHANNEL: ${{ inputs.operation }}
         run: |
+          set -euo pipefail
+          publish_arguments=(--require-publishable-on testpypi)
+          if [ "$RELEASE_CHANNEL" = release ]; then
+            publish_arguments+=(--require-publishable-on pypi)
+          fi
           python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
-            --manifest vane-extension.toml --extension-root . \
+            --manifest "$VANE_MANIFEST" --extension-root . \
             --vane-source vane --ci-tools-version "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD:vane-extension-ci-tools)" \
             --config vane-provider-release.toml \
             --directory packages \
             --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
-            --require-testpypi-publishable
+            --channel "$RELEASE_CHANNEL" \
+            "${publish_arguments[@]}"
 
       - name: Assemble distributions and checksums
         run: |
@@ -1538,8 +1626,9 @@ jobs:
 
     steps:
       - name: Download Lance distributions
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-testpypi-lance-distributions
           path: dist
 
@@ -1557,6 +1646,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    env:
+      VANE_MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
 
     steps:
       - name: Checkout release tooling
@@ -1580,7 +1671,7 @@ jobs:
         id: manifest
         run: |
           python -I vane-extension-ci-tools/scripts/vane_extension.py \
-            --manifest vane-extension.toml --extension-root . \
+            --manifest "$VANE_MANIFEST" --extension-root . \
             manifest --github-output "$GITHUB_OUTPUT"
 
       - name: Checkout exact Vane source for release verification
@@ -1593,18 +1684,19 @@ jobs:
           persist-credentials: false
 
       - name: Download Lance distributions
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-testpypi-lance-distributions
           path: dist
 
       - name: Compare the immutable indexed release
         run: |
           python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
-            --manifest vane-extension.toml --extension-root . \
+            --manifest "$VANE_MANIFEST" --extension-root . \
             --vane-source vane --ci-tools-version "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD:vane-extension-ci-tools)" \
             --config vane-provider-release.toml --provider lance \
-            --directory dist \
+            --directory dist --index testpypi \
             --version "${{ needs.assemble-testpypi-lance.outputs.lance_version }}"
 
   testpypi-local-lance-integration:
@@ -1616,7 +1708,8 @@ jobs:
       contents: read
     env:
       INDEX_URL: https://test.pypi.org/simple/
-      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
+      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
       VANE_RUNNER: local-fast
 
     steps:
@@ -1627,8 +1720,9 @@ jobs:
           persist-credentials: false
 
       - name: Download expected Lance distributions
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-testpypi-lance-distributions
           path: expected/lance
 
@@ -1646,6 +1740,8 @@ jobs:
           set -euo pipefail
           python -m venv .venv-vane-testpypi-local
           . .venv-vane-testpypi-local/bin/activate
+          unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS
+          export PIP_CONFIG_FILE=/dev/null
           python -m pip install --upgrade pip
           mkdir -p indexed
           download_exact() {
@@ -1667,7 +1763,7 @@ jobs:
             done
             return 1
           }
-          download_exact "vane-ai==$VANE_VERSION"
+          INDEX_URL="$VANE_RUNTIME_INDEX_URL" download_exact "vane-ai==$VANE_VERSION"
           download_exact "vane-extension-lance==$LANCE_VERSION"
           mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
           mapfile -t lance_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_lance-*.whl' -print)
@@ -1693,8 +1789,9 @@ jobs:
       contents: read
     env:
       INDEX_URL: https://test.pypi.org/simple/
+      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       RAY_DEDUP_LOGS: "0"
-      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
       VANE_RUNNER: ray
 
     steps:
@@ -1703,6 +1800,13 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Download expected Lance distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vane-testpypi-lance-distributions
+          path: expected/lance
+          digest-mismatch: error
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -1718,6 +1822,8 @@ jobs:
           set -euo pipefail
           python -m venv .venv-vane-testpypi-ray
           . .venv-vane-testpypi-ray/bin/activate
+          unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS
+          export PIP_CONFIG_FILE=/dev/null
           python -m pip install --upgrade pip
           mkdir -p indexed
           download_exact() {
@@ -1739,12 +1845,15 @@ jobs:
             done
             return 1
           }
-          download_exact "vane-ai==$VANE_VERSION"
+          INDEX_URL="$VANE_RUNTIME_INDEX_URL" download_exact "vane-ai==$VANE_VERSION"
           download_exact "vane-extension-lance==$LANCE_VERSION"
           mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
           mapfile -t lance_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_lance-*.whl' -print)
+          mapfile -t expected_lance < <(find expected/lance -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
           test "${#base_wheels[@]}" -eq 1
           test "${#lance_wheels[@]}" -eq 1
+          test "${#expected_lance[@]}" -eq 1
+          cmp "${expected_lance[0]}" "${lance_wheels[0]}"
           python -m pip install \
             "${base_wheels[0]}" \
             "${lance_wheels[0]}" \
@@ -1756,3 +1865,85 @@ jobs:
         run: |
           .venv-vane-testpypi-ray/bin/python -m pytest -q \
             python/tests/test_vane_distributed_scan.py::test_fragment_scan_uses_both_ray_execution_nodes
+
+  publish-pypi-lance:
+    if: inputs.operation == 'release'
+    name: Approve and promote the qualified Lance provider to PyPI
+    needs:
+      - assemble-testpypi-lance
+      - testpypi-local-lance-integration
+      - testpypi-ray-lance-integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: pypi
+      url: https://pypi.org/p/vane-extension-lance
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize pinned Vane CI tools
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read the production integration manifest
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension-release.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for promotion verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download the complete immutable candidate set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vane-testpypi-lance-distributions
+          path: dist
+          digest-mismatch: error
+
+      - name: Recheck exact TestPyPI staging and PyPI publication identities
+        env:
+          VANE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.vane_version }}
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-promotion \
+            --manifest vane-extension-release.toml --extension-root . \
+            --vane-source vane --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --directory dist \
+            --vane-version "$VANE_VERSION"
+
+      - name: Publish the same wheels through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: true
+          packages-dir: dist
+          repository-url: https://upload.pypi.org/legacy/
+          skip-existing: true
+
+      - name: Verify the exact indexed PyPI release
+        env:
+          LANCE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.lance_version }}
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest vane-extension-release.toml --extension-root . \
+            --vane-source vane --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --directory dist --index pypi \
+            --provider lance --version "$LANCE_VERSION"

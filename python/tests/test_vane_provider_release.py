@@ -9,10 +9,12 @@ import importlib.util
 import json
 import subprocess
 import sys
+import tomllib
 import zipfile
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -118,7 +120,10 @@ def test_shared_validate_preserves_workflow_outputs(
         *_source_arguments(tmp_path),
         "--vane-version",
         VANE_VERSION,
-        "--require-testpypi-publishable",
+        "--channel",
+        "testpypi-dev",
+        "--require-publishable-on",
+        "testpypi",
         "--github-output",
         str(outputs),
     ]
@@ -159,6 +164,8 @@ def test_shared_verify_index_uses_lance_provider(tmp_path, monkeypatch) -> None:
             [
                 "verify-index",
                 *_source_arguments(tmp_path),
+                "--index",
+                "testpypi",
                 "--provider",
                 "lance",
                 "--version",
@@ -238,8 +245,10 @@ def test_workflow_uses_only_the_committed_tools_submodule() -> None:
         "vane-wheel-build",
         "vane-dynamic-provider-build",
         "vane-testpypi-wheels",
+        "provider-release-preflight",
         "assemble-testpypi-lance",
         "verify-testpypi-lance",
+        "publish-pypi-lance",
     }
 
 
@@ -263,7 +272,7 @@ def test_release_workflow_supplies_exact_sources_and_shared_config() -> None:
                 "--extension-root",
                 "--vane-source",
                 "--ci-tools-version",
-                "rev-parse HEAD:vane-extension-ci-tools",
+                "HEAD:vane-extension-ci-tools",
                 "--config",
                 "vane-provider-release.toml",
             ):
@@ -281,7 +290,151 @@ def test_release_workflow_supplies_exact_sources_and_shared_config() -> None:
         "vane-testpypi-wheels",
         "assemble-testpypi-lance",
         "verify-testpypi-lance",
+        "publish-pypi-lance",
     }
     assert "--provider lance" in commands["verify-testpypi-lance"]
     for job in ("vane-testpypi-wheels", "assemble-testpypi-lance"):
-        assert "--require-testpypi-publishable" in commands[job]
+        assert "--channel" in commands[job]
+        assert "--require-publishable-on testpypi" in commands[job]
+
+
+def test_production_manifest_does_not_change_the_development_runtime() -> None:
+    development = tomllib.loads((ROOT / "vane-extension.toml").read_text())
+    production = tomllib.loads((ROOT / "vane-extension-release.toml").read_text())
+    assert production["vane"].pop("revision") == (
+        "033b549afcb498633fd6669b26c054c00363004e"
+    )
+    assert development["vane"].pop("revision") == (
+        "472df75ab51fd3eac2642f6646545075549e5921"
+    )
+    assert production == development
+
+
+def test_production_promotion_requires_the_exact_staged_lance_matrix(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _write_release(tmp_path)
+    for path in paths:
+        # Keep the existing immutable provider version shape; only the exact
+        # runtime requirement distinguishes this synthetic production candidate.
+        _write_wheel(tmp_path, path.name.split("-")[2], requirement="vane-ai===0.2.0")
+    document = {
+        "urls": [
+            {
+                "filename": path.name,
+                "packagetype": "bdist_wheel",
+                "digests": {"sha256": release._sha256(path)},
+            }
+            for path in paths
+        ]
+    }
+    monkeypatch.setattr(release, "verify_sources", Mock())
+    request = Mock(side_effect=[(200, document), (404, None)])
+    monkeypatch.setattr(release, "_request_json", request)
+    command = [
+        "verify-promotion",
+        *_source_arguments(tmp_path),
+        "--vane-version",
+        "0.2.0",
+        "--attempts",
+        "1",
+        "--delay-seconds",
+        "0",
+    ]
+    assert release.main(command) == 0
+    assert [call.args[0] for call in request.call_args_list] == [
+        f"https://test.pypi.org/pypi/vane-extension-lance/{PROVIDER_VERSION}/json",
+        f"https://pypi.org/pypi/vane-extension-lance/{PROVIDER_VERSION}/json",
+    ]
+    document["urls"][0]["digests"]["sha256"] = "0" * 64
+    request.side_effect = [(200, document)]
+    assert release.main(command) == 2
+
+
+def test_production_workflow_has_no_shortcut_around_qualification() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/VaneExtension.yml").read_text()
+    )
+    dispatch = workflow[True]["workflow_dispatch"]["inputs"]["operation"]
+    assert dispatch["default"] == "build-only"
+    assert dispatch["options"] == ["build-only", "testpypi-dev", "release"]
+    jobs = workflow["jobs"]
+    assert "inputs.operation != 'release'" in jobs["preflight"]["if"]
+    preflight = jobs["provider-release-preflight"]
+    assert "environment" not in preflight
+    assert "secrets." not in str(preflight)
+    assert jobs["vane-testpypi-wheels"]["needs"] == "provider-release-preflight"
+    assert "production-signing" in jobs["vane-testpypi-wheels"]["environment"]["name"]
+    publish = jobs["publish-pypi-lance"]
+    assert publish["if"] == "inputs.operation == 'release'"
+    assert set(publish["needs"]) == {
+        "assemble-testpypi-lance",
+        "testpypi-local-lance-integration",
+        "testpypi-ray-lance-integration",
+    }
+    assert publish["environment"]["name"] == "pypi"
+    steps = publish["steps"]
+    promotion = next(
+        i for i, step in enumerate(steps) if "verify-promotion" in step.get("run", "")
+    )
+    upload = next(
+        i
+        for i, step in enumerate(steps)
+        if "gh-action-pypi-publish" in step.get("uses", "")
+    )
+    indexed = next(
+        i for i, step in enumerate(steps) if "--index pypi" in step.get("run", "")
+    )
+    assert promotion < upload < indexed
+    assert "--directory dist" in steps[promotion]["run"]
+    assert steps[upload]["with"]["packages-dir"] == "dist"
+    assert steps[upload]["with"]["repository-url"] == "https://upload.pypi.org/legacy/"
+    assert not any(
+        "build_vane_dynamic_wheel.py" in step.get("run", "") for step in steps
+    )
+
+
+@pytest.mark.parametrize("runner", ["local", "ray"])
+def test_release_smokes_use_exact_staged_bytes_and_the_correct_runtime_index(
+    runner,
+) -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/VaneExtension.yml").read_text()
+    )
+    job = workflow["jobs"][f"testpypi-{runner}-lance-integration"]
+    assert job["env"]["INDEX_URL"] == "https://test.pypi.org/simple/"
+    assert "inputs.operation == 'release'" in job["env"]["VANE_RUNTIME_INDEX_URL"]
+    assert "https://pypi.org/simple/" in job["env"]["VANE_RUNTIME_INDEX_URL"]
+    commands = "\n".join(step.get("run", "") for step in job["steps"])
+    assert (
+        'INDEX_URL="$VANE_RUNTIME_INDEX_URL" download_exact "vane-ai==$VANE_VERSION"'
+        in commands
+    )
+    assert 'cmp "${expected_lance[0]}" "${lance_wheels[0]}"' in commands
+    assert "unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS" in commands
+    assert "PIP_CONFIG_FILE=/dev/null" in commands
+
+
+def test_every_artifact_download_fails_on_a_digest_mismatch() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/VaneExtension.yml").read_text()
+    )
+    for job in workflow["jobs"].values():
+        for step in job["steps"]:
+            if step.get("uses", "").startswith("actions/download-artifact@"):
+                assert (
+                    step["uses"]
+                    == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+                )
+                assert step["with"]["digest-mismatch"] == "error"
+
+
+def test_every_provider_builder_uses_the_selected_manifest() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/VaneExtension.yml").read_text()
+    )
+    for job in workflow["jobs"].values():
+        for step in job["steps"]:
+            command = step.get("run", "")
+            if "-I extension/scripts/build_vane_dynamic_wheel.py" in command:
+                assert '--manifest "$VANE_MANIFEST"' in command
