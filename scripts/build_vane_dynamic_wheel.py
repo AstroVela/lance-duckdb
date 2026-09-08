@@ -752,13 +752,10 @@ def _package_signed(
     arguments, vane_source: Path, build_directory: Path, output_directory: Path
 ) -> int:
     signed = arguments.signed_artifact
-    metadata = signed.lstat()
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or not 512 < metadata.st_size <= 384 * 1024 * 1024
-        or any(parent.is_symlink() for parent in signed.parents)
-    ):
-        raise QualificationError("signed Lance artifact must be bounded regular data")
+    _require_original_payload(
+        arguments.bundle_directory / "artifacts" / f"{EXTENSION_NAME}.duckdb_extension",
+        signed,
+    )
     licenses = _prepared_licenses(arguments.bundle_directory)
     runtimes = tuple(
         (
@@ -787,6 +784,46 @@ def _package_signed(
         )
         _emit_wheels(wheels, output_directory)
     return 0
+
+
+def _require_original_payload(unsigned: Path, signed: Path) -> None:
+    sizes = []
+    for path in (unsigned, signed):
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or not 512 < metadata.st_size <= 384 * 1024 * 1024
+            or any(parent.is_symlink() for parent in path.parents)
+        ):
+            raise QualificationError(
+                "Lance artifacts must be bounded regular non-symlink data"
+            )
+        sizes.append(metadata.st_size)
+    if sizes[0] != sizes[1]:
+        raise QualificationError(
+            "signing must preserve the original prepared artifact size"
+        )
+    with unsigned.open("rb") as original, signed.open("rb") as candidate:
+        remaining = sizes[0] - 256
+        while remaining:
+            chunk = original.read(min(remaining, 1024 * 1024))
+            if not chunk or candidate.read(len(chunk)) != chunk:
+                raise QualificationError(
+                    "signed payload differs from the original prepared artifact"
+                )
+            remaining -= len(chunk)
+        original_signature = original.read(256)
+        signed_signature = candidate.read(256)
+        if (
+            original_signature != b"\0" * 256
+            or len(signed_signature) != 256
+            or signed_signature == b"\0" * 256
+            or original.read(1)
+            or candidate.read(1)
+        ):
+            raise QualificationError(
+                "signing must change only the final 256-byte signature slot"
+            )
 
 
 def main() -> int:

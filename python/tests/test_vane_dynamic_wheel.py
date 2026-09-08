@@ -309,6 +309,52 @@ def test_prepared_licenses_are_exact_bounded_regular_data(tmp_path) -> None:
         builder._prepared_licenses(tmp_path)
 
 
+def test_packaging_compares_signed_bytes_with_the_original_prepare_bundle(
+    tmp_path,
+) -> None:
+    unsigned = tmp_path / "unsigned.duckdb_extension"
+    signed = tmp_path / "signed.duckdb_extension"
+    payload = b"native payload" * 100000
+    unsigned.write_bytes(payload + b"\0" * 256)
+    signed.write_bytes(payload + b"s" * 256)
+    builder._require_original_payload(unsigned, signed)
+    for replacement in (
+        b"x" + payload[1:] + b"s" * 256,
+        payload + b"s" * 257,
+        payload + b"\0" * 256,
+    ):
+        signed.write_bytes(replacement)
+        with pytest.raises(builder.QualificationError):
+            builder._require_original_payload(unsigned, signed)
+    signed.unlink()
+    signed.symlink_to(unsigned)
+    with pytest.raises(builder.QualificationError, match="bounded regular"):
+        builder._require_original_payload(unsigned, signed)
+
+
+def test_packaging_rejects_replacement_before_native_audit_or_wheel_build(
+    tmp_path, monkeypatch
+) -> None:
+    arguments = _phase_arguments(
+        "package",
+        "production",
+        bundle_directory=tmp_path,
+        signed_artifact=tmp_path / "signed.duckdb_extension",
+    )
+    original = tmp_path / "artifacts/lance.duckdb_extension"
+    original.parent.mkdir()
+    original.write_bytes(b"original" * 100 + b"\0" * 256)
+    arguments.signed_artifact.write_bytes(b"replaced" * 100 + b"s" * 256)
+    audit = Mock()
+    package = Mock()
+    monkeypatch.setattr(builder, "_require_self_contained_artifact", audit)
+    monkeypatch.setattr(builder, "_build_provider_matrix", package)
+    with pytest.raises(builder.QualificationError, match="differs"):
+        builder._package_signed(arguments, tmp_path, tmp_path, tmp_path)
+    audit.assert_not_called()
+    package.assert_not_called()
+
+
 @pytest.mark.parametrize("profile", ["production", "ci-test", "testpypi"])
 def test_cmake_enables_only_the_selected_testing_key(
     profile, tmp_path, monkeypatch

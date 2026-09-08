@@ -196,7 +196,9 @@ def test_signer_unsets_the_secret_and_destroys_the_private_temporary_file(
         private_paths.append(key)
         if fail:
             raise subprocess.CalledProcessError(1, command)
-        Path(command[-1]).write_bytes(b"signed native data")
+        Path(command[-1]).write_bytes(
+            Path(command[-2]).read_bytes()[:-256] + b"s" * 256
+        )
 
     monkeypatch.setattr(signer.subprocess, "run", run)
     if fail:
@@ -244,6 +246,47 @@ def test_signer_cli_runs_without_site_packages() -> None:
         capture_output=True,
     )
     assert "manifest,sign" in result.stdout
+
+
+def test_signer_requires_an_unchanged_payload_and_exact_signature_slot(
+    tmp_path,
+) -> None:
+    unsigned = _artifact(tmp_path / "prepared")
+    expected = signer.require_artifact(unsigned)
+    signed = tmp_path / "signed.duckdb_extension"
+    valid = unsigned.read_bytes()[:-256] + b"s" * 256
+    signed.write_bytes(valid)
+    signer.require_signed_artifact(signed, expected)
+    for invalid in (b"x" + valid[1:], valid + b"x", valid[:-1], unsigned.read_bytes()):
+        signed.write_bytes(invalid)
+        with pytest.raises(ValueError, match="only the final"):
+            signer.require_signed_artifact(signed, expected)
+    signed.unlink()
+    signed.symlink_to(unsigned)
+    with pytest.raises(ValueError, match="bounded regular"):
+        signer.require_signed_artifact(signed, expected)
+
+
+def test_signer_detects_replacement_even_when_utility_rewrites_both_files(
+    tmp_path, monkeypatch
+) -> None:
+    unsigned = _artifact(tmp_path / "prepared")
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    monkeypatch.setenv("VANE_PROVIDER_SIGNING_PRIVATE_KEY", "synthetic private key")
+    monkeypatch.setattr(signer, "_git", _git_identity)
+    monkeypatch.setattr(signer, "require_key_fingerprint", Mock())
+
+    def replace(command, **kwargs):
+        replacement = b"x" + unsigned.read_bytes()[1:]
+        unsigned.write_bytes(replacement)
+        Path(command[-1]).write_bytes(replacement[:-256] + b"s" * 256)
+
+    monkeypatch.setattr(signer.subprocess, "run", replace)
+    with pytest.raises(ValueError, match="only the final"):
+        signer.main(_sign_arguments(tmp_path))
+    assert not list(runner_temp.iterdir())
 
 
 @pytest.mark.parametrize("directory", ["prepared", "signed"])

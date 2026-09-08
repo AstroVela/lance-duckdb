@@ -95,11 +95,15 @@ The release channel reuses the existing candidate jobs:
    dependencies and never builds or loads native code. It checks the bounded
    regular unsigned artifact and public DER key fingerprint, removes the key
    from the environment, and destroys its private temporary file after signing.
-   The only output is the signed native artifact.
+   Before upload it verifies a regular output of the same size, with the payload
+   SHA-256 recorded before signing unchanged and only the final 256-byte signature
+   slot replaced. The only output is the signed native artifact.
 4. In a fresh job without secrets or OIDC, package those signed bytes without a
    native rebuild. Verify against every exact indexed runtime and assemble the full
    provider wheel matrix. Preserve provenance, checksums, licenses, and SBOM
-   evidence. Validate availability on both indexes without overwriting files.
+   evidence. Independently compare signed bytes with the original unsigned bundle
+   before native verification or packaging; only the signature slot may differ.
+   Validate availability on both indexes without overwriting files.
 5. Upload the candidate wheels to TestPyPI. Verify the complete indexed filename
    and SHA-256 set, then install from TestPyPI into fresh local and two-worker Ray
    test environments. Both tests compare the downloaded provider bytes with the

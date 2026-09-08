@@ -60,20 +60,42 @@ def committed_manifest(root: Path, profile: str) -> dict:
     return vane
 
 
-def require_artifact(path: Path) -> None:
+def artifact_identity(path: Path) -> tuple[int, bytes, bytes]:
     metadata = path.lstat()
     if (
         not stat.S_ISREG(metadata.st_mode)
         or not 512 < metadata.st_size <= MAX_ARTIFACT_BYTES
         or any(parent.is_symlink() for parent in path.parents)
     ):
-        raise ValueError("signer input must be bounded regular non-symlink native data")
+        raise ValueError(
+            "signer artifact must be bounded regular non-symlink native data"
+        )
+    digest = hashlib.sha256()
     with path.open("rb") as source:
-        source.seek(-256, os.SEEK_END)
-        if source.read() != b"\0" * 256:
-            raise ValueError(
-                "signer input must contain the unsigned DuckDB signature slot"
-            )
+        remaining = metadata.st_size - 256
+        while remaining:
+            chunk = source.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError("native data changed size while being inspected")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        signature = source.read(256)
+        if len(signature) != 256 or source.read(1):
+            raise ValueError("native data changed size while being inspected")
+    return metadata.st_size, digest.digest(), signature
+
+
+def require_artifact(path: Path) -> tuple[int, bytes]:
+    size, digest, signature = artifact_identity(path)
+    if signature != b"\0" * 256:
+        raise ValueError("signer input must contain the unsigned DuckDB signature slot")
+    return size, digest
+
+
+def require_signed_artifact(path: Path, prepared_identity: tuple[int, bytes]) -> None:
+    size, digest, signature = artifact_identity(path)
+    if (size, digest) != prepared_identity or signature == b"\0" * 256:
+        raise ValueError("signing must change only the final 256-byte signature slot")
 
 
 def require_key_fingerprint(contents: bytearray, profile: str) -> None:
@@ -112,7 +134,9 @@ def sign_bundle(arguments, contents: bytearray) -> None:
     artifact = (
         arguments.input_directory / "artifacts" / f"{EXTENSION_NAME}.duckdb_extension"
     )
-    require_artifact(artifact)
+    # Snapshot immutable input identity before running the signing utility; do
+    # not allow simultaneous edits of the input and output to mask a replacement.
+    prepared_identity = require_artifact(artifact)
     require_key_fingerprint(contents, arguments.profile)
     output = arguments.output_directory
     if output.is_symlink() or any(parent.is_symlink() for parent in output.parents):
@@ -161,6 +185,7 @@ def sign_bundle(arguments, contents: bytearray) -> None:
                     destination.write(b"\0" * private_key.stat().st_size)
                     os.fsync(destination.fileno())
                 private_key.unlink()
+    require_signed_artifact(output / artifact.name, prepared_identity)
 
 
 def main(argv: list[str] | None = None) -> int:
