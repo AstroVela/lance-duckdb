@@ -22,6 +22,7 @@ from pathlib import Path
 
 import tomllib
 from packaging.tags import sys_tags
+from packaging.utils import parse_wheel_filename
 
 EXTENSION_NAME = "lance"
 PROVIDER_PLATFORM_TAG = "manylinux_2_28_x86_64"
@@ -32,6 +33,7 @@ SIGNING_PROFILES = {
         "astrovela/vane-testpypi",
         "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY",
     ),
+    "production": ("astrovela/vane", None),
 }
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND "
@@ -132,6 +134,26 @@ def _read_signing_private_key(path: Path, *, consume: bool) -> bytearray:
     return contents
 
 
+def _require_production_runtime_wheels(wheels: Sequence[Path]) -> None:
+    versions = set()
+    for wheel in wheels:
+        distribution, version, _, _ = parse_wheel_filename(wheel.name)
+        if (
+            distribution != "vane-ai"
+            or wheel.name.split("-")[1] != str(version)
+            or version.is_devrelease
+            or version.local is not None
+            or version.epoch != 0
+            or len(version.release) != 3
+        ):
+            raise QualificationError(
+                "production signing requires one exact non-dev Vane runtime release"
+            )
+        versions.add(version)
+    if len(versions) != 1:
+        raise QualificationError("production runtime wheels must use one exact version")
+
+
 def _require_git_revision(source: Path, expected: str, description: str) -> None:
     if _REVISION_RE.fullmatch(expected) is None:
         raise QualificationError(
@@ -170,23 +192,23 @@ def _platform_tag() -> str:
     return PROVIDER_PLATFORM_TAG
 
 
-def _vcpkg_revision(extension_root: Path) -> str:
+def _vcpkg_revision(manifest_path: Path) -> str:
     manifest = tomllib.loads(
-        _require_file(
-            extension_root / "vane-extension.toml", "Vane extension manifest"
-        ).read_text(encoding="utf-8")
+        _require_file(manifest_path, "Vane extension manifest").read_text(
+            encoding="utf-8"
+        )
     )
     vcpkg = manifest.get("vcpkg")
     if manifest.get("schema_version") != 2 or not isinstance(vcpkg, dict):
         raise QualificationError(
-            "vane-extension.toml must use schema 2 with an explicit [vcpkg] table"
+            "Vane extension manifest must use schema 2 with an explicit [vcpkg] table"
         )
     if vcpkg.get("repository") != "microsoft/vcpkg":
         raise QualificationError("vcpkg.repository must be microsoft/vcpkg")
     revision = vcpkg.get("revision")
     if not isinstance(revision, str) or _REVISION_RE.fullmatch(revision) is None:
         raise QualificationError(
-            "vane-extension.toml must contain one complete vcpkg.revision"
+            "Vane extension manifest must contain one complete vcpkg.revision"
         )
     return revision
 
@@ -248,7 +270,7 @@ def _build_environment(
     vane_vcpkg_installed: Path,
     vcpkg_toolchain: Path,
     jobs: int,
-    signing_cmake_option: str,
+    signing_cmake_option: str | None,
 ) -> dict[str, str]:
     target_triplet = "x64-linux"
     dependency_prefix = vane_vcpkg_installed / target_triplet
@@ -271,7 +293,9 @@ def _build_environment(
         "-DEXTENSION_STATIC_BUILD=ON",
         "-DLANCE_VANE_DISTRIBUTED=ON",
         "-DLANCE_VANE_DYNAMIC_PROVIDER=ON",
-        f"-D{signing_cmake_option}=ON",
+        "-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=OFF",
+        "-DVANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY=OFF",
+        *([f"-D{signing_cmake_option}=ON"] if signing_cmake_option else []),
         f"-DDUCKDB_EXTENSION_CONFIGS={extension_config}",
         "-DVCPKG_BUILD=ON",
         f"-DCMAKE_TOOLCHAIN_FILE={vcpkg_toolchain}",
@@ -540,21 +564,26 @@ def _build_provider_wheel(
 
 def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--phase", choices=("full", "prepare", "package"), required=True
+    )
     parser.add_argument("--extension-root", required=True, type=Path)
+    parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--vane-source", required=True, type=Path)
     parser.add_argument("--vane-revision", required=True)
-    parser.add_argument("--vane-vcpkg-installed", required=True, type=Path)
-    parser.add_argument("--vcpkg-toolchain", required=True, type=Path)
-    parser.add_argument("--cargo-about", required=True, type=Path)
+    parser.add_argument("--vane-vcpkg-installed", type=Path)
+    parser.add_argument("--vcpkg-toolchain", type=Path)
+    parser.add_argument("--cargo-about", type=Path)
     parser.add_argument("--build-directory", required=True, type=Path)
     parser.add_argument("--output-directory", required=True, type=Path)
     parser.add_argument("--jobs", default=8, type=int)
     parser.add_argument(
         "--signing-profile", required=True, choices=tuple(SIGNING_PROFILES)
     )
-    parser.add_argument("--signing-private-key", required=True, type=Path)
-    parser.add_argument("--consume-signing-private-key", action="store_true")
-    runtime_group = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument("--signing-private-key", type=Path)
+    parser.add_argument("--bundle-directory", type=Path)
+    parser.add_argument("--signed-artifact", type=Path)
+    runtime_group = parser.add_mutually_exclusive_group()
     runtime_group.add_argument("--package-local-runtime", action="store_true")
     runtime_group.add_argument(
         "--runtime-python", action="append", default=[], type=Path
@@ -563,38 +592,172 @@ def _parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    arguments = _parse_arguments()
-    if arguments.jobs <= 0:
-        raise QualificationError("--jobs must be a positive integer")
-    if arguments.package_local_runtime and arguments.runtime_wheel:
-        raise QualificationError(
-            "--runtime-wheel cannot be combined with --package-local-runtime"
-        )
+def _validate_phase(arguments: argparse.Namespace) -> None:
+    if arguments.phase == "full":
+        if (
+            arguments.signing_profile != "ci-test"
+            or not arguments.package_local_runtime
+        ):
+            raise QualificationError(
+                "full builds are only for CI's public test key and local runtime"
+            )
+        if arguments.signing_private_key is None:
+            raise QualificationError("full CI builds require the public fixture key")
+    else:
+        if arguments.signing_profile == "ci-test":
+            raise QualificationError(
+                "published phases require testpypi or production signing"
+            )
+        if arguments.signing_private_key is not None or arguments.package_local_runtime:
+            raise QualificationError(
+                "published build/package phases cannot access signing keys or package local runtimes"
+            )
     if len(arguments.runtime_python) != len(arguments.runtime_wheel):
         raise QualificationError(
             "--runtime-python and --runtime-wheel must be supplied equally"
         )
-    if not arguments.package_local_runtime and not arguments.runtime_python:
-        raise QualificationError("at least one indexed runtime pair is required")
+    if arguments.phase == "package":
+        if (
+            not arguments.runtime_python
+            or arguments.bundle_directory is None
+            or arguments.signed_artifact is None
+        ):
+            raise QualificationError(
+                "package requires exact runtimes, the prepared license bundle, and the signed artifact"
+            )
+        if any(
+            value is not None
+            for value in (
+                arguments.vane_vcpkg_installed,
+                arguments.vcpkg_toolchain,
+                arguments.cargo_about,
+            )
+        ):
+            raise QualificationError("package cannot configure native build tools")
+        if arguments.signing_profile == "production":
+            _require_production_runtime_wheels(arguments.runtime_wheel)
+    else:
+        if (
+            arguments.runtime_python
+            or arguments.runtime_wheel
+            or arguments.bundle_directory is not None
+            or arguments.signed_artifact is not None
+        ):
+            raise QualificationError(
+                "native phases cannot consume indexed runtime or signed bundle inputs"
+            )
+        if any(
+            value is None
+            for value in (
+                arguments.vane_vcpkg_installed,
+                arguments.vcpkg_toolchain,
+                arguments.cargo_about,
+            )
+        ):
+            raise QualificationError(
+                "native phases require exact vcpkg and cargo-about inputs"
+            )
 
-    extension_root = _require_directory(arguments.extension_root, "extension root")
-    vane_source = _require_directory(arguments.vane_source, "Vane source")
-    vane_vcpkg_installed = _require_directory(
-        arguments.vane_vcpkg_installed, "Vane vcpkg installation"
-    )
-    cargo_about = _require_file(arguments.cargo_about, "cargo-about executable")
-    if not os.access(cargo_about, os.X_OK):
-        raise QualificationError(f"cargo-about is not executable: {cargo_about}")
-    trust_identity, signing_cmake_option = SIGNING_PROFILES[arguments.signing_profile]
-    if (
-        arguments.signing_profile == "testpypi"
-        and not arguments.consume_signing_private_key
-    ):
-        raise QualificationError(
-            "the TestPyPI signing profile requires --consume-signing-private-key"
+
+def _build_provider_matrix(
+    *,
+    runtimes,
+    staging: Path,
+    build_directory: Path,
+    vane_source: Path,
+    signed: Path,
+    platform_tag: str,
+    trust_identity: str,
+    licenses: Sequence[Path],
+) -> list[Path]:
+    provider_wheels = []
+    for runtime_index, (runtime_python, runtime_wheel) in enumerate(runtimes):
+        _require_base_wheel_free_of_lance(runtime_wheel)
+        provider_directory = staging / f"extension-{runtime_index}"
+        provider_directory.mkdir()
+        builder_environment, builder_python = _builder_python(
+            runtime_python, runtime_wheel, build_directory.parent
         )
-    indexed_runtimes = tuple(
+        try:
+            provider_wheel = _build_provider_wheel(
+                python=builder_python,
+                vane_source=vane_source,
+                artifact=signed,
+                output_directory=provider_directory,
+                platform_tag=platform_tag,
+                trust_identity=trust_identity,
+                license_files=licenses,
+            )
+            _run(
+                (
+                    str(builder_python),
+                    "-I",
+                    str(vane_source / "scripts/verify_extension_wheel.py"),
+                    "--base-wheel",
+                    str(runtime_wheel),
+                    "--extension-wheel",
+                    str(provider_wheel),
+                    "--extension-name",
+                    EXTENSION_NAME,
+                    "--trust-identity",
+                    trust_identity,
+                )
+            )
+        finally:
+            builder_environment.cleanup()
+        provider_wheels.append(provider_wheel)
+    return provider_wheels
+
+
+def _emit_wheels(wheels: Sequence[Path], output_directory: Path) -> None:
+    for wheel in wheels:
+        destination = output_directory / wheel.name
+        if destination.exists():
+            raise QualificationError(f"multiple runtimes produced {destination.name}")
+        shutil.copyfile(wheel, destination)
+        print(destination)
+
+
+def _prepared_licenses(bundle: Path) -> tuple[Path, ...]:
+    directory = bundle / "licenses" / EXTENSION_NAME
+    expected = {
+        "Lance-DuckDB-Apache-2.0.txt": 1024 * 1024,
+        "Vane-runtime-licenses.txt": _MAX_BASE_LICENSE_BYTES + 1024 * 1024,
+        "Rust-third-party-licenses.txt": _MAX_RUST_LICENSE_BYTES,
+        "Rust-standard-library-licenses.html": _MAX_RUST_STDLIB_LICENSE_BYTES,
+    }
+    if (
+        directory.is_symlink()
+        or any(parent.is_symlink() for parent in directory.parents)
+        or not directory.is_dir()
+    ):
+        raise QualificationError("prepared licenses must use a regular data directory")
+    if {path.name for path in directory.iterdir()} != set(expected):
+        raise QualificationError(
+            "prepared license bundle does not contain the exact expected files"
+        )
+    paths = []
+    for name, limit in expected.items():
+        path = directory / name
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= limit:
+            raise QualificationError(
+                f"prepared license is not bounded regular data: {name}"
+            )
+        paths.append(path)
+    return tuple(paths)
+
+
+def _package_signed(
+    arguments, vane_source: Path, build_directory: Path, output_directory: Path
+) -> int:
+    signed = arguments.signed_artifact
+    _require_original_payload(
+        arguments.bundle_directory / "artifacts" / f"{EXTENSION_NAME}.duckdb_extension",
+        signed,
+    )
+    licenses = _prepared_licenses(arguments.bundle_directory)
+    runtimes = tuple(
         (
             _require_file(interpreter, "runtime Python interpreter"),
             _require_file(wheel, "indexed Vane runtime wheel"),
@@ -603,20 +766,95 @@ def main() -> int:
             arguments.runtime_python, arguments.runtime_wheel, strict=True
         )
     )
-    if any(not os.access(interpreter, os.X_OK) for interpreter, _ in indexed_runtimes):
+    if any(not os.access(interpreter, os.X_OK) for interpreter, _ in runtimes):
         raise QualificationError("one runtime Python interpreter is not executable")
+    _require_self_contained_artifact(signed)
+    with tempfile.TemporaryDirectory(
+        prefix="vane-qualified-wheels-", dir=output_directory.parent
+    ) as staging:
+        wheels = _build_provider_matrix(
+            runtimes=runtimes,
+            staging=Path(staging),
+            build_directory=build_directory,
+            vane_source=vane_source,
+            signed=signed,
+            platform_tag=_platform_tag(),
+            trust_identity=SIGNING_PROFILES[arguments.signing_profile][0],
+            licenses=licenses,
+        )
+        _emit_wheels(wheels, output_directory)
+    return 0
 
-    vcpkg_toolchain = _require_vcpkg_toolchain(
-        arguments.vcpkg_toolchain, _vcpkg_revision(extension_root)
-    )
+
+def _require_original_payload(unsigned: Path, signed: Path) -> None:
+    sizes = []
+    for path in (unsigned, signed):
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or not 512 < metadata.st_size <= 384 * 1024 * 1024
+            or any(parent.is_symlink() for parent in path.parents)
+        ):
+            raise QualificationError(
+                "Lance artifacts must be bounded regular non-symlink data"
+            )
+        sizes.append(metadata.st_size)
+    if sizes[0] != sizes[1]:
+        raise QualificationError(
+            "signing must preserve the original prepared artifact size"
+        )
+    with unsigned.open("rb") as original, signed.open("rb") as candidate:
+        remaining = sizes[0] - 256
+        while remaining:
+            chunk = original.read(min(remaining, 1024 * 1024))
+            if not chunk or candidate.read(len(chunk)) != chunk:
+                raise QualificationError(
+                    "signed payload differs from the original prepared artifact"
+                )
+            remaining -= len(chunk)
+        original_signature = original.read(256)
+        signed_signature = candidate.read(256)
+        if (
+            original_signature != b"\0" * 256
+            or len(signed_signature) != 256
+            or signed_signature == b"\0" * 256
+            or original.read(1)
+            or candidate.read(1)
+        ):
+            raise QualificationError(
+                "signing must change only the final 256-byte signature slot"
+            )
+
+
+def main() -> int:
+    arguments = _parse_arguments()
+    if arguments.jobs <= 0:
+        raise QualificationError("--jobs must be a positive integer")
+    _validate_phase(arguments)
+
+    extension_root = _require_directory(arguments.extension_root, "extension root")
+    vane_source = _require_directory(arguments.vane_source, "Vane source")
+    _require_git_revision(vane_source, arguments.vane_revision, "Vane")
     build_directory = arguments.build_directory.expanduser().resolve()
     output_directory = arguments.output_directory.expanduser().resolve()
     build_directory.mkdir(parents=True, exist_ok=True)
     output_directory.mkdir(parents=True, exist_ok=True)
-    if list(output_directory.glob("*.whl")):
-        raise QualificationError("output directory already contains a wheel")
-
-    _require_git_revision(vane_source, arguments.vane_revision, "Vane")
+    if any(output_directory.iterdir()):
+        raise QualificationError("output directory must be empty")
+    if arguments.phase == "package":
+        return _package_signed(
+            arguments, vane_source, build_directory, output_directory
+        )
+    vane_vcpkg_installed = _require_directory(
+        arguments.vane_vcpkg_installed, "Vane vcpkg installation"
+    )
+    cargo_about = _require_file(arguments.cargo_about, "cargo-about executable")
+    if not os.access(cargo_about, os.X_OK):
+        raise QualificationError(f"cargo-about is not executable: {cargo_about}")
+    trust_identity, signing_cmake_option = SIGNING_PROFILES[arguments.signing_profile]
+    vcpkg_toolchain = _require_vcpkg_toolchain(
+        arguments.vcpkg_toolchain, _vcpkg_revision(arguments.manifest)
+    )
     platform_tag = _platform_tag()
     environment = _build_environment(
         extension_root=extension_root,
@@ -626,10 +864,7 @@ def main() -> int:
         jobs=arguments.jobs,
         signing_cmake_option=signing_cmake_option,
     )
-    signing_private_key_contents = _read_signing_private_key(
-        arguments.signing_private_key,
-        consume=arguments.consume_signing_private_key,
-    )
+    signing_private_key_contents = bytearray()
 
     try:
         with tempfile.TemporaryDirectory(
@@ -671,6 +906,28 @@ def main() -> int:
                 "unsigned Lance artifact",
             )
             _require_self_contained_artifact(unsigned)
+            licenses = _stage_license_files(
+                extension_root=extension_root,
+                base_wheel=base_wheel,
+                cargo_about=cargo_about,
+                build_directory=build_directory,
+            )
+            if arguments.phase == "prepare":
+                if not 512 < unsigned.stat().st_size <= 384 * 1024 * 1024:
+                    raise QualificationError(
+                        "unsigned Lance artifact exceeds the signing size contract"
+                    )
+                artifact_directory = output_directory / "artifacts"
+                license_directory = output_directory / "licenses" / EXTENSION_NAME
+                artifact_directory.mkdir()
+                license_directory.mkdir(parents=True)
+                shutil.copyfile(unsigned, artifact_directory / unsigned.name)
+                for license_file in licenses:
+                    shutil.copyfile(license_file, license_directory / license_file.name)
+                return 0
+            signing_private_key_contents = _read_signing_private_key(
+                arguments.signing_private_key, consume=False
+            )
             signed_directory = build_directory / "signed-vane-extensions"
             signed_directory.mkdir(parents=True, exist_ok=True)
             signed = signed_directory / unsigned.name
@@ -704,93 +961,43 @@ def main() -> int:
                 if ephemeral_key.exists():
                     _destroy_file(ephemeral_key)
 
-            licenses = _stage_license_files(
-                extension_root=extension_root,
-                base_wheel=base_wheel,
-                cargo_about=cargo_about,
-                build_directory=build_directory,
-            )
             with tempfile.TemporaryDirectory(
                 prefix="vane-qualified-wheels-", dir=output_directory.parent
             ) as staging_value:
                 staging = Path(staging_value)
-                emitted_base_wheel: Path | None = None
-                if arguments.package_local_runtime:
-                    repaired_base_directory = staging / "base"
-                    repaired_base_directory.mkdir()
-                    _run(
-                        (
-                            sys.executable,
-                            "-m",
-                            "auditwheel",
-                            "repair",
-                            "--plat",
-                            platform_tag,
-                            "--wheel-dir",
-                            str(repaired_base_directory),
-                            str(base_wheel),
-                        )
+                repaired_base_directory = staging / "base"
+                repaired_base_directory.mkdir()
+                _run(
+                    (
+                        sys.executable,
+                        "-m",
+                        "auditwheel",
+                        "repair",
+                        "--plat",
+                        platform_tag,
+                        "--wheel-dir",
+                        str(repaired_base_directory),
+                        str(base_wheel),
                     )
-                    emitted_base_wheel = _one_wheel(
-                        repaired_base_directory,
-                        "vane_ai-*.whl",
-                        "repaired base Vane wheel",
-                    )
-                    runtimes = ((Path(sys.executable).resolve(), emitted_base_wheel),)
-                else:
-                    runtimes = indexed_runtimes
-
-                provider_wheels: list[Path] = []
-                for runtime_index, (runtime_python, runtime_wheel) in enumerate(
-                    runtimes
-                ):
-                    _require_base_wheel_free_of_lance(runtime_wheel)
-                    provider_directory = staging / f"extension-{runtime_index}"
-                    provider_directory.mkdir()
-                    builder_environment, builder_python = _builder_python(
-                        runtime_python, runtime_wheel, build_directory.parent
-                    )
-                    try:
-                        provider_wheel = _build_provider_wheel(
-                            python=builder_python,
-                            vane_source=vane_source,
-                            artifact=signed,
-                            output_directory=provider_directory,
-                            platform_tag=platform_tag,
-                            trust_identity=trust_identity,
-                            license_files=licenses,
-                        )
-                        _run(
-                            (
-                                str(builder_python),
-                                "-I",
-                                str(vane_source / "scripts/verify_extension_wheel.py"),
-                                "--base-wheel",
-                                str(runtime_wheel),
-                                "--extension-wheel",
-                                str(provider_wheel),
-                                "--extension-name",
-                                EXTENSION_NAME,
-                                "--trust-identity",
-                                trust_identity,
-                            )
-                        )
-                    finally:
-                        builder_environment.cleanup()
-                    provider_wheels.append(provider_wheel)
-
-                wheels_to_emit = (
-                    *((emitted_base_wheel,) if emitted_base_wheel else ()),
-                    *provider_wheels,
                 )
-                for wheel in wheels_to_emit:
-                    destination = output_directory / wheel.name
-                    if destination.exists():
-                        raise QualificationError(
-                            f"multiple runtimes produced {destination.name}"
-                        )
-                    shutil.copyfile(wheel, destination)
-                    print(destination)
+                emitted_base_wheel = _one_wheel(
+                    repaired_base_directory,
+                    "vane_ai-*.whl",
+                    "repaired base Vane wheel",
+                )
+                runtimes = ((Path(sys.executable).resolve(), emitted_base_wheel),)
+                provider_wheels = _build_provider_matrix(
+                    runtimes=runtimes,
+                    staging=staging,
+                    build_directory=build_directory,
+                    vane_source=vane_source,
+                    signed=signed,
+                    platform_tag=platform_tag,
+                    trust_identity=trust_identity,
+                    licenses=licenses,
+                )
+
+                _emit_wheels((emitted_base_wheel, *provider_wheels), output_directory)
     finally:
         signing_private_key_contents[:] = b"\0" * len(signing_private_key_contents)
         signing_private_key_contents.clear()
