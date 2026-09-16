@@ -1,5 +1,5 @@
 # Preparation pin only: select a reviewed, published non-dev Vane release before
-# dispatching operation=release. The development manifest remains on dev612.
+# dispatching operation=release. Keep the development manifest pinned separately.
 schema_version = 2
 name = "lance"
 extension_config = "extension_config_vane.cmake"
