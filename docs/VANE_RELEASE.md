@@ -31,7 +31,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-provider-dist \
-  --vane-version 0.2.0.dev657 --channel testpypi-dev \
+  --vane-version 0.2.0.dev661 --channel testpypi-dev \
   --require-publishable-on testpypi
 ```
 
@@ -57,8 +57,8 @@ and provider versioning remain explicit.
 
 `VaneExtension.yml` keeps `build-only` as its default operation. Pushes, pull
 requests, and build-only dispatches cannot reach provider publishing or private
-signing keys. They continue to build against `vane-extension.toml`, which remains
-byte-for-byte pinned to the existing `vane-ai==0.2.0.dev657` runtime.
+signing keys. They continue to build against `vane-extension.toml`, which pins
+the reviewed Vane main revision below (`0.2.0.dev661`).
 
 Both publishing operations require a manual dispatch on the protected
 `AstroVela/lance-duckdb` `main_vane` branch. No provider tag is required or created:
@@ -71,7 +71,7 @@ committed exact Vane revision.
 | `release` | `vane-extension-release.toml`, PyPI only | `astrovela/vane` |
 
 The production manifest currently selects preparation commit
-`3c9ed18e29c586e9d5448c74440e8ea55469a749`. **This is not a published Vane release.**
+`4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`. **This is not a published Vane release.**
 Production dispatch deliberately fails its secret-free preflight until a reviewed
 PR changes that manifest to a canonical non-development Vane release with the
 complete CPython 3.10–3.14 runtime matrix on PyPI. The selected source must include
@@ -155,6 +155,11 @@ OIDC identity used for package-index uploads and provenance attestations.
 
 ## Default Ray qualification
 
+The qualification pin is Vane main
+`4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`, including the merged connection
+snapshot, terminal partition, native fragment lifecycle, and schema-only chunk
+fixes. The package version is derived from that checkout's Git history.
+
 All installed-wheel integration tests leave `VANE_RUNNER` unset and use no
 runner-selection APIs. The scan, write, and smoke suites share an owned Ray
 cluster with a CPU-free head and two execution nodes. SQL and Relation queries,
@@ -165,6 +170,12 @@ their Arrow input still executes on Ray. This preserves deliberate
 fragment layouts without using a local Vane runner. File-layout assertions use
 Python/PyArrow inspection, and worker fault injection continues to exercise the
 explicit native distributed protocol directly.
+
+Native DuckDB and Vane S3 jobs use the same immutable MinIO server and `mc`
+images from Quay. The `mc` container joins the server's network namespace to
+create its test bucket; the native DuckDB job also mounts the Lance fixtures
+read-only and uploads them. Bucket creation and fixture upload failures stop
+the job. No job downloads a client binary from `dl.min.io`.
 
 `COPY ... (FORMAT LANCE)` does not yet implement Vane's distributed COPY receipt
 contract. Ray rejects that operation before writing; the smoke suite checks this

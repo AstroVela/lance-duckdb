@@ -698,7 +698,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
 
       - name: Wait for MinIO and create the test bucket
@@ -716,15 +716,11 @@ jobs:
             fi
             sleep 1
           done
-          curl --retry 5 --retry-delay 1 --retry-all-errors -fsSL \
-            "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-01-17T23-25-50Z" \
-            -o "${RUNNER_TEMP}/mc"
-          mc_sha256="2da8a55896bccb7cb5a29a7f907455c3b1a83eb9f51b10e4b4fbc9bff206e43d"
-          echo "${mc_sha256}  ${RUNNER_TEMP}/mc" | sha256sum --check -
-          chmod +x "${RUNNER_TEMP}/mc"
-          "${RUNNER_TEMP}/mc" alias set local "${AWS_ENDPOINT_URL}" \
-            "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}"
-          "${RUNNER_TEMP}/mc" mb --ignore-existing "local/${LANCE_S3_BUCKET}"
+          docker run --rm \
+            --network container:lance-vane-minio \
+            --env "MC_HOST_local=http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
+            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            mb --ignore-existing "local/${LANCE_S3_BUCKET}"
 
       - name: Run distributed scan contracts
         shell: bash
@@ -802,7 +798,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
 
       - name: Wait for MinIO and create the test bucket
@@ -820,15 +816,11 @@ jobs:
             fi
             sleep 1
           done
-          curl --retry 5 --retry-delay 1 --retry-all-errors -fsSL \
-            "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-01-17T23-25-50Z" \
-            -o "${RUNNER_TEMP}/mc"
-          mc_sha256="2da8a55896bccb7cb5a29a7f907455c3b1a83eb9f51b10e4b4fbc9bff206e43d"
-          echo "${mc_sha256}  ${RUNNER_TEMP}/mc" | sha256sum --check -
-          chmod +x "${RUNNER_TEMP}/mc"
-          "${RUNNER_TEMP}/mc" alias set local "${AWS_ENDPOINT_URL}" \
-            "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}"
-          "${RUNNER_TEMP}/mc" mb --ignore-existing "local/${LANCE_S3_BUCKET}"
+          docker run --rm \
+            --network container:lance-vane-write-minio \
+            --env "MC_HOST_local=http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
+            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            mb --ignore-existing "local/${LANCE_S3_BUCKET}"
 
       - name: Run distributed write and mutation contracts
         shell: bash
