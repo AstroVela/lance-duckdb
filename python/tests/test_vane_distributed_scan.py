@@ -1542,6 +1542,7 @@ def _physical_plan(connection, relation):
 class _WorkerTaskCaptureBackend:
     def __init__(self) -> None:
         self.tasks: list[object] = []
+        self.production_finished_queries: list[str] = []
 
     def register_query_owner(self, _query_id: str, _owner_query_id: str) -> None:
         return None
@@ -1564,6 +1565,9 @@ class _WorkerTaskCaptureBackend:
         self, _query_id: str, _source_node_ids
     ) -> list[object]:
         return []
+
+    def task_production_finished(self, query_id: str) -> None:
+        self.production_finished_queries.append(query_id)
 
     def materialization_barrier_completed(self, _query_id: str, _node_id: str) -> None:
         return None
@@ -1662,6 +1666,7 @@ def _capture_worker_tasks(physical, connection):
         stream = runner.run_plan(physical, connection)
         asyncio.run(_drain_native_result_stream_async(stream))
         assert backend.tasks
+        assert backend.production_finished_queries == [str(physical.idx())]
         yield backend.tasks
     finally:
         try:
