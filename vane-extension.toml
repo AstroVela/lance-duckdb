@@ -6,7 +6,7 @@ native_test_selection = "test/sql/dual_build_smoke.test"
 
 [vane]
 repository = "AstroVela/vane"
-revision = "472df75ab51fd3eac2642f6646545075549e5921"
+revision = "3c9ed18e29c586e9d5448c74440e8ea55469a749"
 
 [vcpkg]
 repository = "microsoft/vcpkg"

@@ -7,9 +7,12 @@ import json
 import os
 from pathlib import Path
 
+import pytest
 import vane
 
 from packaged_dynamic_extension import load_packaged_dynamic_lance
+
+pytestmark = pytest.mark.usefixtures("default_ray_runtime")
 
 
 def _sql_literal(value: str | Path) -> str:
@@ -59,7 +62,7 @@ def _lance_scan_info(plan: object) -> dict:
     return matches[0]
 
 
-def test_static_wheel_owns_the_vane_lance_artifact() -> None:
+def test_wheel_owns_the_vane_lance_artifact() -> None:
     from vane import _native
 
     assert "site-packages" in Path(_native.__file__).resolve().parts
@@ -70,7 +73,11 @@ def test_static_wheel_owns_the_vane_lance_artifact() -> None:
             "WHERE lower(extension_name) = 'lance'"
         ).fetchone()
         assert loaded is True
-        assert str(install_mode).upper() == "STATICALLY_LINKED"
+        assert str(install_mode).upper() == (
+            "NOT_INSTALLED"
+            if os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY")
+            else "STATICALLY_LINKED"
+        )
     finally:
         connection.close()
 
@@ -97,11 +104,9 @@ def test_single_node_lance_scan(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_single_node_lance_writes_and_mutations_keep_native_execution(
+def test_default_ray_lance_writes_and_mutations(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _connect()
     root = tmp_path / "single-node-write"
     root.mkdir()
@@ -119,7 +124,7 @@ def test_single_node_lance_writes_and_mutations_keep_native_execution(
         source.insert_into("lance_write.main.insert_target")
         source.create("lance_write.main.ctas_target")
         connection.table("lance_write.main.insert_target").update(
-            {"value": vane.lit("native-update")},
+            {"value": vane.lit("ray-update")},
             condition=vane.col("id") < 4,
         )
         connection.table("lance_write.main.insert_target").delete(
@@ -128,7 +133,7 @@ def test_single_node_lance_writes_and_mutations_keep_native_execution(
 
         assert connection.execute(
             "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-            "count(*) FILTER (WHERE value = 'native-update')::BIGINT "
+            "count(*) FILTER (WHERE value = 'ray-update')::BIGINT "
             "FROM lance_write.main.insert_target"
         ).fetchone() == (10, 45, 4)
         assert connection.execute(

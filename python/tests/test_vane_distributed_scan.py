@@ -24,9 +24,10 @@ from pathlib import Path
 import pytest
 import vane
 from vane import runners
-from vane.runners.ray import set_runner_ray
 
 from packaged_dynamic_extension import load_packaged_dynamic_lance
+
+pytestmark = pytest.mark.usefixtures("default_ray_runtime")
 
 WORKER_COUNT = 2
 VECTOR_CANDIDATE_DIMENSION = 256
@@ -843,7 +844,6 @@ import vane
 from ray.cluster_utils import Cluster
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from vane import runners
-from vane.runners.ray import set_runner_ray
 
 
 def sql_literal(value):
@@ -1253,14 +1253,10 @@ try:
         assert all(value not in repr(logical) for value in sensitive_values)
 
     if mode != "secret":
-        set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
         baseline_task_ids = set(settled_fte_create_task_locations())
-        rows = sorted(
-            tuple(row.values())
-            for table in runner.run_iter_tables(relation)
-            for row in table.to_pylist()
-        )
+        assert runner.name == "ray"
+        rows = sorted(relation.fetchall())
         assert rows == [(row_id,) for row_id in range(12)]
         assert new_fte_create_task_node_ids(
             baseline_task_ids, expected_count=2
@@ -1273,11 +1269,7 @@ try:
             namespace_relation = connection.sql(
                 "SELECT id FROM credential_ns.main.items ORDER BY id"
             )
-            namespace_rows = [
-                tuple(row.values())
-                for table in runner.run_iter_tables(namespace_relation)
-                for row in table.to_pylist()
-            ]
+            namespace_rows = namespace_relation.fetchall()
             assert namespace_rows == [(row_id,) for row_id in range(12)]
 
             search_source = sql_literal("credential_ns.main.search_items")
@@ -2013,11 +2005,8 @@ def _clear_manifest_deletion_counts(path: Path) -> None:
 
 
 def _run(runner, relation) -> list[tuple[object, ...]]:
-    return [
-        tuple(row.values())
-        for table in runner.run_iter_tables(relation)
-        for row in table.to_pylist()
-    ]
+    assert runner.name == "ray"
+    return relation.fetchall()
 
 
 def _run_serialized_logical(runner, serialized: bytes) -> list[tuple[object, ...]]:
@@ -2133,67 +2122,15 @@ def _ray_fte_create_task_node_ids(
     return observed_node_ids
 
 
-@pytest.fixture(scope="session")
-def ray_cluster():
-    import ray
-    from ray.cluster_utils import Cluster
-
-    if ray.is_initialized():
-        ray.shutdown()
-    environment = pytest.MonkeyPatch()
-    cluster = None
-    try:
-        environment.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-        environment.setenv("RAY_task_events_report_interval_ms", "100")
-        cluster = Cluster(shutdown_at_exit=False)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=r"Tip: In future versions of Ray")
-            cluster.add_node(
-                include_dashboard=False,
-                num_cpus=0,
-                num_gpus=0,
-                object_store_memory=128 * 1024 * 1024,
-            )
-            for _ in range(WORKER_COUNT):
-                cluster.add_node(
-                    num_cpus=1,
-                    num_gpus=0,
-                    object_store_memory=128 * 1024 * 1024,
-                )
-            ray.init(
-                address=cluster.address,
-                ignore_reinit_error=True,
-                log_to_driver=True,
-            )
-        yield _execution_node_ids(ray)
-    finally:
-        try:
-            vane.teardown_runner()
-        finally:
-            ray.shutdown()
-            if cluster is not None:
-                cluster.shutdown()
-            environment.undo()
+@pytest.fixture
+def ray_runner(default_ray_runtime):
+    return default_ray_runtime
 
 
 @pytest.fixture
-def ray_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    assert len(ray_cluster) == WORKER_COUNT
-    monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "2")
-    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
-    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
-    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
-    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(tmp_path / "shuffle"))
-    vane.teardown_runner()
-    set_runner_ray(noop_if_initialized=True)
-    try:
-        yield runners.get_or_create_runner()
-    finally:
-        vane.teardown_runner()
-
-
-@pytest.fixture
-def ray_retry_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def ray_retry_runner(
+    default_ray_runtime, ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     assert len(ray_cluster) == WORKER_COUNT
     monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "2")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
@@ -2204,7 +2141,6 @@ def ray_retry_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     monkeypatch.setenv("VANE_FTE_CONTROL_RPC_INITIAL_BACKOFF_S", "0")
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(tmp_path / "retry-shuffle"))
     vane.teardown_runner()
-    set_runner_ray(noop_if_initialized=True)
     try:
         yield runners.get_or_create_runner()
     finally:
@@ -2362,7 +2298,7 @@ def test_vane_scan_and_search_share_database_session_cache() -> None:
         connection.close()
 
 
-def test_global_search_overloads_match_native_and_emit_one_task(ray_runner) -> None:
+def test_global_search_overloads_match_sql_and_emit_one_task(ray_runner) -> None:
     path = (
         Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
     ).resolve()
@@ -2479,7 +2415,7 @@ def test_global_search_overloads_match_native_and_emit_one_task(ray_runner) -> N
         connection.close()
 
 
-def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
+def test_exact_vector_candidates_are_disjoint_deterministic_and_match_final_search(
     tmp_path: Path, ray_cluster: frozenset[str], ray_runner
 ) -> None:
     import ray
@@ -3200,7 +3136,7 @@ def test_large_vector_searches_outside_candidate_boundaries_remain_final_search(
         connection.close()
 
 
-def test_global_search_computed_score_postfilters_match_native(ray_runner) -> None:
+def test_global_search_computed_score_postfilters_match_sql(ray_runner) -> None:
     path = (
         Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
     ).resolve()
@@ -3264,7 +3200,8 @@ def test_direct_fts_and_hybrid_reject_complex_prefilter_rewrite() -> None:
     connection = _connect()
     try:
         for name, sql in searches:
-            connection.execute(sql).fetchall()
+            with pytest.raises(Exception, match="complete filter pushdown"):
+                connection.execute(sql).fetchall()
             with pytest.raises(Exception, match="complete filter pushdown"):
                 relation = connection.sql(sql)
                 logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -3654,7 +3591,7 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
         connection.close()
 
 
-def test_indexed_partial_coverage_global_search_matches_native(
+def test_indexed_partial_coverage_global_search_matches_sql(
     tmp_path: Path, ray_runner
 ) -> None:
     source = (

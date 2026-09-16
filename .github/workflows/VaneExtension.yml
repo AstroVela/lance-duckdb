@@ -589,7 +589,7 @@ jobs:
           if-no-files-found: error
 
   vane-single-test:
-    name: Vane single-node scan and native writes
+    name: Vane default Ray scan and writes
     needs: [rust-quality, python-quality, vane-native-build, vane-wheel-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -625,9 +625,10 @@ jobs:
           "${RUNNER_TEMP}/vane-lance-single/bin/python" -m pip install \
             "${wheels[0]}" \
             "pytest>=8" \
+            "grpcio>=1.42.0" \
             "ray==2.58.0"
 
-      - name: Run Vane single-node scan and native-write tests
+      - name: Run Vane default Ray scan and write tests
         shell: bash
         env:
           PYTHONSAFEPATH: "1"
@@ -651,7 +652,6 @@ jobs:
       LANCE_S3_BUCKET: lance-vane-test
       LANCE_TEST_S3: "1"
       RAY_DEDUP_LOGS: "0"
-      VANE_RUNNER: ray
     steps:
       - name: Checkout tests
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -755,7 +755,6 @@ jobs:
       LANCE_S3_BUCKET: lance-vane-write-test
       LANCE_TEST_S3: "1"
       RAY_DEDUP_LOGS: "0"
-      VANE_RUNNER: ray
     steps:
       - name: Checkout tests
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -1062,7 +1061,6 @@ jobs:
       contents: read
     env:
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
-      VANE_RUNNER: local-fast
 
     steps:
       - name: Checkout tests
@@ -1083,7 +1081,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Exercise provider-backed Lance locally
+      - name: Exercise provider-backed Lance with default Ray
         shell: bash
         run: |
           set -euo pipefail
@@ -1091,10 +1089,10 @@ jobs:
           . .venv-provider-local/bin/activate
           mapfile -t wheels < <(find wheels -maxdepth 1 -type f -name '*.whl' -print | sort)
           test "${#wheels[@]}" -eq 2
-          python -m pip install "${wheels[@]}" pytest
+          python -m pip install "${wheels[@]}" "grpcio>=1.42.0" pytest
           python -m pip check
           python -m pytest -q \
-            python/tests/test_vane_single_scan.py::test_single_node_lance_scan
+            python/tests/test_vane_single_scan.py
 
   vane-dynamic-provider-ray-test:
     if: inputs.operation != 'testpypi-dev'
@@ -1107,7 +1105,6 @@ jobs:
     env:
       RAY_DEDUP_LOGS: "0"
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
-      VANE_RUNNER: ray
 
     steps:
       - name: Checkout tests
@@ -1835,8 +1832,8 @@ jobs:
             --directory dist --index testpypi \
             --version "${{ needs.assemble-testpypi-lance.outputs.lance_version }}"
 
-  testpypi-local-lance-integration:
-    name: TestPyPI local Lance integration
+  testpypi-smoke-lance-integration:
+    name: TestPyPI default Ray Lance smoke
     needs: [assemble-testpypi-lance, verify-testpypi-lance]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1846,7 +1843,6 @@ jobs:
       INDEX_URL: https://test.pypi.org/simple/
       VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
-      VANE_RUNNER: local-fast
 
     steps:
       - name: Checkout extension tests
@@ -1875,8 +1871,8 @@ jobs:
           VANE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.vane_version }}
         run: |
           set -euo pipefail
-          python -m venv .venv-vane-testpypi-local
-          . .venv-vane-testpypi-local/bin/activate
+          python -m venv .venv-vane-testpypi-smoke
+          . .venv-vane-testpypi-smoke/bin/activate
           unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS
           export PIP_CONFIG_FILE=/dev/null
           python -m pip install --upgrade pip
@@ -1909,13 +1905,13 @@ jobs:
           test "${#lance_wheels[@]}" -eq 1
           test "${#expected_lance[@]}" -eq 1
           cmp "${expected_lance[0]}" "${lance_wheels[0]}"
-          python -m pip install "${base_wheels[0]}" "${lance_wheels[0]}" pytest
+          python -m pip install "${base_wheels[0]}" "${lance_wheels[0]}" "grpcio>=1.42.0" pytest
           python -m pip check
 
-      - name: Exercise the indexed provider locally
+      - name: Exercise the indexed provider with default Ray
         run: |
-          .venv-vane-testpypi-local/bin/python -m pytest -q \
-            python/tests/test_vane_single_scan.py::test_single_node_lance_scan
+          .venv-vane-testpypi-smoke/bin/python -m pytest -q \
+            python/tests/test_vane_single_scan.py
 
   testpypi-ray-lance-integration:
     name: TestPyPI two-worker Ray Lance integration
@@ -1929,7 +1925,6 @@ jobs:
       VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       RAY_DEDUP_LOGS: "0"
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
-      VANE_RUNNER: ray
 
     steps:
       - name: Checkout extension tests
@@ -2009,7 +2004,7 @@ jobs:
     name: Approve and verify the immutable Lance promotion without OIDC
     needs:
       - assemble-testpypi-lance
-      - testpypi-local-lance-integration
+      - testpypi-smoke-lance-integration
       - testpypi-ray-lance-integration
     runs-on: ubuntu-24.04
     timeout-minutes: 20

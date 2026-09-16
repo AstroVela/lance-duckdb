@@ -104,7 +104,7 @@ def test_config_declares_the_built_lance_matrix() -> None:
     native = release._load_source_tools()
     manifest = native.load_manifest(ROOT / "vane-extension.toml", ROOT)
     assert manifest.name == "lance"
-    assert manifest.vane_revision == "472df75ab51fd3eac2642f6646545075549e5921"
+    assert manifest.vane_revision == "3c9ed18e29c586e9d5448c74440e8ea55469a749"
 
 
 def test_shared_validate_preserves_workflow_outputs(
@@ -309,10 +309,10 @@ def test_production_manifest_does_not_change_the_development_runtime() -> None:
     development = tomllib.loads((ROOT / "vane-extension.toml").read_text())
     production = tomllib.loads((ROOT / "vane-extension-release.toml").read_text())
     assert production["vane"].pop("revision") == (
-        "033b549afcb498633fd6669b26c054c00363004e"
+        "3c9ed18e29c586e9d5448c74440e8ea55469a749"
     )
     assert development["vane"].pop("revision") == (
-        "472df75ab51fd3eac2642f6646545075549e5921"
+        "3c9ed18e29c586e9d5448c74440e8ea55469a749"
     )
     assert production == development
 
@@ -381,7 +381,7 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
     assert promotion["if"] == "inputs.operation == 'release'"
     assert set(promotion["needs"]) == {
         "assemble-testpypi-lance",
-        "testpypi-local-lance-integration",
+        "testpypi-smoke-lance-integration",
         "testpypi-ray-lance-integration",
     }
     assert promotion["environment"]["name"] == "pypi"
@@ -505,7 +505,7 @@ def test_every_release_stage_downloads_the_original_immutable_artifact_ids() -> 
             for name in (
                 "publish-testpypi-lance",
                 "verify-testpypi-lance",
-                "testpypi-local-lance-integration",
+                "testpypi-smoke-lance-integration",
                 "testpypi-ray-lance-integration",
                 "verify-pypi-promotion",
                 "publish-pypi-lance",
@@ -527,14 +527,14 @@ def test_every_release_stage_downloads_the_original_immutable_artifact_ids() -> 
         )
 
 
-@pytest.mark.parametrize("runner", ["local", "ray"])
+@pytest.mark.parametrize("suite", ["smoke", "ray"])
 def test_release_smokes_use_exact_staged_bytes_and_the_correct_runtime_index(
-    runner,
+    suite,
 ) -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/VaneExtension.yml").read_text()
     )
-    job = workflow["jobs"][f"testpypi-{runner}-lance-integration"]
+    job = workflow["jobs"][f"testpypi-{suite}-lance-integration"]
     assert job["env"]["INDEX_URL"] == "https://test.pypi.org/simple/"
     assert "inputs.operation == 'release'" in job["env"]["VANE_RUNTIME_INDEX_URL"]
     assert "https://pypi.org/simple/" in job["env"]["VANE_RUNTIME_INDEX_URL"]
