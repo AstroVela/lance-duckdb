@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import pytest
 import vane
 
+from lance_fixture import write_fixture_query
 from packaged_dynamic_extension import load_packaged_dynamic_lance
 
 pytestmark = pytest.mark.usefixtures("default_ray_runtime")
@@ -53,25 +54,25 @@ def _connect():
 
 
 def _write_source(connection, path: str | Path) -> None:
-    connection.execute(
-        "COPY (SELECT i::BIGINT AS id, "
-        "('value-' || i::VARCHAR)::VARCHAR AS value "
-        "FROM range(80) AS source(i)) "
-        f"TO {_sql_literal(path)} "
-        "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 10)"
+    write_fixture_query(
+        connection,
+        path,
+        f"SELECT i::BIGINT AS id, ('value-' || i::VARCHAR)::VARCHAR AS value FROM range(80) AS source(i)",
+        mode="create",
+        max_rows_per_file=10,
     )
 
 
 def _write_failure_source(connection, path: str | Path) -> None:
     # Keep the rows in one fragment that spans many DuckDB chunks so the
     # downstream writer receives data before the injected expression error.
-    connection.execute(
-        "COPY (SELECT i::BIGINT AS id, "
-        "('value-' || i::VARCHAR)::VARCHAR AS value "
-        "FROM range(32768) AS source(i)) "
-        f"TO {_sql_literal(path)} "
-        "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 65536, "
-        "MAX_ROWS_PER_GROUP 1024)"
+    write_fixture_query(
+        connection,
+        path,
+        f"SELECT i::BIGINT AS id, ('value-' || i::VARCHAR)::VARCHAR AS value FROM range(32768) AS source(i)",
+        mode="create",
+        max_rows_per_file=65536,
+        max_rows_per_group=1024,
     )
 
 
@@ -452,11 +453,9 @@ def _exercise_stale_target_type_rejection(
     target_path: Path,
 ) -> None:
     connection.execute("CREATE TABLE lance_write.main.stale_target (id INTEGER)")
-    assert connection.execute(
-        "SELECT data_type FROM duckdb_columns() "
-        "WHERE database_name = 'lance_write' AND schema_name = 'main' "
-        "AND table_name = 'stale_target' AND column_name = 'id'"
-    ).fetchone() == ("INTEGER",)
+    assert connection.execute("DESCRIBE lance_write.main.stale_target").fetchone()[
+        :2
+    ] == ("id", "INTEGER")
 
     evolution_connection = _connect()
     try:
@@ -467,10 +466,8 @@ def _exercise_stale_target_type_rejection(
             "ALTER TABLE lance_evolve.main.stale_target " "ALTER COLUMN id TYPE BIGINT"
         )
         assert evolution_connection.execute(
-            "SELECT data_type FROM duckdb_columns() "
-            "WHERE database_name = 'lance_evolve' AND schema_name = 'main' "
-            "AND table_name = 'stale_target' AND column_name = 'id'"
-        ).fetchone() == ("BIGINT",)
+            "DESCRIBE lance_evolve.main.stale_target"
+        ).fetchone()[:2] == ("id", "BIGINT")
 
         manifest_count = _manifest_count(evolution_connection, target_path)
         data_file_count = _data_file_count(evolution_connection, target_path)
@@ -503,12 +500,9 @@ def _exercise_not_null_target(
     connection.execute(
         f"ALTER TABLE {catalog}.main.required_target ALTER COLUMN id SET NOT NULL"
     )
-    assert connection.execute(
-        "SELECT is_nullable FROM duckdb_columns() "
-        f"WHERE database_name = {_sql_literal(catalog)} "
-        "AND schema_name = 'main' AND table_name = 'required_target' "
-        "AND column_name = 'id'"
-    ).fetchone() == (False,)
+    assert connection.execute(f"DESCRIBE {catalog}.main.required_target").fetchone()[
+        :3
+    ] == ("id", "INTEGER", "NO")
 
     source = connection.sql("SELECT i::INTEGER AS id FROM range(3) AS source(i)")
     capture.require_write(
@@ -618,10 +612,8 @@ def _exercise_update_and_delete(
     assert _manifest_count(connection, target_path) == 2
     assert _mutation_attempt_manifest_count(connection, target_path) == 0
     assert connection.execute(
-        f"SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-        "count(*) FILTER (WHERE value = 'updated')::BIGINT "
-        f"FROM {catalog}.main.mutation_target"
-    ).fetchone() == (80, 3160, 40)
+        f"SELECT id, value FROM {catalog}.main.mutation_target ORDER BY id"
+    ).fetchall() == [(i, "updated" if i < 40 else f"value-{i}") for i in range(80)]
 
     capture.require_write(
         "distributed Lance DELETE",
@@ -638,10 +630,8 @@ def _exercise_update_and_delete(
     assert _manifest_count(connection, target_path) == 3
     assert _mutation_attempt_manifest_count(connection, target_path) == 0
     assert connection.execute(
-        f"SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-        "count(*) FILTER (WHERE value = 'updated')::BIGINT "
-        f"FROM {catalog}.main.mutation_target"
-    ).fetchone() == (60, 1770, 40)
+        f"SELECT id, value FROM {catalog}.main.mutation_target ORDER BY id"
+    ).fetchall() == [(i, "updated" if i < 40 else f"value-{i}") for i in range(60)]
 
     for name, operation in (
         (
@@ -699,12 +689,12 @@ def test_two_worker_single_fragment_lance_update_and_delete(
     root.mkdir()
     target_path = root / "mutation_target.lance"
     try:
-        connection.execute(
-            "COPY (SELECT i::BIGINT AS id, "
-            "('value-' || i::VARCHAR)::VARCHAR AS value "
-            "FROM range(16) AS source(i)) "
-            f"TO {_sql_literal(target_path)} "
-            "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 64)"
+        write_fixture_query(
+            connection,
+            target_path,
+            f"SELECT i::BIGINT AS id, ('value-' || i::VARCHAR)::VARCHAR AS value FROM range(16) AS source(i)",
+            mode="create",
+            max_rows_per_file=64,
         )
         connection.execute(
             f"ATTACH {_sql_literal(root)} AS lance_single_mutation (TYPE LANCE)"
@@ -736,10 +726,10 @@ def test_two_worker_single_fragment_lance_update_and_delete(
             allow_empty_tasks=True,
         )
         assert connection.execute(
-            "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-            "list(id ORDER BY id) FILTER (WHERE value = 'single-updated') "
-            "FROM lance_single_mutation.main.mutation_target"
-        ).fetchone() == (13, 78, [0, 1, 2])
+            "SELECT id, value FROM lance_single_mutation.main.mutation_target ORDER BY id"
+        ).fetchall() == [
+            (i, "single-updated" if i < 3 else f"value-{i}") for i in range(13)
+        ]
         assert _manifest_count(connection, target_path) == 3
         assert _mutation_attempt_manifest_count(connection, target_path) == 0
     finally:
@@ -803,10 +793,8 @@ def test_distributed_lance_mutation_rejects_a_stale_bound_snapshot(
         assert _manifest_count(evolution_connection, target_path) == 2
         assert _mutation_attempt_manifest_count(evolution_connection, target_path) == 0
         assert evolution_connection.execute(
-            "SELECT count(*)::BIGINT, "
-            "count(*) FILTER (WHERE value = 'stale-update')::BIGINT "
-            "FROM lance_evolve.main.mutation_target"
-        ).fetchone() == (81, 0)
+            "SELECT id, value FROM lance_evolve.main.mutation_target ORDER BY id"
+        ).fetchall() == [(i, f"value-{i}") for i in range(80)] + [(1000, "concurrent")]
     finally:
         evolution_connection.close()
         connection.close()
@@ -850,10 +838,8 @@ def test_failed_distributed_lance_update_keeps_the_target_unchanged(
         )
         assert _mutation_attempt_manifest_count(connection, target_path) == 0
         assert connection.execute(
-            "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-            "count(*) FILTER (WHERE value IS NULL)::BIGINT "
-            "FROM lance_mutation.main.mutation_target"
-        ).fetchone() == (80, 3160, 0)
+            "SELECT id, value FROM lance_mutation.main.mutation_target ORDER BY id"
+        ).fetchall() == [(i, f"value-{i}") for i in range(80)]
     finally:
         connection.close()
 

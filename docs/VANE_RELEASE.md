@@ -104,7 +104,7 @@ The release channel reuses the existing candidate jobs:
    before native verification or packaging; only the signature slot may differ.
    Validate availability on both indexes without overwriting files.
 5. Upload the candidate wheels to TestPyPI. Verify the complete indexed filename
-   and SHA-256 set, then install from TestPyPI into fresh local and two-worker Ray
+   and SHA-256 set, then install from TestPyPI into fresh default-Ray smoke and full-scan
    test environments. Both tests compare the downloaded provider bytes with the
    expected build artifact; the exact production runtime comes only from PyPI.
 6. After both tests pass, wait for the `pypi` environment approval. Recheck the
@@ -157,7 +157,20 @@ OIDC identity used for package-index uploads and provenance attestations.
 
 All installed-wheel integration tests leave `VANE_RUNNER` unset and use no
 runner-selection APIs. The scan, write, and smoke suites share an owned Ray
-cluster with a CPU-free head and two execution nodes. Setup writes, SQL queries,
-Relation queries, and mutations all use the default Ray runner. File-layout
-assertions use Python/PyArrow filesystem inspection, and worker fault injection
-continues to exercise the explicit native distributed protocol directly.
+cluster with a CPU-free head and two execution nodes. SQL and Relation queries,
+INSERT, CTAS, UPDATE, and DELETE use the default Ray runner. Controlled scan and
+mutation fixtures, their indexes, and snapshot cleanup use the pinned upstream
+PyLance 9.0.1 SDK, matching the extension's Cargo.lock; SQL used to generate
+their Arrow input still executes on Ray. This preserves deliberate
+fragment layouts without using a local Vane runner. File-layout assertions use
+Python/PyArrow inspection, and worker fault injection continues to exercise the
+explicit native distributed protocol directly.
+
+`COPY ... (FORMAT LANCE)` does not yet implement Vane's distributed COPY receipt
+contract. Ray rejects that operation before writing; the smoke suite checks this
+boundary. Use the Lance catalog's INSERT/CTAS APIs for supported distributed
+writes. Index creation/optimization and `VACUUM LANCE` are also fixture-side SDK
+operations: their SQL maintenance rewrites are not currently portable Ray plans.
+These tests qualify indexed reads and frozen snapshots, not distributed index
+maintenance (tracked in [#31](https://github.com/AstroVela/lance-duckdb/issues/31)).
+The standalone DuckDB implementations are unchanged.
