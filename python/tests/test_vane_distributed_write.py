@@ -7,17 +7,17 @@ import os
 import shutil
 import time
 import uuid
-import warnings
 from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 import vane
-from vane import runners
-from vane.runners.ray import set_runner_ray
 
+from lance_fixture import write_fixture_query
 from packaged_dynamic_extension import load_packaged_dynamic_lance
+
+pytestmark = pytest.mark.usefixtures("default_ray_runtime")
 
 WORKER_COUNT = 2
 STABLE_ROW_IDS_DATASET = (
@@ -54,25 +54,25 @@ def _connect():
 
 
 def _write_source(connection, path: str | Path) -> None:
-    connection.execute(
-        "COPY (SELECT i::BIGINT AS id, "
-        "('value-' || i::VARCHAR)::VARCHAR AS value "
-        "FROM range(80) AS source(i)) "
-        f"TO {_sql_literal(path)} "
-        "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 10)"
+    write_fixture_query(
+        connection,
+        path,
+        f"SELECT i::BIGINT AS id, ('value-' || i::VARCHAR)::VARCHAR AS value FROM range(80) AS source(i)",
+        mode="create",
+        max_rows_per_file=10,
     )
 
 
 def _write_failure_source(connection, path: str | Path) -> None:
     # Keep the rows in one fragment that spans many DuckDB chunks so the
     # downstream writer receives data before the injected expression error.
-    connection.execute(
-        "COPY (SELECT i::BIGINT AS id, "
-        "('value-' || i::VARCHAR)::VARCHAR AS value "
-        "FROM range(32768) AS source(i)) "
-        f"TO {_sql_literal(path)} "
-        "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 65536, "
-        "MAX_ROWS_PER_GROUP 1024)"
+    write_fixture_query(
+        connection,
+        path,
+        f"SELECT i::BIGINT AS id, ('value-' || i::VARCHAR)::VARCHAR AS value FROM range(32768) AS source(i)",
+        mode="create",
+        max_rows_per_file=65536,
+        max_rows_per_group=1024,
     )
 
 
@@ -102,50 +102,57 @@ def _write_upstream_container_target(path: Path) -> None:
     assert written_schema.field("vector").type.value_field.name == "item"
 
 
-def _manifest_count(connection, path: str | Path) -> int:
-    pattern = f"{str(path).rstrip('/')}/_versions/*.manifest"
-    return int(
-        connection.execute(
-            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
-        ).fetchone()[0]
+def _artifact_count(
+    path: str | Path, directory: str, suffix: str, *, recursive: bool = False
+) -> int:
+    # Inspect committed file layout independently of Vane query routing.
+    import pyarrow.fs as fs
+
+    location = str(path)
+    if location.startswith("s3://"):
+        parsed = urlsplit(location)
+        endpoint = urlsplit(os.environ["AWS_ENDPOINT_URL"])
+        filesystem = fs.S3FileSystem(
+            access_key=os.environ["AWS_ACCESS_KEY_ID"],
+            secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            region=os.environ["AWS_REGION"],
+            endpoint_override=endpoint.netloc or endpoint.path,
+            scheme=endpoint.scheme or "http",
+        )
+        base = f"{parsed.netloc}{parsed.path}"
+    else:
+        filesystem = fs.LocalFileSystem()
+        base = str(Path(location).resolve())
+    selector = fs.FileSelector(
+        f"{base.rstrip('/')}/{directory}", recursive=recursive, allow_not_found=True
     )
+    return sum(
+        info.type == fs.FileType.File and info.path.endswith(suffix)
+        for info in filesystem.get_file_info(selector)
+    )
+
+
+def _manifest_count(connection, path: str | Path) -> int:
+    return _artifact_count(path, "_versions", ".manifest")
 
 
 def _data_file_count(connection, path: str | Path) -> int:
-    pattern = f"{str(path).rstrip('/')}/data/*.lance"
-    return int(
-        connection.execute(
-            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
-        ).fetchone()[0]
-    )
+    return _artifact_count(path, "data", ".lance")
 
 
 def _deletion_file_count(connection, path: str | Path) -> int:
-    pattern = f"{str(path).rstrip('/')}/_deletions/**/*"
-    return int(
-        connection.execute(
-            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
-        ).fetchone()[0]
-    )
+    return _artifact_count(path, "_deletions", "", recursive=True)
 
 
 def _attempt_manifest_count(connection, path: str | Path) -> int:
-    pattern = f"{str(path).rstrip('/')}/_vane_distributed_write_attempts/*/*.manifest"
-    return int(
-        connection.execute(
-            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
-        ).fetchone()[0]
+    return _artifact_count(
+        path, "_vane_distributed_write_attempts", ".manifest", recursive=True
     )
 
 
 def _mutation_attempt_manifest_count(connection, path: str | Path) -> int:
-    pattern = (
-        f"{str(path).rstrip('/')}/_vane_distributed_mutation_attempts/*/*.manifest"
-    )
-    return int(
-        connection.execute(
-            f"SELECT count(*)::BIGINT FROM glob({_sql_literal(pattern)})"
-        ).fetchone()[0]
+    return _artifact_count(
+        path, "_vane_distributed_mutation_attempts", ".manifest", recursive=True
     )
 
 
@@ -174,66 +181,6 @@ def _configure_s3(connection) -> dict[str, str]:
     return config
 
 
-def _execution_node_ids(ray) -> frozenset[str]:
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        node_ids = frozenset(
-            str(node["NodeID"])
-            for node in ray.nodes()
-            if node.get("Alive")
-            and float((node.get("Resources") or {}).get("CPU", 0)) >= 1
-        )
-        if len(node_ids) == WORKER_COUNT:
-            return node_ids
-        time.sleep(0.25)
-    raise AssertionError(f"expected {WORKER_COUNT} live Ray execution nodes")
-
-
-@pytest.fixture(scope="session")
-def ray_cluster():
-    import ray
-    from ray.cluster_utils import Cluster
-
-    if ray.is_initialized():
-        ray.shutdown()
-    environment = pytest.MonkeyPatch()
-    cluster = None
-    try:
-        environment.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-        cluster = Cluster(shutdown_at_exit=False)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=r"Tip: In future versions of Ray")
-            cluster.add_node(
-                include_dashboard=False,
-                num_cpus=0,
-                num_gpus=0,
-                object_store_memory=128 * 1024 * 1024,
-            )
-            for _ in range(WORKER_COUNT):
-                cluster.add_node(
-                    include_dashboard=False,
-                    num_cpus=1,
-                    num_gpus=0,
-                    object_store_memory=128 * 1024 * 1024,
-                )
-            ray.init(
-                address=cluster.address,
-                ignore_reinit_error=False,
-                log_to_driver=True,
-            )
-        yield _execution_node_ids(ray)
-    finally:
-        try:
-            vane.teardown_runner()
-        finally:
-            import ray
-
-            ray.shutdown()
-            if cluster is not None:
-                cluster.shutdown()
-            environment.undo()
-
-
 class DistributedWriteCapture:
     def __init__(self, runner) -> None:
         self.runner = runner
@@ -241,9 +188,15 @@ class DistributedWriteCapture:
         self.last_result: dict[str, object] | None = None
         self.original_run_write = runner.run_write
 
-        def record(*args: object, **kwargs: object) -> object:
+        def record(logical_plan: object) -> object:
+            assert isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan)
             self.dispatch_count += 1
-            result = self.original_run_write(*args, **kwargs)
+            self.last_result = None
+            try:
+                result = self.original_run_write(logical_plan)
+            except BaseException:
+                self.last_result = None
+                raise
             self.last_result = result
             return result
 
@@ -301,25 +254,12 @@ class DistributedWriteCapture:
 
 
 @pytest.fixture
-def write_capture(
-    ray_cluster: frozenset[str],
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-):
-    assert len(ray_cluster) == WORKER_COUNT
-    monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", str(WORKER_COUNT))
-    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", str(WORKER_COUNT))
-    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
-    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
-    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(tmp_path / "shuffle"))
-    vane.teardown_runner()
-    set_runner_ray(noop_if_initialized=True)
-    capture = DistributedWriteCapture(runners.get_or_create_runner())
+def write_capture(default_ray_runtime):
+    capture = DistributedWriteCapture(default_ray_runtime)
     try:
         yield capture
     finally:
         capture.close()
-        vane.teardown_runner()
 
 
 def _exercise_insert_and_ctas(
@@ -513,11 +453,9 @@ def _exercise_stale_target_type_rejection(
     target_path: Path,
 ) -> None:
     connection.execute("CREATE TABLE lance_write.main.stale_target (id INTEGER)")
-    assert connection.execute(
-        "SELECT data_type FROM duckdb_columns() "
-        "WHERE database_name = 'lance_write' AND schema_name = 'main' "
-        "AND table_name = 'stale_target' AND column_name = 'id'"
-    ).fetchone() == ("INTEGER",)
+    assert connection.execute("DESCRIBE lance_write.main.stale_target").fetchone()[
+        :2
+    ] == ("id", "INTEGER")
 
     evolution_connection = _connect()
     try:
@@ -528,10 +466,8 @@ def _exercise_stale_target_type_rejection(
             "ALTER TABLE lance_evolve.main.stale_target " "ALTER COLUMN id TYPE BIGINT"
         )
         assert evolution_connection.execute(
-            "SELECT data_type FROM duckdb_columns() "
-            "WHERE database_name = 'lance_evolve' AND schema_name = 'main' "
-            "AND table_name = 'stale_target' AND column_name = 'id'"
-        ).fetchone() == ("BIGINT",)
+            "DESCRIBE lance_evolve.main.stale_target"
+        ).fetchone()[:2] == ("id", "BIGINT")
 
         manifest_count = _manifest_count(evolution_connection, target_path)
         data_file_count = _data_file_count(evolution_connection, target_path)
@@ -564,12 +500,9 @@ def _exercise_not_null_target(
     connection.execute(
         f"ALTER TABLE {catalog}.main.required_target ALTER COLUMN id SET NOT NULL"
     )
-    assert connection.execute(
-        "SELECT is_nullable FROM duckdb_columns() "
-        f"WHERE database_name = {_sql_literal(catalog)} "
-        "AND schema_name = 'main' AND table_name = 'required_target' "
-        "AND column_name = 'id'"
-    ).fetchone() == (False,)
+    assert connection.execute(f"DESCRIBE {catalog}.main.required_target").fetchone()[
+        :3
+    ] == ("id", "INTEGER", "NO")
 
     source = connection.sql("SELECT i::INTEGER AS id FROM range(3) AS source(i)")
     capture.require_write(
@@ -679,10 +612,8 @@ def _exercise_update_and_delete(
     assert _manifest_count(connection, target_path) == 2
     assert _mutation_attempt_manifest_count(connection, target_path) == 0
     assert connection.execute(
-        f"SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-        "count(*) FILTER (WHERE value = 'updated')::BIGINT "
-        f"FROM {catalog}.main.mutation_target"
-    ).fetchone() == (80, 3160, 40)
+        f"SELECT id, value FROM {catalog}.main.mutation_target ORDER BY id"
+    ).fetchall() == [(i, "updated" if i < 40 else f"value-{i}") for i in range(80)]
 
     capture.require_write(
         "distributed Lance DELETE",
@@ -699,10 +630,8 @@ def _exercise_update_and_delete(
     assert _manifest_count(connection, target_path) == 3
     assert _mutation_attempt_manifest_count(connection, target_path) == 0
     assert connection.execute(
-        f"SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-        "count(*) FILTER (WHERE value = 'updated')::BIGINT "
-        f"FROM {catalog}.main.mutation_target"
-    ).fetchone() == (60, 1770, 40)
+        f"SELECT id, value FROM {catalog}.main.mutation_target ORDER BY id"
+    ).fetchall() == [(i, "updated" if i < 40 else f"value-{i}") for i in range(60)]
 
     for name, operation in (
         (
@@ -760,12 +689,12 @@ def test_two_worker_single_fragment_lance_update_and_delete(
     root.mkdir()
     target_path = root / "mutation_target.lance"
     try:
-        connection.execute(
-            "COPY (SELECT i::BIGINT AS id, "
-            "('value-' || i::VARCHAR)::VARCHAR AS value "
-            "FROM range(16) AS source(i)) "
-            f"TO {_sql_literal(target_path)} "
-            "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 64)"
+        write_fixture_query(
+            connection,
+            target_path,
+            f"SELECT i::BIGINT AS id, ('value-' || i::VARCHAR)::VARCHAR AS value FROM range(16) AS source(i)",
+            mode="create",
+            max_rows_per_file=64,
         )
         connection.execute(
             f"ATTACH {_sql_literal(root)} AS lance_single_mutation (TYPE LANCE)"
@@ -797,10 +726,10 @@ def test_two_worker_single_fragment_lance_update_and_delete(
             allow_empty_tasks=True,
         )
         assert connection.execute(
-            "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-            "list(id ORDER BY id) FILTER (WHERE value = 'single-updated') "
-            "FROM lance_single_mutation.main.mutation_target"
-        ).fetchone() == (13, 78, [0, 1, 2])
+            "SELECT id, value FROM lance_single_mutation.main.mutation_target ORDER BY id"
+        ).fetchall() == [
+            (i, "single-updated" if i < 3 else f"value-{i}") for i in range(13)
+        ]
         assert _manifest_count(connection, target_path) == 3
         assert _mutation_attempt_manifest_count(connection, target_path) == 0
     finally:
@@ -835,6 +764,9 @@ def test_distributed_lance_mutation_rejects_a_stale_bound_snapshot(
             nonlocal raced
             assert raced is False
             raced = True
+            monkeypatch.setattr(
+                RayQueryDriverClient, "run_copy_plan", original_run_copy_plan
+            )
             evolution_connection.execute(
                 "INSERT INTO lance_evolve.main.mutation_target "
                 "VALUES (1000, 'concurrent')"
@@ -856,15 +788,13 @@ def test_distributed_lance_mutation_rejects_a_stale_bound_snapshot(
                 condition=vane.col("id") < 40,
             )
         assert raced is True
-        assert write_capture.dispatch_count == previous_dispatch_count + 1
+        assert write_capture.dispatch_count == previous_dispatch_count + 2
         assert write_capture.last_result is None
         assert _manifest_count(evolution_connection, target_path) == 2
         assert _mutation_attempt_manifest_count(evolution_connection, target_path) == 0
         assert evolution_connection.execute(
-            "SELECT count(*)::BIGINT, "
-            "count(*) FILTER (WHERE value = 'stale-update')::BIGINT "
-            "FROM lance_evolve.main.mutation_target"
-        ).fetchone() == (81, 0)
+            "SELECT id, value FROM lance_evolve.main.mutation_target ORDER BY id"
+        ).fetchall() == [(i, f"value-{i}") for i in range(80)] + [(1000, "concurrent")]
     finally:
         evolution_connection.close()
         connection.close()
@@ -908,10 +838,8 @@ def test_failed_distributed_lance_update_keeps_the_target_unchanged(
         )
         assert _mutation_attempt_manifest_count(connection, target_path) == 0
         assert connection.execute(
-            "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-            "count(*) FILTER (WHERE value IS NULL)::BIGINT "
-            "FROM lance_mutation.main.mutation_target"
-        ).fetchone() == (80, 3160, 0)
+            "SELECT id, value FROM lance_mutation.main.mutation_target ORDER BY id"
+        ).fetchall() == [(i, f"value-{i}") for i in range(80)]
     finally:
         connection.close()
 

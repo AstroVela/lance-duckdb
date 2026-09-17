@@ -1,5 +1,5 @@
 # Preparation pin only: select a reviewed, published non-dev Vane release before
-# dispatching operation=release. The development manifest remains on dev612.
+# dispatching operation=release. Keep the development manifest pinned separately.
 schema_version = 2
 name = "lance"
 extension_config = "extension_config_vane.cmake"
@@ -8,7 +8,7 @@ native_test_selection = "test/sql/dual_build_smoke.test"
 
 [vane]
 repository = "AstroVela/vane"
-revision = "033b549afcb498633fd6669b26c054c00363004e"
+revision = "4e12994a2fed5b872a7bdb44df72c1b9c5653cdc"
 
 [vcpkg]
 repository = "microsoft/vcpkg"

@@ -589,7 +589,7 @@ jobs:
           if-no-files-found: error
 
   vane-single-test:
-    name: Vane single-node scan and native writes
+    name: Vane default Ray scan and writes
     needs: [rust-quality, python-quality, vane-native-build, vane-wheel-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -625,9 +625,11 @@ jobs:
           "${RUNNER_TEMP}/vane-lance-single/bin/python" -m pip install \
             "${wheels[0]}" \
             "pytest>=8" \
+            "grpcio>=1.42.0" \
+            "pylance==9.0.1" \
             "ray==2.58.0"
 
-      - name: Run Vane single-node scan and native-write tests
+      - name: Run Vane default Ray scan and write tests
         shell: bash
         env:
           PYTHONSAFEPATH: "1"
@@ -651,7 +653,6 @@ jobs:
       LANCE_S3_BUCKET: lance-vane-test
       LANCE_TEST_S3: "1"
       RAY_DEDUP_LOGS: "0"
-      VANE_RUNNER: ray
     steps:
       - name: Checkout tests
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -684,6 +685,7 @@ jobs:
           "${RUNNER_TEMP}/vane-lance-distributed/bin/python" -m pip install \
             "${wheels[0]}" \
             "grpcio>=1.42.0" \
+            "pylance==9.0.1" \
             "pytest>=8" \
             "ray==2.58.0"
 
@@ -696,7 +698,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio@sha256:03a0bdbcefdac884210e9a5881085fb9b1c555e292a83987e5e110368f78ab96 \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
 
       - name: Wait for MinIO and create the test bucket
@@ -714,15 +716,11 @@ jobs:
             fi
             sleep 1
           done
-          curl --retry 5 --retry-delay 1 --retry-all-errors -fsSL \
-            "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-01-17T23-25-50Z" \
-            -o "${RUNNER_TEMP}/mc"
-          mc_sha256="2da8a55896bccb7cb5a29a7f907455c3b1a83eb9f51b10e4b4fbc9bff206e43d"
-          echo "${mc_sha256}  ${RUNNER_TEMP}/mc" | sha256sum --check -
-          chmod +x "${RUNNER_TEMP}/mc"
-          "${RUNNER_TEMP}/mc" alias set local "${AWS_ENDPOINT_URL}" \
-            "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}"
-          "${RUNNER_TEMP}/mc" mb --ignore-existing "local/${LANCE_S3_BUCKET}"
+          docker run --rm \
+            --network container:lance-vane-minio \
+            --env "MC_HOST_local=http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
+            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            mb --ignore-existing "local/${LANCE_S3_BUCKET}"
 
       - name: Run distributed scan contracts
         shell: bash
@@ -755,7 +753,6 @@ jobs:
       LANCE_S3_BUCKET: lance-vane-write-test
       LANCE_TEST_S3: "1"
       RAY_DEDUP_LOGS: "0"
-      VANE_RUNNER: ray
     steps:
       - name: Checkout tests
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -788,7 +785,7 @@ jobs:
           "${RUNNER_TEMP}/vane-lance-distributed-write/bin/python" -m pip install \
             "${wheels[0]}" \
             "grpcio>=1.42.0" \
-            "pylance==1.0.0" \
+            "pylance==9.0.1" \
             "pytest>=8" \
             "ray==2.58.0"
 
@@ -801,7 +798,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio@sha256:03a0bdbcefdac884210e9a5881085fb9b1c555e292a83987e5e110368f78ab96 \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
 
       - name: Wait for MinIO and create the test bucket
@@ -819,15 +816,11 @@ jobs:
             fi
             sleep 1
           done
-          curl --retry 5 --retry-delay 1 --retry-all-errors -fsSL \
-            "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-01-17T23-25-50Z" \
-            -o "${RUNNER_TEMP}/mc"
-          mc_sha256="2da8a55896bccb7cb5a29a7f907455c3b1a83eb9f51b10e4b4fbc9bff206e43d"
-          echo "${mc_sha256}  ${RUNNER_TEMP}/mc" | sha256sum --check -
-          chmod +x "${RUNNER_TEMP}/mc"
-          "${RUNNER_TEMP}/mc" alias set local "${AWS_ENDPOINT_URL}" \
-            "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}"
-          "${RUNNER_TEMP}/mc" mb --ignore-existing "local/${LANCE_S3_BUCKET}"
+          docker run --rm \
+            --network container:lance-vane-write-minio \
+            --env "MC_HOST_local=http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
+            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            mb --ignore-existing "local/${LANCE_S3_BUCKET}"
 
       - name: Run distributed write and mutation contracts
         shell: bash
@@ -1052,9 +1045,9 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  vane-dynamic-provider-local-test:
+  vane-dynamic-provider-smoke-test:
     if: inputs.operation != 'testpypi-dev'
-    name: Vane dynamic Lance local integration
+    name: Vane dynamic Lance default Ray smoke integration
     needs: [python-quality, vane-dynamic-provider-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -1062,7 +1055,6 @@ jobs:
       contents: read
     env:
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
-      VANE_RUNNER: local-fast
 
     steps:
       - name: Checkout tests
@@ -1083,18 +1075,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Exercise provider-backed Lance locally
+      - name: Exercise provider-backed Lance with default Ray
         shell: bash
         run: |
           set -euo pipefail
-          python -m venv .venv-provider-local
-          . .venv-provider-local/bin/activate
+          python -m venv .venv-provider-smoke
+          . .venv-provider-smoke/bin/activate
           mapfile -t wheels < <(find wheels -maxdepth 1 -type f -name '*.whl' -print | sort)
           test "${#wheels[@]}" -eq 2
-          python -m pip install "${wheels[@]}" pytest
+          python -m pip install "${wheels[@]}" "grpcio>=1.42.0" "pylance==9.0.1" pytest
           python -m pip check
           python -m pytest -q \
-            python/tests/test_vane_single_scan.py::test_single_node_lance_scan
+            python/tests/test_vane_single_scan.py
 
   vane-dynamic-provider-ray-test:
     if: inputs.operation != 'testpypi-dev'
@@ -1107,7 +1099,6 @@ jobs:
     env:
       RAY_DEDUP_LOGS: "0"
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
-      VANE_RUNNER: ray
 
     steps:
       - name: Checkout tests
@@ -1136,7 +1127,7 @@ jobs:
           . .venv-provider-ray/bin/activate
           mapfile -t wheels < <(find wheels -maxdepth 1 -type f -name '*.whl' -print | sort)
           test "${#wheels[@]}" -eq 2
-          python -m pip install "${wheels[@]}" "grpcio>=1.42.0" pytest
+          python -m pip install "${wheels[@]}" "grpcio>=1.42.0" "pylance==9.0.1" pytest
           python -m pip check
           python -m pytest -q \
             python/tests/test_vane_distributed_scan.py::test_fragment_scan_uses_both_ray_execution_nodes
@@ -1835,8 +1826,8 @@ jobs:
             --directory dist --index testpypi \
             --version "${{ needs.assemble-testpypi-lance.outputs.lance_version }}"
 
-  testpypi-local-lance-integration:
-    name: TestPyPI local Lance integration
+  testpypi-smoke-lance-integration:
+    name: TestPyPI default Ray Lance smoke
     needs: [assemble-testpypi-lance, verify-testpypi-lance]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1846,7 +1837,6 @@ jobs:
       INDEX_URL: https://test.pypi.org/simple/
       VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
-      VANE_RUNNER: local-fast
 
     steps:
       - name: Checkout extension tests
@@ -1875,8 +1865,8 @@ jobs:
           VANE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.vane_version }}
         run: |
           set -euo pipefail
-          python -m venv .venv-vane-testpypi-local
-          . .venv-vane-testpypi-local/bin/activate
+          python -m venv .venv-vane-testpypi-smoke
+          . .venv-vane-testpypi-smoke/bin/activate
           unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS
           export PIP_CONFIG_FILE=/dev/null
           python -m pip install --upgrade pip
@@ -1909,13 +1899,13 @@ jobs:
           test "${#lance_wheels[@]}" -eq 1
           test "${#expected_lance[@]}" -eq 1
           cmp "${expected_lance[0]}" "${lance_wheels[0]}"
-          python -m pip install "${base_wheels[0]}" "${lance_wheels[0]}" pytest
+          python -m pip install "${base_wheels[0]}" "${lance_wheels[0]}" "grpcio>=1.42.0" "pylance==9.0.1" pytest
           python -m pip check
 
-      - name: Exercise the indexed provider locally
+      - name: Exercise the indexed provider with default Ray
         run: |
-          .venv-vane-testpypi-local/bin/python -m pytest -q \
-            python/tests/test_vane_single_scan.py::test_single_node_lance_scan
+          .venv-vane-testpypi-smoke/bin/python -m pytest -q \
+            python/tests/test_vane_single_scan.py
 
   testpypi-ray-lance-integration:
     name: TestPyPI two-worker Ray Lance integration
@@ -1929,7 +1919,6 @@ jobs:
       VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       RAY_DEDUP_LOGS: "0"
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
-      VANE_RUNNER: ray
 
     steps:
       - name: Checkout extension tests
@@ -1996,6 +1985,7 @@ jobs:
             "${base_wheels[0]}" \
             "${lance_wheels[0]}" \
             "grpcio>=1.42.0" \
+            "pylance==9.0.1" \
             pytest
           python -m pip check
 
@@ -2009,7 +1999,7 @@ jobs:
     name: Approve and verify the immutable Lance promotion without OIDC
     needs:
       - assemble-testpypi-lance
-      - testpypi-local-lance-integration
+      - testpypi-smoke-lance-integration
       - testpypi-ray-lance-integration
     runs-on: ubuntu-24.04
     timeout-minutes: 20

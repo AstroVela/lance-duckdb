@@ -7,9 +7,13 @@ import json
 import os
 from pathlib import Path
 
+import pytest
 import vane
 
+from lance_fixture import write_fixture_query
 from packaged_dynamic_extension import load_packaged_dynamic_lance
+
+pytestmark = pytest.mark.usefixtures("default_ray_runtime")
 
 
 def _sql_literal(value: str | Path) -> str:
@@ -59,7 +63,7 @@ def _lance_scan_info(plan: object) -> dict:
     return matches[0]
 
 
-def test_static_wheel_owns_the_vane_lance_artifact() -> None:
+def test_wheel_owns_the_vane_lance_artifact() -> None:
     from vane import _native
 
     assert "site-packages" in Path(_native.__file__).resolve().parts
@@ -70,21 +74,39 @@ def test_static_wheel_owns_the_vane_lance_artifact() -> None:
             "WHERE lower(extension_name) = 'lance'"
         ).fetchone()
         assert loaded is True
-        assert str(install_mode).upper() == "STATICALLY_LINKED"
+        assert str(install_mode).upper() == (
+            "NOT_INSTALLED"
+            if os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY")
+            else "STATICALLY_LINKED"
+        )
     finally:
         connection.close()
 
 
-def test_single_node_lance_scan(tmp_path: Path) -> None:
+def test_ray_copy_rejects_an_unimplemented_receipt_contract(tmp_path: Path) -> None:
     connection = _connect()
-    path = tmp_path / "single-node.lance"
+    path = tmp_path / "unsupported-copy.lance"
     try:
-        connection.execute(
-            "COPY (SELECT i::BIGINT AS id, "
-            "('value-' || i::VARCHAR)::VARCHAR AS value "
-            "FROM range(12) AS source(i)) "
-            f"TO {_sql_literal(path)} "
-            "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 3)"
+        with pytest.raises(Exception, match="copy_to_get_written_statistics"):
+            connection.execute(
+                f"COPY (SELECT 1::BIGINT AS id) TO {_sql_literal(path)} "
+                "(FORMAT LANCE, MODE 'create')"
+            )
+        assert not path.exists()
+    finally:
+        connection.close()
+
+
+def test_default_ray_lance_scan(tmp_path: Path) -> None:
+    connection = _connect()
+    path = tmp_path / "default-ray.lance"
+    try:
+        write_fixture_query(
+            connection,
+            path,
+            f"SELECT i::BIGINT AS id, ('value-' || i::VARCHAR)::VARCHAR AS value FROM range(12) AS source(i)",
+            mode="create",
+            max_rows_per_file=3,
         )
         rows = connection.execute(
             "SELECT id, value "
@@ -97,13 +119,11 @@ def test_single_node_lance_scan(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_single_node_lance_writes_and_mutations_keep_native_execution(
+def test_default_ray_lance_writes_and_mutations(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _connect()
-    root = tmp_path / "single-node-write"
+    root = tmp_path / "default-ray-write"
     root.mkdir()
     try:
         connection.execute(f"ATTACH {_sql_literal(root)} AS lance_write (TYPE LANCE)")
@@ -119,7 +139,7 @@ def test_single_node_lance_writes_and_mutations_keep_native_execution(
         source.insert_into("lance_write.main.insert_target")
         source.create("lance_write.main.ctas_target")
         connection.table("lance_write.main.insert_target").update(
-            {"value": vane.lit("native-update")},
+            {"value": vane.lit("ray-update")},
             condition=vane.col("id") < 4,
         )
         connection.table("lance_write.main.insert_target").delete(
@@ -127,14 +147,13 @@ def test_single_node_lance_writes_and_mutations_keep_native_execution(
         )
 
         assert connection.execute(
-            "SELECT count(*)::BIGINT, sum(id)::BIGINT, "
-            "count(*) FILTER (WHERE value = 'native-update')::BIGINT "
-            "FROM lance_write.main.insert_target"
-        ).fetchone() == (10, 45, 4)
+            "SELECT id, value FROM lance_write.main.insert_target ORDER BY id"
+        ).fetchall() == [
+            (i, "ray-update" if i < 4 else f"value-{i}") for i in range(10)
+        ]
         assert connection.execute(
-            "SELECT count(*)::BIGINT, sum(id)::BIGINT "
-            "FROM lance_write.main.ctas_target"
-        ).fetchone() == (12, 66)
+            "SELECT id, value FROM lance_write.main.ctas_target ORDER BY id"
+        ).fetchall() == [(i, f"value-{i}") for i in range(12)]
     finally:
         connection.close()
 
@@ -144,9 +163,12 @@ def test_vane_rowid_in_uses_sql_membership_semantics(tmp_path: Path) -> None:
     path = tmp_path / "rowid-membership.lance"
     path_sql = _sql_literal(path)
     try:
-        connection.execute(
-            "COPY (SELECT i::BIGINT AS id FROM range(12) AS source(i)) "
-            f"TO {path_sql} (FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 3)"
+        write_fixture_query(
+            connection,
+            path,
+            f"SELECT i::BIGINT AS id FROM range(12) AS source(i)",
+            mode="create",
+            max_rows_per_file=3,
         )
         row_ids_by_id = dict(
             connection.execute(
@@ -190,9 +212,12 @@ def test_vane_keeps_global_pushdowns_outside_lance(tmp_path: Path) -> None:
     path = tmp_path / "pushdown-boundaries.lance"
     path_sql = _sql_literal(path)
     try:
-        connection.execute(
-            "COPY (SELECT i::BIGINT AS id FROM range(20) AS source(i)) "
-            f"TO {path_sql} (FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 4)"
+        write_fixture_query(
+            connection,
+            path,
+            f"SELECT i::BIGINT AS id FROM range(20) AS source(i)",
+            mode="create",
+            max_rows_per_file=4,
         )
 
         aggregate_plan = _explain_json(

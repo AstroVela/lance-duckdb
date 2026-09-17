@@ -24,9 +24,16 @@ from pathlib import Path
 import pytest
 import vane
 from vane import runners
-from vane.runners.ray import set_runner_ray
 
+from lance_fixture import (
+    append_fixture_index,
+    cleanup_fixture_versions,
+    create_fixture_index,
+    write_fixture_query,
+)
 from packaged_dynamic_extension import load_packaged_dynamic_lance
+
+pytestmark = pytest.mark.usefixtures("default_ray_runtime")
 
 WORKER_COUNT = 2
 VECTOR_CANDIDATE_DIMENSION = 256
@@ -843,7 +850,6 @@ import vane
 from ray.cluster_utils import Cluster
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from vane import runners
-from vane.runners.ray import set_runner_ray
 
 
 def sql_literal(value):
@@ -1016,7 +1022,10 @@ try:
             "autoload_known_extensions": "false",
         },
     )
-    connection.execute("LOAD lance")
+    if os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"):
+        vane.load_installed_extension("lance", connection=connection)
+    else:
+        connection.execute("LOAD lance")
     connection.execute("LOAD httpfs")
 
     if mode == "connection":
@@ -1096,19 +1105,28 @@ try:
         # Materialize the lazy table entry while the secret exists. A later
         # bind must retain coordinator-only provenance even after the secret is
         # removed from the live secret manager.
-        assert connection.execute(
+        secret_namespace_relation = connection.sql(
             "SELECT id FROM secret_ns.main.items ORDER BY id"
-        ).fetchall() == [(row_id,) for row_id in range(12)]
+        )
+        try:
+            secret_namespace_relation.fetchall()
+        except Exception as error:
+            message = str(error)
+            assert "coordinator-only TYPE LANCE secret" in message
+            assert all(value not in message for value in sensitive_values)
+        else:
+            raise AssertionError("Ray accepted a coordinator-only namespace secret")
 
         # Vane captures every visible ATTACH, even when the transported plan
         # does not reference that catalog. Replaying a secret-backed namespace
         # must therefore use a credential-free placeholder: the TYPE LANCE
         # secret is coordinator-only and is intentionally not serialized.
         local_path = os.path.abspath("unrelated-to-secret-namespace.lance")
-        connection.execute(
-            "COPY (SELECT i::BIGINT AS id FROM range(12) AS source(i)) "
-            f"TO {sql_literal(local_path)} "
-            "(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE 3)"
+        import lance
+        import pyarrow as pa
+        lance.write_dataset(
+            pa.table({"id": pa.array(range(12), type=pa.int64())}),
+            local_path, mode="create", max_rows_per_file=3,
         )
         unrelated_relation = connection.sql(f"SELECT id FROM {sql_literal(local_path)}")
         unrelated_logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -1138,7 +1156,10 @@ try:
         )
         unrelated_physical = None
         try:
-            planning_connection.execute("LOAD lance")
+            if os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"):
+                vane.load_installed_extension("lance", connection=planning_connection)
+            else:
+                planning_connection.execute("LOAD lance")
             restored_unrelated = pickle.loads(serialized_unrelated)
             unrelated_physical = restored_unrelated.to_physical_plan(
                 planning_connection
@@ -1182,7 +1203,7 @@ try:
                 assert sensitive not in message
         else:
             raise AssertionError("missing S3 credentials unexpectedly opened the dataset")
-    else:
+    elif mode != "secret":
         assert connection.execute(
             f"SELECT id FROM {sql_literal(path)} ORDER BY id"
         ).fetchall() == [(row_id,) for row_id in range(12)]
@@ -1253,14 +1274,10 @@ try:
         assert all(value not in repr(logical) for value in sensitive_values)
 
     if mode != "secret":
-        set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
         baseline_task_ids = set(settled_fte_create_task_locations())
-        rows = sorted(
-            tuple(row.values())
-            for table in runner.run_iter_tables(relation)
-            for row in table.to_pylist()
-        )
+        assert runner.name == "ray"
+        rows = sorted(relation.fetchall())
         assert rows == [(row_id,) for row_id in range(12)]
         assert new_fte_create_task_node_ids(
             baseline_task_ids, expected_count=2
@@ -1273,11 +1290,7 @@ try:
             namespace_relation = connection.sql(
                 "SELECT id FROM credential_ns.main.items ORDER BY id"
             )
-            namespace_rows = [
-                tuple(row.values())
-                for table in runner.run_iter_tables(namespace_relation)
-                for row in table.to_pylist()
-            ]
+            namespace_rows = namespace_relation.fetchall()
             assert namespace_rows == [(row_id,) for row_id in range(12)]
 
             search_source = sql_literal("credential_ns.main.search_items")
@@ -1304,10 +1317,8 @@ try:
                     "ORDER BY _hybrid_score DESC, id",
                 ),
             )
-            namespace_search_results = {
-                name: connection.execute(sql).fetchall()
-                for name, sql in namespace_searches
-            }
+            for name, sql in namespace_searches:
+                assert connection.execute(sql).fetchall(), name
 
             # The attached catalog entry keeps using its already-opened
             # coordinator dataset after the session changes, but replaying its
@@ -1321,12 +1332,17 @@ try:
                 "SET s3_secret_access_key = 'changed-session-secret-key'"
             )
             connection.execute("SET s3_endpoint = 'drift.invalid:1'")
-            assert connection.execute(
-                "SELECT id FROM credential_ns.main.items ORDER BY id"
-            ).fetchall() == [(row_id,) for row_id in range(12)]
             drifted_relation = connection.sql(
                 "SELECT id FROM credential_ns.main.items ORDER BY id"
             )
+            try:
+                drifted_relation.fetchall()
+            except Exception as error:
+                message = str(error)
+                assert "query session storage settings to match" in message
+                assert all(value not in message for value in sensitive_values)
+            else:
+                raise AssertionError("Ray accepted changed namespace storage settings")
             try:
                 drifted_logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
                     drifted_relation, "lance-s3-namespace-session-drift"
@@ -1342,10 +1358,18 @@ try:
                     "settings produced a distributed plan"
                 )
             for name, sql in namespace_searches:
-                assert connection.execute(sql).fetchall() == namespace_search_results[
-                    name
-                ]
                 search_relation = connection.sql(sql)
+                try:
+                    search_relation.fetchall()
+                except Exception as error:
+                    message = str(error)
+                    # Ray restores ATTACH before global-search split planning.
+                    # The changed endpoint must fail that replay, with details
+                    # redacted; direct planning below checks Lance's drift rule.
+                    assert "Connection snapshot query failed (IO)" in message
+                    assert all(value not in message for value in sensitive_values)
+                else:
+                    raise AssertionError(f"Ray accepted changed {name} storage settings")
                 try:
                     search_logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
                         search_relation,
@@ -1415,11 +1439,12 @@ def _write_dataset(
     rows: int = 12,
     max_rows_per_file: int = 3,
 ) -> None:
-    connection.execute(
-        "COPY (SELECT i::BIGINT AS id, "
-        "('value-' || i::VARCHAR)::VARCHAR AS value "
-        f"FROM range({rows}) AS source(i)) TO {_sql_literal(path)} "
-        f"(FORMAT LANCE, MODE 'create', MAX_ROWS_PER_FILE {max_rows_per_file})"
+    write_fixture_query(
+        connection,
+        path,
+        f"SELECT i::BIGINT AS id, ('value-' || i::VARCHAR)::VARCHAR AS value FROM range({rows}) AS source(i)",
+        mode="create",
+        max_rows_per_file=max_rows_per_file,
     )
 
 
@@ -1437,18 +1462,19 @@ def _write_vector_candidate_dataset(
     connection.execute("SET arrow_output_version = '1.0'")
     connection.execute("SET arrow_large_buffer_size = true")
     try:
-        connection.execute(
-            "COPY (SELECT i::BIGINT AS id, (i % 3 = 1) AS keep, "
+        write_fixture_query(
+            connection,
+            path,
+            "SELECT i::BIGINT AS id, (i % 3 = 1) AS keep, "
             "('label-' || i::VARCHAR)::VARCHAR AS label, "
             "CASE WHEN i = 24 THEN NULL ELSE "
             "struct_pack(label := i::BIGINT, even := (i % 2 = 0)) END AS payload, "
             f"list_transform(range({VECTOR_CANDIDATE_DIMENSION}), x -> "
             "CASE WHEN x = 0 THEN (i % 8)::FLOAT ELSE 0.0::FLOAT END)"
             f"::FLOAT[{VECTOR_CANDIDATE_DIMENSION}] AS vec "
-            f"FROM range({start}, {start + rows}) AS source(i)) "
-            f"TO {_sql_literal(path)} "
-            f"(FORMAT LANCE, MODE '{mode}', "
-            f"MAX_ROWS_PER_FILE {VECTOR_CANDIDATE_ROWS_PER_FRAGMENT})"
+            f"FROM range({start}, {start + rows}) AS source(i)",
+            mode=mode,
+            max_rows_per_file=VECTOR_CANDIDATE_ROWS_PER_FRAGMENT,
         )
     finally:
         connection.execute("SET arrow_large_buffer_size = false")
@@ -1476,15 +1502,15 @@ def _write_fts_candidate_dataset(
     connection.execute("SET arrow_output_version = '1.0'")
     connection.execute("SET arrow_large_buffer_size = true")
     try:
-        connection.execute(
-            "COPY (SELECT i::BIGINT AS id, "
-            f'{text} AS "text", '
+        write_fixture_query(
+            connection,
+            path,
+            f'SELECT i::BIGINT AS id, {text} AS "text", '
             "('label-' || i::VARCHAR)::VARCHAR AS label, "
-            "[(i % 4)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT]"
-            "::FLOAT[4] AS vec "
-            f"FROM range({start}, {start + rows}) AS source(i)) "
-            f"TO {_sql_literal(path)} "
-            f"(FORMAT LANCE, MODE '{mode}', MAX_ROWS_PER_FILE 2048)"
+            "[(i % 4)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT]::FLOAT[4] AS vec "
+            f"FROM range({start}, {start + rows}) AS source(i)",
+            mode=mode,
+            max_rows_per_file=2048,
         )
     finally:
         connection.execute("SET arrow_large_buffer_size = false")
@@ -1516,6 +1542,7 @@ def _physical_plan(connection, relation):
 class _WorkerTaskCaptureBackend:
     def __init__(self) -> None:
         self.tasks: list[object] = []
+        self.production_finished_queries: list[str] = []
 
     def register_query_owner(self, _query_id: str, _owner_query_id: str) -> None:
         return None
@@ -1538,6 +1565,9 @@ class _WorkerTaskCaptureBackend:
         self, _query_id: str, _source_node_ids
     ) -> list[object]:
         return []
+
+    def task_production_finished(self, query_id: str) -> None:
+        self.production_finished_queries.append(query_id)
 
     def materialization_barrier_completed(self, _query_id: str, _node_id: str) -> None:
         return None
@@ -1636,6 +1666,7 @@ def _capture_worker_tasks(physical, connection):
         stream = runner.run_plan(physical, connection)
         asyncio.run(_drain_native_result_stream_async(stream))
         assert backend.tasks
+        assert backend.production_finished_queries == [str(physical.idx())]
         yield backend.tasks
     finally:
         try:
@@ -2013,11 +2044,8 @@ def _clear_manifest_deletion_counts(path: Path) -> None:
 
 
 def _run(runner, relation) -> list[tuple[object, ...]]:
-    return [
-        tuple(row.values())
-        for table in runner.run_iter_tables(relation)
-        for row in table.to_pylist()
-    ]
+    assert runner.name == "ray"
+    return relation.fetchall()
 
 
 def _run_serialized_logical(runner, serialized: bytes) -> list[tuple[object, ...]]:
@@ -2133,67 +2161,15 @@ def _ray_fte_create_task_node_ids(
     return observed_node_ids
 
 
-@pytest.fixture(scope="session")
-def ray_cluster():
-    import ray
-    from ray.cluster_utils import Cluster
-
-    if ray.is_initialized():
-        ray.shutdown()
-    environment = pytest.MonkeyPatch()
-    cluster = None
-    try:
-        environment.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-        environment.setenv("RAY_task_events_report_interval_ms", "100")
-        cluster = Cluster(shutdown_at_exit=False)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=r"Tip: In future versions of Ray")
-            cluster.add_node(
-                include_dashboard=False,
-                num_cpus=0,
-                num_gpus=0,
-                object_store_memory=128 * 1024 * 1024,
-            )
-            for _ in range(WORKER_COUNT):
-                cluster.add_node(
-                    num_cpus=1,
-                    num_gpus=0,
-                    object_store_memory=128 * 1024 * 1024,
-                )
-            ray.init(
-                address=cluster.address,
-                ignore_reinit_error=True,
-                log_to_driver=True,
-            )
-        yield _execution_node_ids(ray)
-    finally:
-        try:
-            vane.teardown_runner()
-        finally:
-            ray.shutdown()
-            if cluster is not None:
-                cluster.shutdown()
-            environment.undo()
+@pytest.fixture
+def ray_runner(default_ray_runtime):
+    return default_ray_runtime
 
 
 @pytest.fixture
-def ray_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    assert len(ray_cluster) == WORKER_COUNT
-    monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "2")
-    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
-    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
-    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
-    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(tmp_path / "shuffle"))
-    vane.teardown_runner()
-    set_runner_ray(noop_if_initialized=True)
-    try:
-        yield runners.get_or_create_runner()
-    finally:
-        vane.teardown_runner()
-
-
-@pytest.fixture
-def ray_retry_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def ray_retry_runner(
+    default_ray_runtime, ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     assert len(ray_cluster) == WORKER_COUNT
     monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "2")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
@@ -2204,7 +2180,6 @@ def ray_retry_runner(ray_cluster, monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     monkeypatch.setenv("VANE_FTE_CONTROL_RPC_INITIAL_BACKOFF_S", "0")
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(tmp_path / "retry-shuffle"))
     vane.teardown_runner()
-    set_runner_ray(noop_if_initialized=True)
     try:
         yield runners.get_or_create_runner()
     finally:
@@ -2225,10 +2200,9 @@ def test_vane_session_cache_configuration_and_profile() -> None:
         connection.execute(
             f"SET GLOBAL lance_vane_metadata_cache_size_bytes = {metadata_capacity}"
         )
-        rows = connection.execute(
-            f"EXPLAIN ANALYZE SELECT count(*) FROM {_sql_literal(path)}"
-        ).fetchall()
-        profile = "\n".join(str(value) for row in rows for value in row)
+        connection.enable_profiling()
+        connection.execute(f"SELECT count(*) FROM {_sql_literal(path)}").fetchall()
+        profile = connection.get_profiling_information("query_tree")
         assert f"index_capacity_bytes={index_capacity}" in profile
         assert f"metadata_capacity_bytes={metadata_capacity}" in profile
         assert "index_hits=" in profile
@@ -2285,8 +2259,9 @@ def test_vane_session_cache_configuration_and_profile() -> None:
                 scan_split_batch={str(node_id): bytes(batches[0])},
             )
             assert result.completion_status == "ok"
-            rows = cursor.execute("EXPLAIN ANALYZE SELECT 1").fetchall()
-            profile = "\n".join(str(value) for row in rows for value in row)
+            cursor.enable_profiling()
+            cursor.execute("SELECT current_schema()").fetchall()
+            profile = cursor.get_profiling_information("query_tree")
             assert "Lance Vane Snapshot Cache: entries=0 hits=0 misses=0" in profile
         finally:
             result = None
@@ -2303,7 +2278,7 @@ def test_vane_session_cache_configuration_and_profile() -> None:
         connection.close()
 
 
-def test_vane_scan_and_search_share_database_session_cache() -> None:
+def test_ray_scan_and_search_share_client_planning_cache() -> None:
     path = (
         Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
     ).resolve()
@@ -2325,8 +2300,9 @@ def test_vane_scan_and_search_share_database_session_cache() -> None:
         session_ids: list[str] = []
         cache_stats: list[dict[str, int]] = []
         for cursor, sql in zip(cursors, queries, strict=True):
-            rows = cursor.execute(f"EXPLAIN ANALYZE {sql}").fetchall()
-            profile = "\n".join(str(value) for row in rows for value in row)
+            cursor.enable_profiling()
+            cursor.execute(sql).fetchall()
+            profile = cursor.get_profiling_information("query_tree")
             marker = "shared_session_id="
             assert marker in profile
             session_ids.append(profile.split(marker, 1)[1].split()[0])
@@ -2342,6 +2318,7 @@ def test_vane_scan_and_search_share_database_session_cache() -> None:
                     )
                     if name
                     in {
+                        "index_entries",
                         "index_hits",
                         "index_misses",
                         "metadata_hits",
@@ -2354,7 +2331,9 @@ def test_vane_scan_and_search_share_database_session_cache() -> None:
             current["metadata_hits"] > previous["metadata_hits"]
             for previous, current in zip(cache_stats, cache_stats[1:])
         )
-        assert cache_stats[2]["index_misses"] > 0
+        # Binding preloads index metadata before Ray executes the query.
+        # Verify reuse of those entries; execution misses belong to workers.
+        assert cache_stats[2]["index_entries"] > 0
         assert cache_stats[3]["index_hits"] > cache_stats[2]["index_hits"]
     finally:
         for cursor in cursors[1:]:
@@ -2362,7 +2341,7 @@ def test_vane_scan_and_search_share_database_session_cache() -> None:
         connection.close()
 
 
-def test_global_search_overloads_match_native_and_emit_one_task(ray_runner) -> None:
+def test_global_search_overloads_match_sql_and_emit_one_task(ray_runner) -> None:
     path = (
         Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
     ).resolve()
@@ -2479,7 +2458,7 @@ def test_global_search_overloads_match_native_and_emit_one_task(ray_runner) -> N
         connection.close()
 
 
-def test_exact_vector_candidates_are_disjoint_deterministic_and_match_native(
+def test_exact_vector_candidates_are_disjoint_deterministic_and_match_final_search(
     tmp_path: Path, ray_cluster: frozenset[str], ray_runner
 ) -> None:
     import ray
@@ -2660,9 +2639,8 @@ def test_indexed_vector_candidates_use_disjoint_segments_and_uncovered_fragments
         # Exactly 2**20 distance values meets the existing scheduling threshold.
         # One full-coverage physical segment is still only one useful work unit.
         _write_vector_candidate_dataset(connection, path, rows=4096)
-        connection.execute(
-            f"CREATE INDEX vec_idx ON {path_sql} (vec) "
-            "USING IVF_FLAT WITH (num_partitions=4, metric_type='l2')"
+        create_fixture_index(
+            path, "vec_idx", "vec", "IVF_FLAT", num_partitions=4, metric="l2"
         )
         full_coverage_sql = (
             "SELECT id, label, _distance FROM lance_vector_search("
@@ -2676,6 +2654,10 @@ def test_indexed_vector_candidates_use_disjoint_segments_and_uncovered_fragments
         _write_vector_candidate_dataset(
             connection, path, start=4096, rows=512, mode="append"
         )
+        # SDK writes do not invalidate the extension's connection-local cache.
+        # Start the mutation from the newly committed fixture snapshot.
+        connection.close()
+        connection = _connect()
         connection.execute(
             f"ATTACH {_sql_literal(tmp_path)} AS indexed_vector_ns "
             "(TYPE LANCE, READ_ONLY false)"
@@ -2756,7 +2738,7 @@ def test_indexed_vector_candidates_use_disjoint_segments_and_uncovered_fragments
             expected = connection.execute(native_sql).fetchall()
             if name == "fewer-than-k":
                 assert 0 < len(expected) < 33
-            assert connection.execute(sql).fetchall() == expected, f"{name}-local"
+            assert connection.execute(sql).fetchall() == expected, f"{name}-sql"
             details = candidate_details(sql)
             assert len(details) == 2, name
             assert [detail[4] for detail in details].count("segment") == 1, name
@@ -2799,9 +2781,7 @@ def test_indexed_vector_candidates_use_disjoint_segments_and_uncovered_fragments
         # Lance's append optimizer creates a second physical segment for the
         # previously uncovered fragment. Both segment identities are now
         # independent candidate work, even with full index coverage.
-        connection.execute(
-            f"ALTER INDEX vec_idx ON {path_sql} OPTIMIZE WITH (mode = 'append')"
-        )
+        append_fixture_index(path, "vec_idx")
         # Reopen after maintenance so this assertion observes the newly
         # committed physical index topology instead of a pre-maintenance
         # dataset handle retained by the connection-local cache.
@@ -2829,6 +2809,8 @@ def test_indexed_vector_candidates_use_disjoint_segments_and_uncovered_fragments
         _write_vector_candidate_dataset(
             connection, path, start=4608, rows=512, mode="append"
         )
+        connection.close()
+        connection = _connect()
         mixed_sql = (
             "SELECT id, label, _distance FROM lance_vector_search("
             f"{path_sql}, 'vec', {query}, k = 17, nprobs = 4, "
@@ -2889,7 +2871,7 @@ def test_fts_candidates_use_disjoint_full_coverage_segments_and_global_bm25(
             mode="create",
             every_row_matches=False,
         )
-        connection.execute(f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED")
+        create_fixture_index(path, "text_idx", "text", "INVERTED")
         assert_final_search(search_sql, "one-full-coverage-segment")
 
         # Uncovered fragments are not safe independent FTS work because their
@@ -2902,11 +2884,11 @@ def test_fts_candidates_use_disjoint_full_coverage_segments_and_global_bm25(
             mode="append",
             every_row_matches=True,
         )
+        connection.close()
+        connection = _connect()
         assert_final_search(search_sql, "partial-coverage")
 
-        connection.execute(
-            f"ALTER INDEX text_idx ON {path_sql} OPTIMIZE WITH (mode = 'append')"
-        )
+        append_fixture_index(path, "text_idx")
         connection.close()
         connection = _connect()
 
@@ -2950,9 +2932,7 @@ def test_fts_candidates_use_disjoint_full_coverage_segments_and_global_bm25(
             mode="append",
             every_row_matches=True,
         )
-        connection.execute(
-            f"ALTER INDEX text_idx ON {path_sql} OPTIMIZE WITH (mode = 'append')"
-        )
+        append_fixture_index(path, "text_idx")
         connection.close()
         connection = _connect()
 
@@ -2982,8 +2962,7 @@ def test_fts_candidates_use_disjoint_full_coverage_segments_and_global_bm25(
         assert [row[0] for row in tie_group] == [4095, 5119, 5120]
         assert len({row[1] for row in tie_group}) == 1
 
-        # Local execution selects all three candidate assignments in one bind,
-        # exercising the same multi-segment leaf path a worker batch uses.
+        # SQL and Relation execution must agree on the global tie winner.
         assert connection.execute(tie_sql).fetchall() == [(4095,)]
 
         baseline_task_ids = set(_settled_ray_fte_create_task_locations())
@@ -3040,22 +3019,27 @@ def test_indexed_vector_candidates_preserve_metric_for_uncovered_fragments(
             path_sql = _sql_literal(path)
             # The indexed fragment alone reaches the distributed scheduling
             # threshold. The later fragment remains outside the index segment.
-            connection.execute(
-                f"COPY (SELECT i::BIGINT AS id, {covered} AS vec "
-                "FROM range(4096) AS source(i)) "
-                f"TO {path_sql} (FORMAT LANCE, MODE 'create', "
-                "MAX_ROWS_PER_FILE 4096)"
+            write_fixture_query(
+                connection,
+                path,
+                f"SELECT i::BIGINT AS id, {covered} AS vec FROM range(4096) AS source(i)",
+                mode="create",
+                max_rows_per_file=4096,
             )
-            connection.execute(
-                f"CREATE INDEX {metric}_vec_idx ON {path_sql} (vec) "
-                "USING IVF_FLAT WITH (num_partitions=1, "
-                f"metric_type='{metric}')"
+            create_fixture_index(
+                path,
+                f"{metric}_vec_idx",
+                "vec",
+                "IVF_FLAT",
+                num_partitions=1,
+                metric=metric,
             )
-            connection.execute(
-                f"COPY (SELECT i::BIGINT AS id, {uncovered} AS vec "
-                "FROM range(4096, 4608) AS source(i)) "
-                f"TO {path_sql} (FORMAT LANCE, MODE 'append', "
-                "MAX_ROWS_PER_FILE 512)"
+            write_fixture_query(
+                connection,
+                path,
+                f"SELECT i::BIGINT AS id, {uncovered} AS vec FROM range(4096, 4608) AS source(i)",
+                mode="append",
+                max_rows_per_file=512,
             )
 
             sql = (
@@ -3200,7 +3184,7 @@ def test_large_vector_searches_outside_candidate_boundaries_remain_final_search(
         connection.close()
 
 
-def test_global_search_computed_score_postfilters_match_native(ray_runner) -> None:
+def test_global_search_computed_score_postfilters_match_sql(ray_runner) -> None:
     path = (
         Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
     ).resolve()
@@ -3264,7 +3248,8 @@ def test_direct_fts_and_hybrid_reject_complex_prefilter_rewrite() -> None:
     connection = _connect()
     try:
         for name, sql in searches:
-            connection.execute(sql).fetchall()
+            with pytest.raises(Exception, match="complete filter pushdown"):
+                connection.execute(sql).fetchall()
             with pytest.raises(Exception, match="complete filter pushdown"):
                 relation = connection.sql(sql)
                 logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -3654,7 +3639,7 @@ def test_worker_rejects_invalid_and_foreign_search_task_assignments() -> None:
         connection.close()
 
 
-def test_indexed_partial_coverage_global_search_matches_native(
+def test_indexed_partial_coverage_global_search_matches_sql(
     tmp_path: Path, ray_runner
 ) -> None:
     source = (
@@ -3668,25 +3653,23 @@ def test_indexed_partial_coverage_global_search_matches_native(
         # Frozen metadata is query-owned and must not require enough capacity
         # in Lance's reusable bounded index cache.
         connection.execute("SET GLOBAL lance_vane_index_cache_size_bytes = 1")
-        connection.execute(
-            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
-            "(FORMAT LANCE, MODE 'create')"
+        write_fixture_query(
+            connection, path, f"SELECT * FROM {_sql_literal(source)}", mode="create"
         )
-        connection.execute(
-            f"CREATE INDEX vec_idx ON {path_sql} (vec) "
-            "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2')"
+        create_fixture_index(
+            path, "vec_idx", "vec", "IVF_FLAT", num_partitions=1, metric="l2"
         )
-        connection.execute(f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED")
-        connection.execute(
-            f"CREATE TEMP TABLE lance_search_append AS "
-            f"SELECT * FROM {path_sql} ORDER BY id LIMIT 2"
+        create_fixture_index(path, "text_idx", "text", "INVERTED")
+        write_fixture_query(
+            connection,
+            path,
+            f"SELECT id + 100 AS id, label, text || ' puppy' AS text, keywords, vec "
+            f"FROM (SELECT * FROM {path_sql} ORDER BY id LIMIT 2)",
+            mode="append",
         )
-        connection.execute(
-            "UPDATE lance_search_append SET id = id + 100, " "text = text || ' puppy'"
-        )
-        connection.execute(
-            f"COPY lance_search_append TO {path_sql} " "(FORMAT LANCE, MODE 'append')"
-        )
+        connection.close()
+        connection = _connect()
+        connection.execute("SET GLOBAL lance_vane_index_cache_size_bytes = 1")
 
         searches = (
             (
@@ -3770,9 +3753,8 @@ def test_global_search_keeps_snapshot_and_flat_index_plan_after_mutation(
         ]
     ] = []
     try:
-        connection.execute(
-            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
-            "(FORMAT LANCE, MODE 'create')"
+        write_fixture_query(
+            connection, path, f"SELECT * FROM {_sql_literal(source)}", mode="create"
         )
         for name, sql in searches:
             expected = connection.execute(sql).fetchall()
@@ -3795,20 +3777,16 @@ def test_global_search_keeps_snapshot_and_flat_index_plan_after_mutation(
 
         mutator = _connect()
         try:
-            mutator.execute(
-                "COPY (SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
-                "'puppy puppy puppy'::VARCHAR AS text, "
-                "'puppy'::VARCHAR AS keywords, "
-                "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec) "
-                f"TO {path_sql} (FORMAT LANCE, MODE 'append')"
+            write_fixture_query(
+                mutator,
+                path,
+                f"SELECT -1::BIGINT AS id, -1::INTEGER AS label, 'puppy puppy puppy'::VARCHAR AS text, 'puppy'::VARCHAR AS keywords, [0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec",
+                mode="append",
             )
-            mutator.execute(
-                f"CREATE INDEX vec_idx ON {path_sql} (vec) "
-                "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2')"
+            create_fixture_index(
+                path, "vec_idx", "vec", "IVF_FLAT", num_partitions=1, metric="l2"
             )
-            mutator.execute(
-                f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED"
-            )
+            create_fixture_index(path, "text_idx", "text", "INVERTED")
             latest_results = {
                 name: mutator.execute(sql).fetchall() for name, sql in searches
             }
@@ -3858,19 +3836,15 @@ def test_global_search_keeps_selected_index_segments_after_replacement(
         path_sql = _sql_literal(path)
         connection = _connect()
         try:
-            connection.execute(
-                f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
-                "(FORMAT LANCE, MODE 'create')"
+            write_fixture_query(
+                connection, path, f"SELECT * FROM {_sql_literal(source)}", mode="create"
             )
             if "vector" in branches:
-                connection.execute(
-                    f"CREATE INDEX vec_idx ON {path_sql} (vec) "
-                    "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2')"
+                create_fixture_index(
+                    path, "vec_idx", "vec", "IVF_FLAT", num_partitions=1, metric="l2"
                 )
             if "fts" in branches:
-                connection.execute(
-                    f"CREATE INDEX text_idx ON {path_sql} (text) USING INVERTED"
-                )
+                create_fixture_index(path, "text_idx", "text", "INVERTED")
 
             if kind == "vector":
                 sql = (
@@ -3910,16 +3884,17 @@ def test_global_search_keeps_selected_index_segments_after_replacement(
             old_index_ids = {entry.name for entry in (path / "_indices").iterdir()}
             assert len(old_index_ids) == len(branches)
             if "vector" in branches:
-                connection.execute(
-                    f"CREATE INDEX vec_idx ON {path_sql} (vec) "
-                    "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2', "
-                    "replace=true)"
+                create_fixture_index(
+                    path,
+                    "vec_idx",
+                    "vec",
+                    "IVF_FLAT",
+                    num_partitions=1,
+                    metric="l2",
+                    replace=True,
                 )
             if "fts" in branches:
-                connection.execute(
-                    f"CREATE INDEX text_idx ON {path_sql} (text) "
-                    "USING INVERTED WITH (replace=true)"
-                )
+                create_fixture_index(path, "text_idx", "text", "INVERTED", replace=True)
             current_index_ids = {entry.name for entry in (path / "_indices").iterdir()}
             assert old_index_ids < current_index_ids
             assert len(current_index_ids - old_index_ids) == len(branches)
@@ -3958,9 +3933,8 @@ def test_global_search_fails_when_the_frozen_snapshot_is_vacuumed(
 
     connection = _connect()
     try:
-        connection.execute(
-            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
-            "(FORMAT LANCE, MODE 'create')"
+        write_fixture_query(
+            connection, path, f"SELECT * FROM {_sql_literal(source)}", mode="create"
         )
         logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             connection.sql(sql), "lance-search-vacuumed-snapshot"
@@ -3976,19 +3950,14 @@ def test_global_search_fails_when_the_frozen_snapshot_is_vacuumed(
             == 1
         )
 
-        connection.execute(
-            "COPY (SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
-            "'puppy'::VARCHAR AS text, 'puppy'::VARCHAR AS keywords, "
-            "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec) "
-            f"TO {path_sql} (FORMAT LANCE, MODE 'append')"
+        write_fixture_query(
+            connection,
+            path,
+            f"SELECT -1::BIGINT AS id, -1::INTEGER AS label, 'puppy'::VARCHAR AS text, 'puppy'::VARCHAR AS keywords, [0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec",
+            mode="append",
         )
-        cleanup = connection.execute(
-            f"VACUUM LANCE {path_sql} WITH ("
-            "older_than_seconds = 0, delete_unverified = true, "
-            "error_if_tagged_old_versions = false, retain_n_versions = 1)"
-        ).fetchone()
-        assert cleanup[0] == "cleanup"
-        assert '"old_versions":1' in cleanup[2]
+        cleanup = cleanup_fixture_versions(path)
+        assert cleanup.old_versions == 1
 
         with pytest.raises(
             Exception,
@@ -4015,13 +3984,11 @@ def test_global_search_fails_when_a_selected_index_segment_is_removed(
 
     connection = _connect()
     try:
-        connection.execute(
-            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
-            "(FORMAT LANCE, MODE 'create')"
+        write_fixture_query(
+            connection, path, f"SELECT * FROM {_sql_literal(source)}", mode="create"
         )
-        connection.execute(
-            f"CREATE INDEX vec_idx ON {path_sql} (vec) "
-            "USING IVF_FLAT WITH (num_partitions=1, metric_type='l2')"
+        create_fixture_index(
+            path, "vec_idx", "vec", "IVF_FLAT", num_partitions=1, metric="l2"
         )
         logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             connection.sql(sql), "lance-search-missing-index"
@@ -4061,9 +4028,8 @@ def test_global_search_rejects_a_same_uri_dataset_recreation(
 
     connection = _connect()
     try:
-        connection.execute(
-            f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
-            "(FORMAT LANCE, MODE 'create')"
+        write_fixture_query(
+            connection, path, f"SELECT * FROM {_sql_literal(source)}", mode="create"
         )
         logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             connection.sql(sql), "lance-search-recreated-dataset"
@@ -4082,9 +4048,11 @@ def test_global_search_rejects_a_same_uri_dataset_recreation(
         shutil.rmtree(path)
         replacement = _connect()
         try:
-            replacement.execute(
-                f"COPY (SELECT * FROM {_sql_literal(source)}) TO {path_sql} "
-                "(FORMAT LANCE, MODE 'create')"
+            write_fixture_query(
+                replacement,
+                path,
+                f"SELECT * FROM {_sql_literal(source)}",
+                mode="create",
             )
         finally:
             replacement.close()
@@ -4273,11 +4241,11 @@ def test_standard_rest_resolution_stays_on_the_bound_snapshot(
 
             mutator = _connect()
             try:
-                mutator.execute(
-                    "COPY (SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
-                    "'puppy'::VARCHAR AS text, 'puppy'::VARCHAR AS keywords, "
-                    "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec) "
-                    f"TO {path_sql} (FORMAT LANCE, MODE 'append')"
+                write_fixture_query(
+                    mutator,
+                    path,
+                    f"SELECT -1::BIGINT AS id, -1::INTEGER AS label, 'puppy'::VARCHAR AS text, 'puppy'::VARCHAR AS keywords, [0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec",
+                    mode="append",
                 )
             finally:
                 mutator.close()
@@ -4323,7 +4291,7 @@ def test_fragment_scan_preserves_filter_projection_aggregate_and_global_limit(
         _write_dataset(connection, path)
 
         aggregate = connection.sql(
-            "SELECT id % 3 AS bucket, count(*) AS n, sum(id) AS total "
+            "SELECT id % 3 AS bucket, count(*) AS n, sum(id)::BIGINT AS total "
             f"FROM {_sql_literal(path)} WHERE id >= 2 AND id < 11 "
             "GROUP BY bucket ORDER BY bucket"
         )
@@ -4611,16 +4579,18 @@ def test_rest_namespace_named_secret_drop_and_recreate_is_recoverable(
                 f"API_KEY {_sql_literal(api_key)})"
             )
             connection.execute(create_secret)
-            secret_string = connection.execute(
-                "SELECT secret_string FROM duckdb_secrets() "
-                "WHERE name = 'rest_namespace_auth'"
-            ).fetchone()[0]
-            assert "token=redacted" in secret_string
-            assert "bearer_token=redacted" in secret_string
-            assert "api_key=redacted" in secret_string
-            assert token_alias not in secret_string
-            assert token not in secret_string
-            assert api_key not in secret_string
+            # Secret introspection is not declared client metadata in Vane.
+            # The default runner rejects it without exposing secret values.
+            with pytest.raises(
+                Exception, match="client-context table function"
+            ) as error:
+                connection.execute(
+                    "SELECT secret_string FROM duckdb_secrets() "
+                    "WHERE name = 'rest_namespace_auth'"
+                ).fetchall()
+            assert token_alias not in str(error.value)
+            assert token not in str(error.value)
+            assert api_key not in str(error.value)
             connection.execute(
                 "ATTACH 'safe-namespace-id' AS rest_secret_ns (TYPE LANCE, "
                 f"ENDPOINT {_sql_literal(endpoint)})"
@@ -4765,9 +4735,12 @@ def test_unsafe_directory_namespace_uri_is_not_serialized(
             "single_slash_query_ns",
             "single_slash_fragment_ns",
         ):
-            assert source_connection.execute(
-                f"SELECT count(*) FROM {catalog_name}.main.items"
-            ).fetchone() == (12,)
+            with pytest.raises(Exception, match="replayable") as error:
+                source_connection.execute(
+                    f"SELECT count(*) FROM {catalog_name}.main.items"
+                ).fetchone()
+            for sensitive in (query_secret, fragment_secret, user, password):
+                assert sensitive not in str(error.value)
             explain_text = "\n".join(
                 str(value)
                 for row in source_connection.execute(
@@ -4782,24 +4755,6 @@ def test_unsafe_directory_namespace_uri_is_not_serialized(
                 password,
             ):
                 assert sensitive not in explain_text
-
-            # EXPLAIN ANALYZE includes the user's original SQL text. Refer to
-            # the table by its safe catalog name so this specifically verifies
-            # that runtime operator diagnostics do not expose the backing URI.
-            analyzed_text = "\n".join(
-                str(value)
-                for row in source_connection.execute(
-                    f"EXPLAIN ANALYZE SELECT sum(id) " f"FROM {catalog_name}.main.items"
-                ).fetchall()
-                for value in row
-            )
-            for sensitive in (
-                query_secret,
-                fragment_secret,
-                user,
-                password,
-            ):
-                assert sensitive not in analyzed_text
 
             for search_sql in (
                 "SELECT * FROM lance_fts("
@@ -4934,9 +4889,11 @@ def test_single_slash_uri_replay_and_diagnostics_are_private(
                 str(tmp_path / f"literal-private-{index}.lance") + delimiter + secret
             )
             _write_dataset(connection, literal_path)
-            assert connection.execute(
-                f"SELECT count(*) FROM {_sql_literal(literal_path)}"
-            ).fetchone() == (12,)
+            with pytest.raises(Exception, match="replayable") as error:
+                connection.execute(
+                    f"SELECT count(*) FROM {_sql_literal(literal_path)}"
+                ).fetchone()
+            assert secret not in str(error.value)
             explain_text = "\n".join(
                 str(value)
                 for row in connection.execute(
@@ -4962,9 +4919,11 @@ def test_single_slash_uri_replay_and_diagnostics_are_private(
             (f"/#{trailing_fragment_secret}", trailing_fragment_secret),
         ):
             unsafe_uri = safe_uri + suffix
-            assert connection.execute(
-                f"SELECT count(*) FROM {_sql_literal(unsafe_uri)}"
-            ).fetchone() == (12,)
+            with pytest.raises(Exception, match="replayable") as error:
+                connection.execute(
+                    f"SELECT count(*) FROM {_sql_literal(unsafe_uri)}"
+                ).fetchone()
+            assert secret not in str(error.value)
             explain_text = "\n".join(
                 str(value)
                 for row in connection.execute(
@@ -5091,34 +5050,31 @@ def test_single_slash_uri_replay_and_diagnostics_are_private(
             for secret in secrets:
                 assert secret not in message
 
-        shared_memory_uri = f"shared-memory://lance-{uuid.uuid4()}/process-local.lance"
-        _write_dataset(connection, shared_memory_uri)
-        assert connection.execute(
-            f"SELECT count(*) FROM {_sql_literal(shared_memory_uri)}"
-        ).fetchone() == (12,)
-        shared_memory_relation = connection.sql(
-            f"SELECT id FROM {_sql_literal(shared_memory_uri)} ORDER BY id"
+        # Process-local object stores cannot be a distributed fixture. Check
+        # their catalog transport with an independent file-backed query.
+        memory_uris = (
+            f"memory:/lance-{uuid.uuid4()}",
+            f"shared-memory://lance-{uuid.uuid4()}",
         )
-        with pytest.raises(Exception, match="replayable"):
-            shared_memory_logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-                shared_memory_relation, "lance-process-local-shared-memory-uri"
+        for index, memory_uri in enumerate(memory_uris):
+            connection.execute(
+                f"ATTACH {_sql_literal(memory_uri)} AS memory_ns_{index} (TYPE LANCE)"
             )
-            shared_memory_logical.to_physical_plan(connection)
-
-        memory_uri = f"memory:/lance-{uuid.uuid4()}"
-        connection.execute(
-            f"ATTACH {_sql_literal(memory_uri)} AS memory_ns (TYPE LANCE)"
-        )
         memory_relation = connection.sql(
             f"SELECT id FROM {_sql_literal(safe_uri)} ORDER BY id"
         )
         memory_logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             memory_relation, "lance-process-local-memory-uri"
         )
-        attach_sql = "\n".join(memory_logical.__getstate__()[3]["attached_databases"])
-        assert "vane-internal://lance/directory-planning-snapshot" in attach_sql
-        assert memory_uri not in attach_sql
-        assert memory_uri.encode() not in pickle.dumps(memory_logical)
+        memory_attaches = memory_logical.__getstate__()[3]["attached_databases"]
+        assert len(memory_attaches) == len(memory_uris)
+        assert all(
+            "vane-internal://lance/directory-planning-snapshot" in statement
+            for statement in memory_attaches
+        )
+        for memory_uri in memory_uris:
+            assert memory_uri not in "\n".join(memory_attaches)
+            assert memory_uri.encode() not in pickle.dumps(memory_logical)
     finally:
         physical = None
         connection.close()
@@ -5575,12 +5531,11 @@ def test_s3_connection_credentials_override_process_environment(
         # Seed every remote dataset before the isolated subprocess replaces its
         # ambient credentials. This test exercises distributed read credential
         # precedence, not native COPY credential resolution.
-        seed.execute(
-            "COPY (SELECT i::BIGINT AS id, i::INTEGER AS label, "
-            "CASE WHEN i % 2 = 0 THEN 'puppy' ELSE 'kitten' END::VARCHAR "
-            "AS text, [i::FLOAT, 0.0, 0.0, 0.0]::FLOAT[4] AS vec "
-            "FROM range(5) AS source(i)) "
-            f"TO {_sql_literal(search_path)} (FORMAT LANCE, MODE 'create')"
+        write_fixture_query(
+            seed,
+            search_path,
+            f"SELECT i::BIGINT AS id, i::INTEGER AS label, CASE WHEN i % 2 = 0 THEN 'puppy' ELSE 'kitten' END::VARCHAR AS text, [i::FLOAT, 0.0, 0.0, 0.0]::FLOAT[4] AS vec FROM range(5) AS source(i)",
+            mode="create",
         )
     finally:
         seed.close()
@@ -5656,9 +5611,11 @@ def test_worker_reopens_the_coordinator_snapshot_after_append(tmp_path: Path) ->
         }
         assert sum(len(batches) for batches in split_map.values()) == 4
 
-        connection.execute(
-            "COPY (SELECT 99::BIGINT AS id, 'value-99'::VARCHAR AS value) "
-            f"TO {_sql_literal(path)} (FORMAT LANCE, MODE 'append')"
+        write_fixture_query(
+            connection,
+            path,
+            f"SELECT 99::BIGINT AS id, 'value-99'::VARCHAR AS value",
+            mode="append",
         )
 
         rows: list[int] = []
@@ -5708,17 +5665,14 @@ def test_worker_fails_if_the_coordinator_snapshot_was_vacuumed(
         node_id, batches = next(iter(split_map.items()))
         split_batch = bytes(batches[0])
 
-        connection.execute(
-            "COPY (SELECT 99::BIGINT AS id, 'value-99'::VARCHAR AS value) "
-            f"TO {_sql_literal(path)} (FORMAT LANCE, MODE 'append')"
+        write_fixture_query(
+            connection,
+            path,
+            f"SELECT 99::BIGINT AS id, 'value-99'::VARCHAR AS value",
+            mode="append",
         )
-        cleanup = connection.execute(
-            f"VACUUM LANCE {_sql_literal(path)} WITH ("
-            "older_than_seconds = 0, delete_unverified = true, "
-            "error_if_tagged_old_versions = false, retain_n_versions = 1)"
-        ).fetchone()
-        assert cleanup[0] == "cleanup"
-        assert '"old_versions":1' in cleanup[2]
+        cleanup = cleanup_fixture_versions(path)
+        assert cleanup.old_versions == 1
 
         worker = _connect()
         cursor = worker.cursor()
@@ -5948,6 +5902,7 @@ def test_worker_rejects_overlapping_take_split_ranges(
 def test_real_ray_fte_task_retry_preserves_lance_state_exactly_once(
     tmp_path: Path, ray_retry_runner, query_kind: str, failure_phase: str
 ) -> None:
+    import lance
     import ray
     import ray.cloudpickle
 
@@ -5980,10 +5935,15 @@ def test_real_ray_fte_task_retry_preserves_lance_state_exactly_once(
             source = (
                 Path(__file__).resolve().parents[2] / "test/data/search_test_data.lance"
             ).resolve()
-            writer.execute(
-                f"COPY (SELECT * FROM {_sql_literal(source)}) "
-                f"TO {_sql_literal(path)} (FORMAT LANCE, MODE 'create')"
+            write_fixture_query(
+                writer, path, f"SELECT * FROM {_sql_literal(source)}", mode="create"
             )
+            append_rows = writer.sql(
+                "SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
+                "'puppy puppy puppy'::VARCHAR AS text, "
+                "'puppy'::VARCHAR AS keywords, "
+                "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec"
+            ).to_arrow_table()
         expected = sorted(writer.execute(sql).fetchall())
 
         # Materialize the job-scoped query driver and its two real worker actors
@@ -6060,30 +6020,15 @@ def test_real_ray_fte_task_retry_preserves_lance_state_exactly_once(
         assert worker_attempt0["task_id"] == attempt0["task_id"]
         assert worker_attempt0["query_id"] == attempt0["query_id"]
 
-        # Commit after attempt 0 captured the immutable plan and before its
-        # injected retryable failure is reported. Reopening latest would make
-        # the retried result observably different in either query shape.
+        # Commit a fixture mutation after attempt 0 captured its immutable plan.
+        # Use the independent SDK while fault-injection gates hold Ray tasks;
+        # another Ray query here could wait on the deliberately blocked work.
+        # Public Ray readback below verifies the newly committed snapshot after
+        # the original query has completed its retry.
         if query_kind == "fragment-scan":
-            writer.execute(
-                f"ATTACH {_sql_literal(tmp_path)} AS retry_ns "
-                "(TYPE LANCE, READ_ONLY false)"
-            )
-            writer.execute(
-                "DELETE FROM retry_ns.main.retry_fragment_scan "
-                "WHERE id IN (1, 4, 7, 10)"
-            )
-            assert writer.execute(
-                f"SELECT id FROM {_sql_literal(path)} ORDER BY id"
-            ).fetchall() == [(row_id,) for row_id in (0, 2, 3, 5, 6, 8, 9, 11)]
+            lance.dataset(str(path)).delete("id IN (1, 4, 7, 10)")
         else:
-            writer.execute(
-                "COPY (SELECT -1::BIGINT AS id, -1::INTEGER AS label, "
-                "'puppy puppy puppy'::VARCHAR AS text, "
-                "'puppy'::VARCHAR AS keywords, "
-                "[0.0, 0.0, 0.0, 0.0]::FLOAT[4] AS vec) "
-                f"TO {_sql_literal(path)} (FORMAT LANCE, MODE 'append')"
-            )
-            assert any(row[0] == -1 for row in writer.execute(sql).fetchall())
+            lance.write_dataset(append_rows, str(path), mode="append")
 
         ray.get(
             attempt0_worker_actor.__ray_call__.remote(_release_fte_worker_retry_gate)
@@ -6192,6 +6137,14 @@ def test_real_ray_fte_task_retry_preserves_lance_state_exactly_once(
             )
         )
         assert sorted(completed_snapshot["attempts"]) == [0, 1]
+        writer.close()
+        writer = _connect()
+        if query_kind == "fragment-scan":
+            assert writer.execute(
+                f"SELECT id FROM {_sql_literal(path)} ORDER BY id"
+            ).fetchall() == [(row_id,) for row_id in (0, 2, 3, 5, 6, 8, 9, 11)]
+        else:
+            assert any(row[0] == -1 for row in writer.execute(sql).fetchall())
     finally:
         primary_error = sys.exception()
         cleanup_errors: list[BaseException] = []
