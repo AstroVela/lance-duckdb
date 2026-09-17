@@ -13,10 +13,6 @@ and vector, full-text, and hybrid search.
 | **Vane** | Python and SQL pipelines using the default Ray runner for scans, supported writes, and searches | [VANE_README.md](VANE_README.md) |
 | **DuckDB** | Querying, updating, and searching Lance datasets in official DuckDB | [DUCKDB_README.md](DUCKDB_README.md) |
 
-The two runtimes share the Lance SQL interface and build against different
-DuckDB engines. Use the extension package or build intended for your runtime;
-their native extension binaries are not interchangeable.
-
 ## License
 
 [Apache License 2.0](LICENSE).
