@@ -190,12 +190,6 @@ shared_ptr<LanceDatasetCacheEntry>
 LanceVaneOpenSearchSnapshotForMaterialization(
     ClientContext &context, const LanceVaneGlobalSearchState &state);
 
-void LanceVanePopulateSearchSchema(ClientContext &context,
-                                   const vector<string> &names,
-                                   const vector<LogicalType> &types,
-                                   ArrowSchemaWrapper &schema_root,
-                                   ArrowTableSchema &arrow_table);
-
 void LanceVaneValidateExecutionInput(const TableFunctionInitInput &input,
                                      const LanceVaneGlobalSearchState &state);
 

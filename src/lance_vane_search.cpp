@@ -2,12 +2,10 @@
 
 #include "lance_vane_search.hpp"
 
-#include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
-#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
@@ -2408,24 +2406,6 @@ LanceVaneOpenSearchSnapshotForMaterialization(
         "Distributed Lance search materialization state is contradictory");
   }
   return OpenValidatedSearchSnapshot(context, state);
-}
-
-void LanceVanePopulateSearchSchema(ClientContext &context,
-                                   const vector<string> &names,
-                                   const vector<LogicalType> &types,
-                                   ArrowSchemaWrapper &schema_root,
-                                   ArrowTableSchema &arrow_table) {
-  if (names.empty() || names.size() != types.size()) {
-    throw SerializationException(
-        "Distributed Lance search has an invalid output schema");
-  }
-  std::memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  auto properties = context.GetClientProperties();
-  ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, types, names,
-                                properties);
-  LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
-                                               schema_root.arrow_schema);
 }
 
 void LanceVaneValidateExecutionInput(const TableFunctionInitInput &input,

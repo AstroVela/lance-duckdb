@@ -2458,6 +2458,74 @@ def test_global_search_overloads_match_sql_and_emit_one_task(ray_runner) -> None
         connection.close()
 
 
+@pytest.mark.parametrize("large_strings", [False, True], ids=["string", "large-string"])
+@pytest.mark.parametrize("search", ["fts", "vector", "hybrid"])
+def test_global_search_reads_the_actual_arrow_batch_schema(
+    tmp_path: Path, large_strings: bool, search: str
+) -> None:
+    import lance
+    import pyarrow as pa
+
+    # One fragment/index segment keeps these on the final-search worker path.
+    # Exceed both DuckDB's vector size and Lance's default scan batch size.
+    row_count = 10033
+    string_type = pa.large_string() if large_strings else pa.string()
+    payloads = [None, "", "short", "long-" * 40, "多字节文本"]
+    expected = [(i, "puppy", payloads[i % len(payloads)]) for i in range(row_count)]
+    table = pa.table(
+        {
+            "id": pa.array(range(row_count), type=pa.int64()),
+            "text": pa.array(["puppy"] * row_count, type=string_type),
+            "payload": pa.array([row[2] for row in expected], type=string_type),
+            "vec": pa.array(
+                [[float(i), 0.0, 0.0, 0.0] for i in range(row_count)],
+                type=pa.list_(pa.float32(), 4),
+            ),
+        }
+    )
+    path = tmp_path / "search_layout.lance"
+    lance.write_dataset(table, str(path), max_rows_per_file=row_count)
+    create_fixture_index(path, "text_idx", "text", "INVERTED")
+    dataset = lance.dataset(str(path))
+    assert len(dataset.get_fragments()) == 1
+    assert dataset.schema.field("text").type == string_type
+    path_sql = _sql_literal(path)
+    vector_query = "[0.0, 0.0, 0.0, 0.0]::FLOAT[4]"
+    sources = {
+        "fts": f"lance_fts({path_sql}, 'text', 'puppy', k={row_count})",
+        "vector": (
+            f"lance_vector_search({path_sql}, 'vec', {vector_query}, "
+            f"k={row_count}, use_index=false)"
+        ),
+        "hybrid": (
+            f"lance_hybrid_search({path_sql}, 'vec', {vector_query}, "
+            f"'text', 'puppy', k={row_count}, use_index=false, oversample_factor=1)"
+        ),
+    }
+    connection = _connect()
+    try:
+        # Reorder the projection, then prune columns used only by a filter.
+        result = connection.sql(
+            f"SELECT payload, id, text FROM {sources[search]} ORDER BY id"
+        ).fetchall()
+        assert result == [(payload, i, text) for i, text, payload in expected]
+        filtered = connection.sql(
+            f"SELECT payload FROM {sources[search]} "
+            "WHERE id < 10 AND text = 'puppy' ORDER BY id"
+        ).fetchall()
+        assert filtered == [(payloads[i % len(payloads)],) for i in range(10)]
+        if search == "fts":
+            assert (
+                connection.sql(
+                    f"SELECT text, payload FROM lance_fts({path_sql}, "
+                    "'text', 'absenttoken', k=10)"
+                ).fetchall()
+                == []
+            )
+    finally:
+        connection.close()
+
+
 def test_exact_vector_candidates_are_disjoint_deterministic_and_match_final_search(
     tmp_path: Path, ray_cluster: frozenset[str], ray_runner
 ) -> None:
