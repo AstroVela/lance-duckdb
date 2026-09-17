@@ -353,8 +353,8 @@ initialization to the current Vane SDK.
 All 12 provider-path Python blocks passed sequentially in 101.99 seconds, with
 `VANE_RUNNER` unset and the default Ray runner asserted. The test owned a
 same-host Ray cluster with two CPU execution nodes and observed 16 Ray reads
-and six Ray writes, including additional assertions. Validation compared all
-source and mutated rows, Relation aggregates, nearest-vector results, every
+and six Ray writes, including additional assertions. Validation checked source
+counts and totals, every mutated row, Relation aggregates, nearest-vector results, every
 full-text result including its `text`, and the best hybrid-search result.
 
 The ordered Relation preview keeps the `.fetchall()` workaround for
