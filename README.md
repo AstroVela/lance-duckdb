@@ -10,7 +10,7 @@ and vector, full-text, and hybrid search.
 
 | Runtime | Use it for | Installation and examples |
 | --- | --- | --- |
-| **Vane** | Python and SQL pipelines with local execution or distributed scans, supported writes, and eligible searches on Ray | [VANE_README.md](VANE_README.md) |
+| **Vane** | Python and SQL pipelines using the default Ray runner for scans, supported writes, and searches | [VANE_README.md](VANE_README.md) |
 | **DuckDB** | Querying, updating, and searching Lance datasets in official DuckDB | [DUCKDB_README.md](DUCKDB_README.md) |
 
 The two runtimes share the Lance SQL interface and build against different

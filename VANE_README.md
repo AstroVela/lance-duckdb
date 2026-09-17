@@ -5,7 +5,7 @@
 [Vane](https://github.com/AstroVela/vane) is a multimodal data engine built on
 DuckDB and Ray. This extension lets Vane query, write, and search
 [Lance](https://github.com/lance-format/lance/) datasets through SQL and Python
-relations, with local execution and distributed processing on Ray.
+relations using Vane's default Ray runner.
 
 ## Install
 
@@ -87,7 +87,8 @@ connection.execute("LOAD lance")
 
 Follow the examples in order: create tables, insert rows, update and delete
 rows, query the results, then run searches. The examples reuse the `connection`
-initialized above and leave the runner unset to use Vane's default Ray runner.
+initialized above. Leave `VANE_RUNNER` unset and do not call a runner-selection
+API: `vane.connect()` uses Ray by default.
 Use `.show()` to display results; use `.fetchall()` when Python code needs a
 list of result rows. See the [SQL reference](docs/sql.md) for the shared SQL
 interface.
@@ -107,11 +108,9 @@ needed. Local storage needs no S3 settings. On a multi-host Ray cluster, use a
 filesystem mounted at the same absolute path on every worker, or shared object
 storage configured as described in [Cloud storage](#cloud-storage).
 
-To use an existing Ray cluster, configure its address before starting step 1:
-
-```python
-vane.set_runner_ray(address="auto")
-```
+Vane starts Ray automatically for these examples. To connect to an existing
+Ray cluster instead, set `RAY_ADDRESS` before starting Python. This selects
+the cluster address; no Vane runner configuration is needed.
 
 ### 1. Create tables with CTAS
 
@@ -145,9 +144,8 @@ data through Ray workers, and commits the selected results on the coordinator.
 Use new table names when repeating the example; `.create(...)` does not
 overwrite existing tables.
 
-For Ray execution, use the relation methods shown here. Submitting a raw CTAS
-statement through `connection.execute(...)` or `connection.sql(...)` uses the
-native statement path in the current API.
+Both the relation methods shown here and supported SQL CTAS/INSERT statements
+submitted through this connection use the default Ray runner.
 
 ### 2. Insert rows
 
@@ -230,7 +228,8 @@ from vane import col
 source = connection.table("lance_ns.main.source")
 filtered = source.filter(col("id") >= 100).select(col("id"), col("value"))
 
-filtered.sort(col("id").asc()).limit(5).show()
+print(filtered.sort(col("id").asc()).limit(5).fetchall())
+# [(100, 'value-100'), ..., (104, 'value-104')]
 ```
 
 Aggregate the filtered rows, or group the source rows by an expression:
@@ -255,33 +254,59 @@ accept filtered relations when you want to write their results.
 
 ### 5. Run vector, full-text, and hybrid searches
 
-Run search SQL through `connection.sql(...).show()` using the default Ray
-runner. Search needs text and vector columns, so the examples below use a
-separate, existing dataset at `path/to/dataset.lance` with `id`, `text`, and a
-four-dimensional `vec` column of type `FLOAT[4]`. Replace that path with your
-search dataset; the two-column tables above demonstrate table writes and
-queries:
+Search uses a separate dataset with text and four-dimensional vectors. Create
+it through the same default-Ray connection:
+
+```python
+connection.sql("""
+    SELECT i::BIGINT AS id,
+           CASE WHEN i % 2 = 0 THEN 'playful puppy' ELSE 'sleepy kitten' END AS text,
+           [i / 100.0, i / 100.0 + 0.1,
+            i / 100.0 + 0.2, i / 100.0 + 0.3]::FLOAT[4] AS vec
+    FROM range(100) AS source(i)
+""").create("lance_ns.main.search")
+```
+
+Full-text and hybrid search need an inverted text index. Install the Lance
+Python SDK for this one-time index preparation:
+
+```bash
+python -m pip install "pylance==9.0.1"
+```
+
+```python
+import lance as lance_sdk
+
+lance_sdk.dataset("lance_demo/search.lance").create_scalar_index(
+    "text", "INVERTED", name="text_idx",
+    base_tokenizer="simple", language="English", stem=False,
+)
+```
+
+The SDK prepares the index directly; index-management SQL is not currently
+qualified on Ray. The following vector, full-text, and hybrid queries all
+execute through Vane's default Ray runner:
 
 ```python
 connection.sql("""
     SELECT id, _distance
     FROM lance_vector_search(
-        'path/to/dataset.lance', 'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[4],
+        'lance_demo/search.lance', 'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[4],
         k = 5, use_index = false, prefilter = true
     )
     ORDER BY _distance ASC, id ASC
 """).show()
 
 connection.sql("""
-    SELECT id, text, _score
-    FROM lance_fts('path/to/dataset.lance', 'text', 'puppy', k = 10)
+    SELECT id, _score
+    FROM lance_fts('lance_demo/search.lance', 'text', 'puppy', k = 10)
     ORDER BY _score DESC, id ASC
 """).show()
 
 connection.sql("""
     SELECT id, _hybrid_score, _distance, _score
     FROM lance_hybrid_search(
-        'path/to/dataset.lance',
+        'lance_demo/search.lance',
         'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[4], 'text', 'puppy',
         k = 10, prefilter = false, alpha = 0.5, oversample_factor = 4
     )
@@ -318,20 +343,33 @@ The [cloud reference](docs/cloud.md) covers object-store configuration.
 
 ### Tested development package
 
-Validation on 2026-09-07 with `vane-ai==0.2.0.dev612` and its matching Lance
-provider covered Ray table creation, insertion, mutation, aggregation, and
-Relation API queries. The search examples were tested with a separate fixture:
-vector and hybrid search passed, while full-text search returning `text` failed
-with a string-conversion error. Additional tests with a multi-fragment dataset
-reproduced a batch-index error in ordered row previews. These runtime issues
-have not been fixed by the documentation changes.
+Validated on 2026-09-17 against Vane main
+`4e12994a2fed5b872a7bdb44df72c1b9c5653cdc` (`vane-ai==0.2.0.dev661`)
+and Lance `main_vane` `43d1106480f2b65db98e0963b0301a19da7181ce`, using
+matching locally built provider wheels and `pylance==9.0.1`. The provider-path
+Python examples ran with `VANE_RUNNER` unset on a same-host Ray cluster with
+two execution nodes. Validation covers table creation, insertion, mutation,
+SQL and Relation queries, vector search, full-text search, and hybrid search.
+
+Two runtime limitations were also reproduced on these revisions:
+
+- An ordered `.sort(...).limit(5).show()` preview fails with
+  `Connection snapshot query failed (FATAL)`. The example above fetches and
+  prints the five rows with `.fetchall()`, which still executes on Ray.
+- Selecting `text` directly from `lance_fts(...)` fails with
+  `DuckDB does not support Strings over 4GB`. The full-text example above
+  returns `id` and `_score` instead.
+
+These documentation changes do not fix either runtime issue. This validation
+used installed wheels built from the revisions above; it did not republish
+packages or rerun the alternative static-wheel build recipe.
 
 ## Contributing
 
 See [Contributing](README.md#contributing) for shared development resources.
 `make vane_native` builds the native compatibility harness and runs its smoke
 test. The [Vane workflow](.github/workflows/VaneExtension.yml) also covers static
-and provider wheels, local queries, Ray scans, distributed writes, and
+and provider wheels, default-Ray queries, scans, distributed writes, and
 MinIO-backed storage. The relevant integration tests are
 [`test_vane_single_scan.py`](python/tests/test_vane_single_scan.py),
 [`test_vane_distributed_scan.py`](python/tests/test_vane_distributed_scan.py), and
