@@ -298,7 +298,7 @@ connection.sql("""
 """).show()
 
 connection.sql("""
-    SELECT id, _score
+    SELECT id, text, _score
     FROM lance_fts('lance_demo/search.lance', 'text', 'puppy', k = 10)
     ORDER BY _score DESC, id ASC
 """).show()
@@ -344,25 +344,42 @@ The [cloud reference](docs/cloud.md) covers object-store configuration.
 ### Tested development package
 
 Validated on 2026-09-17 against Vane main
-`4e12994a2fed5b872a7bdb44df72c1b9c5653cdc` (`vane-ai==0.2.0.dev661`)
-and Lance `main_vane` `43d1106480f2b65db98e0963b0301a19da7181ce`, using
-matching locally built provider wheels and `pylance==9.0.1`. The provider-path
-Python examples ran with `VANE_RUNNER` unset on a same-host Ray cluster with
-two execution nodes. Validation covers table creation, insertion, mutation,
-SQL and Relation queries, vector search, full-text search, and hybrid search.
+`d1460a580455f01485e2e508e05d0049cb18a105` (`vane-ai==0.2.0.dev663`)
+and Lance native sources at `428fe38`, using matching locally built,
+non-editable provider wheels and `pylance==9.0.1`. The engine source ID was
+`d8a9d61d59`. This branch adapts the distributed write enum and search-task
+initialization to the current Vane SDK.
 
-Two runtime limitations were also reproduced on these revisions:
+All 12 provider-path Python blocks passed sequentially in 101.99 seconds, with
+`VANE_RUNNER` unset and the default Ray runner asserted. The test owned a
+same-host Ray cluster with two CPU execution nodes and observed 16 Ray reads
+and six Ray writes, including additional assertions. Validation compared all
+source and mutated rows, Relation aggregates, nearest-vector results, every
+full-text result including its `text`, and the best hybrid-search result.
 
-- An ordered `.sort(...).limit(5).show()` preview fails with
-  `Connection snapshot query failed (FATAL)`. The example above fetches and
-  prints the five rows with `.fetchall()`, which still executes on Ray.
-- Selecting `text` directly from `lance_fts(...)` fails with
-  `DuckDB does not support Strings over 4GB`. The full-text example above
-  returns `id` and `_score` instead.
+The ordered Relation preview keeps the `.fetchall()` workaround for
+[Vane #833](https://github.com/AstroVela/vane/issues/833); fetching and printing
+those rows still executes the query on Ray. The full-text example now selects
+`text` as well, exercising the Arrow schema fix merged in Lance #35.
 
-These documentation changes do not fix either runtime issue. This validation
-used installed wheels built from the revisions above; it did not republish
-packages or rerun the alternative static-wheel build recipe.
+This qualification covers the local provider walkthrough. It did not test
+cloud storage, multi-host deployment, or the alternative static-wheel
+installation, and did not publish packages. Replace the TestPyPI placeholders
+with a matching published runtime/provider pair before using that install path.
+
+## Re-run the walkthrough test
+
+With matching provider and Vane wheels installed, run the checked-in test from
+this extension's checkout. Leave `VANE_RUNNER` and `RAY_ADDRESS` unset:
+
+```bash
+python -m pip install pytest "pylance==9.0.1"
+python -I -m pytest -q -s python/tests/test_vane_readme.py
+```
+
+The test executes the provider-path Python blocks from this guide in a fresh temporary
+directory, asserts the default Ray runner, checks the resulting data, and owns
+and cleans up a same-host Ray cluster with two CPU execution nodes.
 
 ## Contributing
 
