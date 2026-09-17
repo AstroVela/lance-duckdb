@@ -1,11 +1,5 @@
 # Lance DuckDB Extension
 
-[Project overview](README.md) · [Vane guide](VANE_README.md)
-
-This guide covers the Lance extension for official DuckDB. For Vane installation,
-Ray execution, and distributed storage configuration, see the
-[Vane guide](VANE_README.md).
-
 [Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension will make `Lance` the best file/table/lakehouse formats on DuckDB.
 
 ## Install
@@ -51,8 +45,6 @@ duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'
 
 - Full SQL reference: [`docs/sql.md`](./docs/sql.md)
 - Cloud storage reference: [`docs/cloud.md`](./docs/cloud.md)
-- Vane distributed scan contract: [`docs/vane_distributed_scan.md`](./docs/vane_distributed_scan.md)
-- Vane distributed write contract: [`docs/vane_distributed_write.md`](./docs/vane_distributed_write.md)
 
 ### Query a Lance dataset
 
