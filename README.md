@@ -1,194 +1,68 @@
-# Lance DuckDB Extension
+# Lance Extension for Vane and DuckDB
 
-[Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension will make `Lance` the best file/table/lakehouse formats on DuckDB.
+[Lance](https://github.com/lance-format/lance/) is a columnar data format for
+ML and AI workloads, with support for vector indexes and cloud storage. This
+repository brings Lance datasets to [Vane](https://github.com/AstroVela/vane)
+and [DuckDB](https://duckdb.org/) through SQL scans, namespace tables, writes,
+and vector, full-text, and hybrid search.
 
-## Install
+## Choose your runtime
 
-### Install from DuckDB (recommended)
+| Runtime | Use it for | Installation and examples |
+| --- | --- | --- |
+| **Vane** | Python and SQL pipelines using the default Ray runner for scans, supported writes, and searches | [VANE_README.md](VANE_README.md) |
+| **DuckDB** | Querying, updating, and searching Lance datasets in official DuckDB | [DUCKDB_README.md](DUCKDB_README.md) |
 
-If you just want to use the extension, install it directly from DuckDB's core extensions repository:
+The two runtimes share the Lance SQL interface and build against different
+DuckDB engines. Use the extension package or build intended for your runtime;
+their native extension binaries are not interchangeable.
 
-```sql
-INSTALL lance;
-LOAD lance;
+## Capabilities
 
-SELECT *
-  FROM 'path/to/dataset.lance'
-  LIMIT 1;
-```
+- **Read Lance datasets** from local paths and object-store URIs, with projection
+  and filter pushdown.
+- **Work with tables** through `ATTACH ... (TYPE LANCE)` directory and REST
+  namespaces.
+- **Write and manage data** with `COPY`, table DDL/DML, indexes, and maintenance
+  statements, as described in the [SQL reference](docs/sql.md).
+- **Search data** with `lance_vector_search`, `lance_fts`, and
+  `lance_hybrid_search`.
+- **Scale with Vane** using Ray workers for fragment scans, supported
+  directory-namespace writes, and eligible vector and full-text searches.
+  Global SQL operators and search ranking remain coordinated by Vane.
 
-See DuckDB's extension page for `lance` for the latest release details: https://duckdb.org/docs/stable/core_extensions/lance
+Vane's distributed execution has specific storage, credential, and operation
+requirements. The [Vane guide](VANE_README.md) explains these alongside runnable
+examples; the [DuckDB guide](DUCKDB_README.md) covers native DuckDB usage.
 
-### Build from source (development)
+## Documentation
 
-This repository focuses on source builds for development and CI.
-
-1. Initialize submodules:
-
-```bash
-git submodule update --init --recursive
-```
-
-2. Build:
-
-```bash
-GEN=ninja make release
-```
-
-3. Load the extension from a standalone DuckDB binary (local builds typically require unsigned extensions):
-
-```bash
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
-```
-
-## Usage
-
-- Full SQL reference: [`docs/sql.md`](./docs/sql.md)
-- Cloud storage reference: [`docs/cloud.md`](./docs/cloud.md)
-- Vane distributed scan contract: [`docs/vane_distributed_scan.md`](./docs/vane_distributed_scan.md)
-- Vane distributed write contract: [`docs/vane_distributed_write.md`](./docs/vane_distributed_write.md)
-
-### Query a Lance dataset
-
-```sql
--- local file
-SELECT *
-  FROM 'path/to/dataset.lance'
-  LIMIT 10;
--- s3
-SELECT *
-  FROM 's3://bucket/path/to/dataset.lance'
-  LIMIT 10;
-```
-
-To access object store URIs (e.g. `s3://...`), configure a `TYPE LANCE` secret (see [`docs/cloud.md`](./docs/cloud.md)).
-
-```sql
-CREATE SECRET (
-  TYPE LANCE,
-  PROVIDER credential_chain,
-  SCOPE 's3://bucket/'
-);
-
-SELECT *
-  FROM 's3://bucket/path/to/dataset.lance'
-  LIMIT 10;
-```
-
-### Write a Lance dataset
-
-Use DuckDB's `COPY ... TO ...` to materialize query results as a Lance dataset.
-
-```sql
--- Create/overwrite a Lance dataset from a query
-COPY (
-  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
-  UNION ALL
-  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
-) TO 'path/to/out.lance' (FORMAT lance, mode 'overwrite');
-
--- Read it back via the replacement scan
-SELECT count(*) FROM 'path/to/out.lance';
-
--- Append more rows to an existing dataset
-COPY (
-  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
-) TO 'path/to/out.lance' (FORMAT lance, mode 'append');
-
--- Optionally create an empty dataset (schema only)
-COPY (
-  SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s
-  LIMIT 0
-) TO 'path/to/empty.lance' (FORMAT lance, mode 'overwrite', write_empty_file true);
-```
-
-To write to `s3://...` paths, configure a `TYPE LANCE` secret for that scope (see [`docs/cloud.md`](./docs/cloud.md)).
-
-```sql
-CREATE SECRET (
-  TYPE LANCE,
-  PROVIDER credential_chain,
-  SCOPE 's3://bucket/'
-);
-
-COPY (SELECT 1 AS id) TO 's3://bucket/path/to/out.lance' (FORMAT lance, mode 'overwrite');
-```
-
-### Create a Lance dataset via `CREATE TABLE` (directory namespace)
-
-When you `ATTACH` a directory as a Lance namespace, you can create new datasets using `CREATE TABLE` (schema-only)
-or `CREATE TABLE AS SELECT` (CTAS). The dataset is written to `<namespace_root>/<table_name>.lance`.
-
-```sql
-ATTACH 'path/to/dir' AS lance_ns (TYPE LANCE);
-
--- Schema-only (creates an empty dataset)
-CREATE TABLE lance_ns.main.my_empty (id BIGINT, s VARCHAR);
-
--- CTAS (writes query results)
-CREATE TABLE lance_ns.main.my_dataset AS
-  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
-  UNION ALL
-  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s;
-
-SELECT count(*) FROM lance_ns.main.my_dataset;
-```
-
-### Vector search
-
-```sql
--- Search a vector column, returning distances in `_distance` (smaller is closer)
-SELECT id, label, _distance
-FROM lance_vector_search('path/to/dataset.lance', 'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[4],
-                         k = 5, prefilter = true)
-ORDER BY _distance ASC;
-```
-
-See the SQL reference for full parameter documentation: [docs/sql.md#search](docs/sql.md#search).
-
-### Full-text search (FTS)
-
-```sql
--- Search a text column, returning BM25-like scores in `_score`
-SELECT id, text, _score
-FROM lance_fts('path/to/dataset.lance', 'text', 'puppy', k = 10, prefilter = true)
-ORDER BY _score DESC;
-```
-
-See the SQL reference for full parameter documentation: [docs/sql.md#search](docs/sql.md#search).
-
-### Hybrid search (vector + FTS)
-
-```sql
--- Combine vector and text scores, returning `_hybrid_score` in addition to `_distance` / `_score`
-SELECT id, _hybrid_score, _distance, _score
-FROM lance_hybrid_search('path/to/dataset.lance',
-                         'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[4],
-                         'text', 'puppy',
-                         k = 10, prefilter = false,
-                         alpha = 0.5, oversample_factor = 4)
-ORDER BY _hybrid_score DESC;
-```
-
-See the SQL reference for full parameter documentation: [docs/sql.md#search](docs/sql.md#search).
+- [Vane installation and walkthrough](VANE_README.md): create tables, insert
+  rows, update and delete, query, then search
+- [Vane Relation API examples](VANE_README.md#use-the-relation-api)
+- [DuckDB installation and usage](DUCKDB_README.md)
+- [SQL reference](docs/sql.md): scans, namespaces, writes, search, indexes, and
+  maintenance
+- [Cloud storage](docs/cloud.md): object-store options and native local secrets
+- [Vane distributed scans](docs/vane_distributed_scan.md): snapshots, shared
+  storage, credentials, and search support
+- [Vane distributed writes](docs/vane_distributed_write.md): supported mutations
+  and commit behavior
+- [Indexed vector search](docs/vane_indexed_vector_candidates.md) and
+  [indexed full-text search](docs/vane_fts_candidates.md): conditions for
+  distributing search work
 
 ## Contributing
 
-Issues and PRs are welcome. High-impact areas include pushdown, parallelism/performance, type coverage, and better diagnostics.
+Issues and pull requests are welcome. Areas for contribution include pushdown,
+parallelism, performance, type coverage, and diagnostics. Each runtime guide
+includes its source-build instructions. See the
+[SQL test guide](test/sql/README.md), [C++ guidelines](docs/cpp_guidelines.md),
+and [Rust guidelines](docs/rust_guidelines.md) for development details.
 
-### Manual Lance dependency bumps
-
-This repository includes a manual GitHub Actions workflow for preparing Lance dependency bump PRs:
-
-- `.github/workflows/codex-update-lance-dependency.yml`: manually runs Codex CLI with the repo-scoped `$lance-duckdb-update-lance-dependency` skill.
-- `.agents/skills/lance-duckdb-update-lance-dependency/SKILL.md`: defines the shared workflow for latest-release resolution, duplicate PR handling, dependency updates, validation, and PR creation.
-- `ci/update_lance_dependency.py`: provides the deterministic dependency update and metadata entrypoint used by the skill.
-
-Required repository secrets:
-
-- `LANCE_RELEASE_TOKEN`: a GitHub token that can read tags and create PRs in this repository.
-- `CODEX_TOKEN`: an OpenAI API key used by Codex CLI.
+The [DuckDB guide](DUCKDB_README.md#manual-lance-dependency-bumps) also documents
+the shared workflow for preparing Lance dependency updates.
 
 ## License
 
-Apache License 2.0.
+[Apache License 2.0](LICENSE).
