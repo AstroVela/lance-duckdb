@@ -71,7 +71,7 @@ committed exact Vane revision.
 | `release` | `vane-extension-release.toml`, PyPI only | `astrovela/vane` |
 
 The production manifest currently selects preparation commit
-`4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`. **This is not a published Vane release.**
+`d1460a580455f01485e2e508e05d0049cb18a105`. **This is not a published Vane release.**
 Production dispatch deliberately fails its secret-free preflight until a reviewed
 PR changes that manifest to a canonical non-development Vane release with the
 complete CPython 3.10–3.14 runtime matrix on PyPI. The selected source must include
@@ -155,8 +155,8 @@ OIDC identity used for package-index uploads and provenance attestations.
 
 ## Default Ray qualification
 
-The qualification pin is Vane main
-`4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`, including the merged connection
+The development qualification pin is Vane main
+`d1460a580455f01485e2e508e05d0049cb18a105`, including the merged connection
 snapshot, terminal partition, native fragment lifecycle, and schema-only chunk
 fixes. The package version is derived from that checkout's Git history.
 

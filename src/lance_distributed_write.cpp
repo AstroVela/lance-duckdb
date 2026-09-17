@@ -899,7 +899,7 @@ static void ResolveWorkerStorageOptions(ClientContext &context,
 static void
 ValidateResolvedInfo(const DistributedExtensionWriteInfo &info,
                      const LanceDistributedWriteTransport &transport) {
-  if (info.mode != DistributedWriteMode::CALLBACK ||
+  if (info.mode != DistributedWriteMode::CALLBACK_SINK ||
       info.capability.extension_name != "lance" ||
       info.capability.capability.name !=
           WriteOperatorName(transport.write_kind) ||
@@ -2942,7 +2942,7 @@ void RegisterLanceDistributedWrites(ExtensionLoader &loader) {
     DistributedWriteOperatorExtension extension;
     extension.name = WriteOperatorName(write_kind);
     extension.protocol_version = LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION;
-    extension.mode = DistributedWriteMode::CALLBACK;
+    extension.mode = DistributedWriteMode::CALLBACK_SINK;
     extension.fragment_codec = {WriteFragmentCodecName(write_kind),
                                 LANCE_DISTRIBUTED_WRITE_PROTOCOL_VERSION};
     extension.callbacks = LanceDistributedWriteCallbacks();
