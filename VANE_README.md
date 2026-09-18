@@ -341,46 +341,6 @@ credentials and a writable target namespace as described in the
 [distributed write guide](docs/vane_distributed_write.md#storage-and-credential-boundary).
 The [cloud reference](docs/cloud.md) covers object-store configuration.
 
-### Tested development package
-
-Validated on 2026-09-17 against Vane main
-`d1460a580455f01485e2e508e05d0049cb18a105` (`vane-ai==0.2.0.dev663`)
-and Lance native sources at `428fe38`, using matching locally built,
-non-editable provider wheels and `pylance==9.0.1`. The engine source ID was
-`d8a9d61d59`. This branch adapts the distributed write enum and search-task
-initialization to the current Vane SDK.
-
-All 12 provider-path Python blocks passed sequentially in 101.99 seconds, with
-`VANE_RUNNER` unset and the default Ray runner asserted. The test owned a
-same-host Ray cluster with two CPU execution nodes and observed 16 Ray reads
-and six Ray writes, including additional assertions. Validation checked source
-counts and totals, every mutated row, Relation aggregates, nearest-vector results, every
-full-text result including its `text`, and the best hybrid-search result.
-
-The ordered Relation preview keeps the `.fetchall()` workaround for
-[Vane #833](https://github.com/AstroVela/vane/issues/833); fetching and printing
-those rows still executes the query on Ray. The full-text example now selects
-`text` as well, exercising the Arrow schema fix merged in Lance #35.
-
-This qualification covers the local provider walkthrough. It did not test
-cloud storage, multi-host deployment, or the alternative static-wheel
-installation, and did not publish packages. Replace the TestPyPI placeholders
-with a matching published runtime/provider pair before using that install path.
-
-## Re-run the walkthrough test
-
-With matching provider and Vane wheels installed, run the checked-in test from
-this extension's checkout. Leave `VANE_RUNNER` and `RAY_ADDRESS` unset:
-
-```bash
-python -m pip install pytest "pylance==9.0.1"
-python -I -m pytest -q -s python/tests/test_vane_readme.py
-```
-
-The test executes the provider-path Python blocks from this guide in a fresh temporary
-directory, asserts the default Ray runner, checks the resulting data, and owns
-and cleans up a same-host Ray cluster with two CPU execution nodes.
-
 ## Contributing
 
 See [Contributing](README.md#contributing) for shared development resources.
