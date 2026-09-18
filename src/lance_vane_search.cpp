@@ -572,8 +572,13 @@ static LanceVaneSearchTaskAssignment
 ExpectedSearchTaskAssignment(const LanceVaneGlobalSearchState &state,
                              optional_idx fragment_id = optional_idx(),
                              const string &index_segment_uuid = string()) {
-  return {state.execution_variant, state.search_node_uuid, state.state_sha256,
-          fragment_id, index_segment_uuid};
+  LanceVaneSearchTaskAssignment result;
+  result.variant = state.execution_variant;
+  result.search_node_uuid = state.search_node_uuid;
+  result.state_sha256 = state.state_sha256;
+  result.fragment_id = fragment_id;
+  result.index_segment_uuid = index_segment_uuid;
+  return result;
 }
 
 static string HexIndexSegmentUUID(const string &uuid) {

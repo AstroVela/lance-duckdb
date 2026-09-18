@@ -298,7 +298,7 @@ connection.sql("""
 """).show()
 
 connection.sql("""
-    SELECT id, _score
+    SELECT id, text, _score
     FROM lance_fts('lance_demo/search.lance', 'text', 'puppy', k = 10)
     ORDER BY _score DESC, id ASC
 """).show()
@@ -340,29 +340,6 @@ credentials and a writable target namespace as described in the
 [distributed scan guide](docs/vane_distributed_scan.md#sql-semantics) and
 [distributed write guide](docs/vane_distributed_write.md#storage-and-credential-boundary).
 The [cloud reference](docs/cloud.md) covers object-store configuration.
-
-### Tested development package
-
-Validated on 2026-09-17 against Vane main
-`4e12994a2fed5b872a7bdb44df72c1b9c5653cdc` (`vane-ai==0.2.0.dev661`)
-and Lance `main_vane` `43d1106480f2b65db98e0963b0301a19da7181ce`, using
-matching locally built provider wheels and `pylance==9.0.1`. The provider-path
-Python examples ran with `VANE_RUNNER` unset on a same-host Ray cluster with
-two execution nodes. Validation covers table creation, insertion, mutation,
-SQL and Relation queries, vector search, full-text search, and hybrid search.
-
-Two runtime limitations were also reproduced on these revisions:
-
-- An ordered `.sort(...).limit(5).show()` preview fails with
-  `Connection snapshot query failed (FATAL)`. The example above fetches and
-  prints the five rows with `.fetchall()`, which still executes on Ray.
-- Selecting `text` directly from `lance_fts(...)` fails with
-  `DuckDB does not support Strings over 4GB`. The full-text example above
-  returns `id` and `_score` instead.
-
-These documentation changes do not fix either runtime issue. This validation
-used installed wheels built from the revisions above; it did not republish
-packages or rerun the alternative static-wheel build recipe.
 
 ## Contributing
 
