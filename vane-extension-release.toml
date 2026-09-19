@@ -1,5 +1,4 @@
-# Preparation pin only: select a reviewed, published non-dev Vane release before
-# dispatching operation=release. Keep the development manifest pinned separately.
+# Production qualification uses the exact PyPI Vane v0.2.0 runtime wheels.
 schema_version = 2
 name = "lance"
 extension_config = "extension_config_vane.cmake"
@@ -8,7 +7,8 @@ native_test_selection = "test/sql/dual_build_smoke.test"
 
 [vane]
 repository = "AstroVela/vane"
-revision = "d1460a580455f01485e2e508e05d0049cb18a105"
+# Vane v0.2.0.
+revision = "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
 
 [vcpkg]
 repository = "microsoft/vcpkg"

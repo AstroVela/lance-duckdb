@@ -22,17 +22,17 @@ python -m pip install -r vane-extension-ci-tools/requirements-release.txt pytest
 python -m pytest -q python/tests/test_vane_dynamic_wheel.py python/tests/test_vane_dynamic_signing.py python/tests/test_vane_provider_release.py
 ```
 
-For a locally assembled TestPyPI candidate set:
+For a locally assembled production candidate set:
 
 ```bash
 python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
-  --manifest vane-extension.toml --extension-root . \
+  --manifest vane-extension-release.toml --extension-root . \
   --vane-source ../vane \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-provider-dist \
-  --vane-version 0.2.0.dev661 --channel testpypi-dev \
-  --require-publishable-on testpypi
+  --vane-version 0.2.0 --channel release \
+  --require-publishable-on testpypi --require-publishable-on pypi
 ```
 
 The Vane checkout must already exist at the exact manifest revision. The shared
@@ -57,8 +57,10 @@ and provider versioning remain explicit.
 
 `VaneExtension.yml` keeps `build-only` as its default operation. Pushes, pull
 requests, and build-only dispatches cannot reach provider publishing or private
-signing keys. They continue to build against `vane-extension.toml`, which pins
-the reviewed Vane main revision below (`0.2.0.dev661`).
+signing keys. They build against `vane-extension.toml`, which pins Vane v0.2.0.
+Build-only CI enables the public CI test key in its locally built runtime and
+packages a matching runtime/provider set. These are test artifacts even though
+the runtime reports `0.2.0`; do not mix them with the PyPI runtime or publish them.
 
 Both publishing operations require a manual dispatch on the protected
 `AstroVela/lance-duckdb` `main_vane` branch. No provider tag is required or created:
@@ -70,14 +72,18 @@ committed exact Vane revision.
 | `testpypi-dev` | `vane-extension.toml`, TestPyPI only | `astrovela/vane-testpypi` |
 | `release` | `vane-extension-release.toml`, PyPI only | `astrovela/vane` |
 
-The production manifest currently selects preparation commit
-`d1460a580455f01485e2e508e05d0049cb18a105`. **This is not a published Vane release.**
-Production dispatch deliberately fails its secret-free preflight until a reviewed
-PR changes that manifest to a canonical non-development Vane release with the
-complete CPython 3.10–3.14 runtime matrix on PyPI. The selected source must include
-the production-key commit. Development versions, local versions, missing or
-yanked runtime wheels, and a different source/tool identity fail closed. There is
-no fallback runtime, index, or signing key.
+Both manifests select Vane v0.2.0, commit
+`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`. Production qualification uses its
+exact PyPI runtime wheels and the production signer. Updating this pin does not
+publish the provider or establish production qualification; the full protected
+release workflow is still required. Development versions, local versions,
+missing or yanked runtime wheels, and a different source/tool identity fail
+closed. There is no fallback runtime, index, or signing key.
+
+With this stable pin, use `build-only` for PRs and `release` for production.
+`testpypi-dev` deliberately rejects `0.2.0`; a future development publication
+requires a separately reviewed pin to its exact TestPyPI runtime. Ordinary
+TestPyPI dev runtimes trust the dedicated TestPyPI key, not the public CI key.
 
 ## One build, two indexes
 
@@ -155,10 +161,8 @@ OIDC identity used for package-index uploads and provenance attestations.
 
 ## Default Ray qualification
 
-The development qualification pin is Vane main
-`d1460a580455f01485e2e508e05d0049cb18a105`, including the merged connection
-snapshot, terminal partition, native fragment lifecycle, and schema-only chunk
-fixes. The package version is derived from that checkout's Git history.
+The development and production qualification pin is Vane v0.2.0,
+`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`.
 
 All installed-wheel integration tests leave `VANE_RUNNER` unset and use no
 runner-selection APIs. The scan, write, and smoke suites share an owned Ray
