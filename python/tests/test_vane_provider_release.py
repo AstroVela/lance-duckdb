@@ -104,7 +104,7 @@ def test_config_declares_the_built_lance_matrix() -> None:
     native = release._load_source_tools()
     manifest = native.load_manifest(ROOT / "vane-extension.toml", ROOT)
     assert manifest.name == "lance"
-    assert manifest.vane_revision == "d1460a580455f01485e2e508e05d0049cb18a105"
+    assert manifest.vane_revision == "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
 
 
 def test_shared_validate_preserves_workflow_outputs(
@@ -305,14 +305,14 @@ def test_release_workflow_supplies_exact_sources_and_shared_config() -> None:
         assert "--require-publishable-on testpypi" in commands[job]
 
 
-def test_production_manifest_does_not_change_the_development_runtime() -> None:
+def test_production_and_development_manifests_pin_vane_020() -> None:
     development = tomllib.loads((ROOT / "vane-extension.toml").read_text())
     production = tomllib.loads((ROOT / "vane-extension-release.toml").read_text())
     assert production["vane"].pop("revision") == (
-        "d1460a580455f01485e2e508e05d0049cb18a105"
+        "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
     )
     assert development["vane"].pop("revision") == (
-        "d1460a580455f01485e2e508e05d0049cb18a105"
+        "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
     )
     assert production == development
 
