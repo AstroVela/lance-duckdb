@@ -11,32 +11,25 @@ relations using Vane's default Ray runner.
 
 ### Install a provider package
 
-Development provider packages are available on
-[TestPyPI](https://test.pypi.org/project/vane-extension-lance/). The published
+Provider packages are published on
+[PyPI](https://pypi.org/project/vane-extension-lance/). The published
 wheels target Linux x86-64 with glibc 2.28 or newer and CPython 3.10 through
 3.14. Python 3.12 is used below.
-
-Choose a provider version and the exact `vane-ai` version required by that
-provider's package metadata. Download both from TestPyPI, then install the
-downloaded wheels with their remaining dependencies from PyPI:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 
-LANCE_VERSION='<provider-version>'
-VANE_VERSION='<matching-vane-version>'
-mkdir -p wheels
-python -m pip download --no-deps --only-binary=:all: \
-  --index-url https://test.pypi.org/simple/ --dest wheels \
-  "vane-extension-lance==$LANCE_VERSION" "vane-ai==$VANE_VERSION"
-python -m pip install ./wheels/*.whl "grpcio>=1.42.0"
+python -m pip install vane-extension-lance "grpcio>=1.42.0"
+python -m pip check
 ```
 
-Use a fresh wheel directory for each selected package pair. Provider loading
-checks compatibility with the installed Vane engine. Install the same pair on
-the coordinator and every Ray worker.
+`pip` resolves the exact matching `vane-ai` from the provider's package
+metadata. Pin exact versions (for example
+`"vane-extension-lance==<version>"`) for reproducible deployments. Provider
+loading checks compatibility with the installed Vane engine. Install the
+same packages on the coordinator and every Ray worker.
 
 Load the provider on the connection used to build your queries:
 
