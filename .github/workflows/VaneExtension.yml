@@ -693,12 +693,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ./scripts/build_minio_test_images.sh
           docker run -d --rm \
             --name lance-vane-minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            astrovela-minio-test:RELEASE.2025-09-07T16-13-09Z \
             server /data
 
       - name: Wait for MinIO and create the test bucket
@@ -719,7 +720,7 @@ jobs:
           docker run --rm \
             --network container:lance-vane-minio \
             --env "MC_HOST_local=http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
-            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            astrovela-mc-test:RELEASE.2025-08-13T08-35-41Z \
             mb --ignore-existing "local/${LANCE_S3_BUCKET}"
 
       - name: Run distributed scan contracts
@@ -793,12 +794,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ./scripts/build_minio_test_images.sh
           docker run -d --rm \
             --name lance-vane-write-minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            astrovela-minio-test:RELEASE.2025-09-07T16-13-09Z \
             server /data
 
       - name: Wait for MinIO and create the test bucket
@@ -819,7 +821,7 @@ jobs:
           docker run --rm \
             --network container:lance-vane-write-minio \
             --env "MC_HOST_local=http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
-            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            astrovela-mc-test:RELEASE.2025-08-13T08-35-41Z \
             mb --ignore-existing "local/${LANCE_S3_BUCKET}"
 
       - name: Run distributed write and mutation contracts
