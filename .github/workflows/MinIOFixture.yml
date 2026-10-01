@@ -1,0 +1,54 @@
+name: Verify MinIO test fixture
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  minio-fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        release: ["RELEASE.2025-09-07T16-13-09Z"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build the pinned server and client
+        env:
+          MINIO_TEST_RELEASE: ${{ matrix.release }}
+        run: ./scripts/build_minio_test_images.sh "$MINIO_TEST_RELEASE"
+      - name: Verify readiness and authenticated object round trip
+        env:
+          MINIO_TEST_RELEASE: ${{ matrix.release }}
+        run: |
+          set -euo pipefail
+          docker run --detach --rm --pull never --name minio-fixture \
+            --env MINIO_ROOT_USER=fixture-admin \
+            --env MINIO_ROOT_PASSWORD=fixture-password \
+            "astrovela-minio-test:$MINIO_TEST_RELEASE" server /data
+          ready=false
+          for attempt in {1..60}; do
+            if docker exec minio-fixture wget -q -O /dev/null \
+              http://127.0.0.1:9000/minio/health/ready; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          printf 'MinIO fixture round trip\n' > "$RUNNER_TEMP/minio-fixture-input"
+          docker run --rm --pull never --network container:minio-fixture \
+            --volume "$RUNNER_TEMP/minio-fixture-input:/fixtures/input:ro" \
+            --env MC_HOST_fixture=http://fixture-admin:fixture-password@127.0.0.1:9000 \
+            --entrypoint /bin/sh \
+            astrovela-mc-test:RELEASE.2025-08-13T08-35-41Z -ec '
+              mc mb fixture/fixture-check
+              mc cp /fixtures/input fixture/fixture-check/object
+              mc cat fixture/fixture-check/object > /tmp/download
+              cmp /fixtures/input /tmp/download
+            '
+      - name: Clean up MinIO
+        if: always()
+        run: |
+          docker logs minio-fixture || true
+          docker rm --force minio-fixture || true

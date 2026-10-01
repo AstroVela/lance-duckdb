@@ -122,12 +122,13 @@ jobs:
 
       - name: Start MinIO
         run: |
-          docker run -d --rm \
+          ./scripts/build_minio_test_images.sh RELEASE.2025-09-07T16-13-09Z
+          docker run -d --rm --pull never \
             --name lance-minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            astrovela-minio-test:RELEASE.2025-09-07T16-13-09Z \
             server /data
 
       - name: Wait for MinIO
@@ -143,12 +144,12 @@ jobs:
 
       - name: Upload test dataset to MinIO
         run: |
-          docker run --rm \
+          docker run --rm --pull never \
             --network container:lance-minio \
             --volume "${GITHUB_WORKSPACE}/test/data:/fixtures:ro" \
             --env MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000 \
             --entrypoint /bin/sh \
-            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            astrovela-mc-test:RELEASE.2025-08-13T08-35-41Z \
             -ec '
               mc mb --ignore-existing local/lance-test
               mc mirror --overwrite /fixtures/test_data.lance local/lance-test/test_data.lance
