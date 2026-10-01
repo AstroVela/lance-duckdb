@@ -213,7 +213,7 @@ jobs:
       VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
       VANE_NATIVE_BUILD_DIR: ${{ github.workspace }}/build/vane-native
       VANE_SOURCE_DIR: ${{ github.workspace }}/vane
-      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TARGET_TRIPLET: x64-linux-release
     steps:
       - name: Reclaim hosted-runner disk space
         shell: bash
@@ -381,7 +381,7 @@ jobs:
       VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
       VANE_WHEEL_BUILD_DIR: ${{ github.workspace }}/build/vane-wheel
       VANE_WHEEL_DIST_DIR: ${{ github.workspace }}/build/vane-wheel/dist
-      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TARGET_TRIPLET: x64-linux-release
     steps:
       - name: Reclaim hosted-runner disk space
         shell: bash
@@ -866,7 +866,7 @@ jobs:
       VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
       VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
       VCPKG_BINARY_SOURCES: clear
-      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TARGET_TRIPLET: x64-linux-release
 
     steps:
       - name: Checkout extension and submodules
@@ -1226,7 +1226,7 @@ jobs:
       VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
       VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
-      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TARGET_TRIPLET: x64-linux-release
       SIGNING_PROFILE: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
 
     steps:

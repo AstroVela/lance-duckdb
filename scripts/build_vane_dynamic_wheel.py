@@ -272,7 +272,7 @@ def _build_environment(
     jobs: int,
     signing_cmake_option: str | None,
 ) -> dict[str, str]:
-    target_triplet = "x64-linux"
+    target_triplet = "x64-linux-release"
     dependency_prefix = vane_vcpkg_installed / target_triplet
     _require_file(
         dependency_prefix / "share/protobuf/protobuf-config.cmake",
