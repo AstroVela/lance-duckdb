@@ -122,8 +122,8 @@ jobs:
 
       - name: Start MinIO
         run: |
-          ./scripts/build_minio_test_images.sh
-          docker run -d --rm \
+          ./scripts/build_minio_test_images.sh RELEASE.2025-09-07T16-13-09Z
+          docker run -d --rm --pull never \
             --name lance-minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
@@ -144,7 +144,7 @@ jobs:
 
       - name: Upload test dataset to MinIO
         run: |
-          docker run --rm \
+          docker run --rm --pull never \
             --network container:lance-minio \
             --volume "${GITHUB_WORKSPACE}/test/data:/fixtures:ro" \
             --env MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000 \
