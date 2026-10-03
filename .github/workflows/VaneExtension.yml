@@ -852,6 +852,7 @@ jobs:
     permissions:
       contents: read
     env:
+      VANE_PROVIDER_PACKAGING_SOURCE: ${{ github.workspace }}/provider-packaging
       CARGO_INCREMENTAL: "0"
       RUSTUP_TOOLCHAIN: 1.98.0
       CCACHE_COMPILERCHECK: content
@@ -1009,6 +1010,26 @@ jobs:
             VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
             VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
             VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT"
+
+      - name: Read exact provider packaging tools pin
+        id: provider_packaging
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          with Path("extension/vane-provider-release.toml").open("rb") as source:
+              revision = tomllib.load(source)["packaging"]["revision"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"revision={revision}\n")
+          PY
+
+      - name: Checkout exact provider packaging tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.provider_packaging.outputs.revision }}
+          path: provider-packaging
+          persist-credentials: false
 
       - name: Build, sign, and verify dynamic provider wheels
         env:
@@ -1487,6 +1508,7 @@ jobs:
       vane_version: ${{ needs.provider-release-preflight.outputs.vane_version }}
       artifact_id: ${{ steps.candidate.outputs.artifact-id }}
     env:
+      VANE_PROVIDER_PACKAGING_SOURCE: ${{ github.workspace }}/provider-packaging
       SIGNING_PROFILE: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
       VANE_DYNAMIC_BUILD_DIR: ${{ github.workspace }}/build/vane-provider-package
       VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-provider-dist
@@ -1561,6 +1583,26 @@ jobs:
               --dest "$destination" "vane-ai==$VANE_VERSION"
             test "$(find "$destination" -maxdepth 1 -type f -name 'vane_ai-*.whl' | wc -l)" -eq 1
           done
+
+      - name: Read exact provider packaging tools pin
+        id: provider_packaging
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          with Path("extension/vane-provider-release.toml").open("rb") as source:
+              revision = tomllib.load(source)["packaging"]["revision"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"revision={revision}\n")
+          PY
+
+      - name: Checkout exact provider packaging tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.provider_packaging.outputs.revision }}
+          path: provider-packaging
+          persist-credentials: false
 
       - name: Package signed bytes and verify against every indexed runtime
         shell: bash
