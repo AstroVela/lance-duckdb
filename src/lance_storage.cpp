@@ -283,7 +283,7 @@ static void PopulateLanceTableColumnsFromDataset(
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  auto coerced = LancePrepareArrowSchemaForRead(schema_root.arrow_schema);
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
   }
@@ -523,7 +523,7 @@ static void PopulateLanceTableColumnsFromJsonSchema(
                       "Interface" +
                       LanceFormatErrorSuffix());
   }
-  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  auto coerced = LancePrepareArrowSchemaForRead(schema_root.arrow_schema);
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
   }

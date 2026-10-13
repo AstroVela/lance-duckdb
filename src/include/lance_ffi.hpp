@@ -231,9 +231,15 @@ int32_t lance_vane_resolve_rest_table(
 #endif
 
 void *lance_get_schema(void *dataset);
+// Default scan view; Blob v2 fields are descriptors, including nested fields.
+void *lance_get_read_schema(void *dataset);
 void *lance_get_schema_for_scan(void *dataset);
 void lance_free_schema(void *schema);
 int32_t lance_schema_to_arrow(void *schema, ArrowSchema *out_schema);
+// Borrows storage_schema. out_schema must be distinct and empty; the caller
+// owns the exported schema and releases it using its Arrow release callback.
+int32_t lance_arrow_schema_to_read(const ArrowSchema *storage_schema,
+                                   ArrowSchema *out_schema);
 
 int32_t lance_stream_next(void *stream, void **out_batch);
 void lance_close_stream(void *stream);

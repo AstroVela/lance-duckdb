@@ -356,7 +356,7 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
         "UPDATE on Lance table '" + lance_table->name +
         "' is not supported: column(s) [" +
         StringUtil::Join(lance_table->CoercedColumnNames(), ", ") +
-        "] have Arrow types DuckDB cannot represent natively, so the "
+        "] have read types that differ from their Lance storage types, so the "
         "catalog exposes a coerced type. Writing in the coerced type would "
         "silently change the on-disk storage.");
   }

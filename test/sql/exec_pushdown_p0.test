@@ -68,3 +68,15 @@ query I
 SELECT count(dec) FROM 'test/.tmp/exec_pushdown_p0.lance';
 ----
 3
+
+# Blob v2 inputs must use the descriptor schema in the Exec provider.
+# This optimizer is registered only in the native DuckDB build.
+query II
+EXPLAIN (FORMAT JSON) SELECT count(video) FROM 'test/data/blob_v2_fixture.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query I
+SELECT count(video) FROM 'test/data/blob_v2_fixture.lance';
+----
+5

@@ -46,7 +46,9 @@ static bool PopulateArrowSchemaForComparison(ClientContext &context,
                                              vector<string> &out_names,
                                              vector<LogicalType> &out_types) {
   try {
-    LanceCoerceArrowSchemaForDuckDB(&schema);
+    // Fingerprints are computed from storage schema before entering this
+    // function. Compare the same read view exposed by catalog binding.
+    LancePrepareArrowSchemaForRead(schema);
     ArrowTableSchema table_schema;
     ArrowTableFunction::PopulateArrowTableSchema(context, table_schema, schema);
     out_names = table_schema.GetNames();

@@ -1,5 +1,9 @@
 #include "lance_arrow_compat.hpp"
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "lance_common.hpp"
+#include "lance_ffi.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -11,6 +15,56 @@
 namespace duckdb {
 
 namespace {
+
+bool ContainsBlobDescriptor(const ArrowSchema &schema) {
+  static const char *names[] = {"kind", "position", "size", "blob_id",
+                                "blob_uri"};
+  static const char *formats[] = {"C", "L", "L", "I", "u"};
+  if (std::strcmp(schema.format, "+s") == 0 && schema.n_children == 5) {
+    bool descriptor = true;
+    for (idx_t i = 0; i < 5; i++) {
+      auto &child = *schema.children[i];
+      descriptor = descriptor && child.name &&
+                   std::strcmp(child.name, names[i]) == 0 &&
+                   std::strcmp(child.format, formats[i]) == 0;
+    }
+    if (descriptor) {
+      return true;
+    }
+  }
+  for (idx_t i = 0; i < static_cast<idx_t>(schema.n_children); i++) {
+    if (ContainsBlobDescriptor(*schema.children[i])) {
+      return true;
+    }
+  }
+  return schema.dictionary && ContainsBlobDescriptor(*schema.dictionary);
+}
+
+bool SameArrowReadType(const ArrowSchema &storage, const ArrowSchema &read) {
+  if (std::strcmp(storage.format, read.format) != 0 ||
+      storage.n_children != read.n_children ||
+      bool(storage.dictionary) != bool(read.dictionary)) {
+    return false;
+  }
+  // List element names are not part of the layout: DuckDB reconstructs them
+  // as "l" (or "" for fixed-size lists), while Lance can return "item".
+  const bool is_list = std::strcmp(storage.format, "+l") == 0 ||
+                       std::strcmp(storage.format, "+L") == 0 ||
+                       std::strcmp(storage.format, "+vl") == 0 ||
+                       std::strcmp(storage.format, "+vL") == 0 ||
+                       std::strncmp(storage.format, "+w:", 3) == 0;
+  for (idx_t i = 0; i < static_cast<idx_t>(storage.n_children); i++) {
+    auto &left = *storage.children[i];
+    auto &right = *read.children[i];
+    if ((!is_list && std::strcmp(left.name ? left.name : "",
+                                 right.name ? right.name : "") != 0) ||
+        !SameArrowReadType(left, right)) {
+      return false;
+    }
+  }
+  return !storage.dictionary ||
+         SameArrowReadType(*storage.dictionary, *read.dictionary);
+}
 
 // ---------------------------------------------------------------------------
 // Per-type coercion rules. Add new rules here; call sites never change.
@@ -231,6 +285,59 @@ void CoerceSchemaRecursive(ArrowSchema *schema, SchemaOverride &state) {
 }
 
 } // namespace
+
+void LanceValidateBlobReadSchema(const ArrowSchema &expected,
+                                 ArrowSchema &actual) {
+  if (!expected.release) {
+    return;
+  }
+  bool coerced = false;
+  for (idx_t i = 0; i < static_cast<idx_t>(expected.n_children); i++) {
+    auto &field = *expected.children[i];
+    if (!ContainsBlobDescriptor(field)) {
+      continue;
+    }
+    if (!coerced) {
+      LanceCoerceArrowSchemaForDuckDB(&actual);
+      coerced = true;
+    }
+    // The actual batch can project a subset of the bound top-level columns.
+    for (idx_t j = 0; j < static_cast<idx_t>(actual.n_children); j++) {
+      auto &batch_field = *actual.children[j];
+      if (field.name && batch_field.name &&
+          std::strcmp(field.name, batch_field.name) == 0 &&
+          !SameArrowReadType(field, batch_field)) {
+        throw IOException("Lance Blob read schema mismatch for column '" +
+                          std::string(field.name) + "'");
+      }
+    }
+  }
+}
+
+std::vector<std::string> LancePrepareArrowSchemaForRead(ArrowSchema &schema) {
+  ArrowSchemaWrapper read;
+  std::memset(&read.arrow_schema, 0, sizeof(read.arrow_schema));
+  if (lance_arrow_schema_to_read(&schema, &read.arrow_schema) != 0) {
+    throw IOException("Failed to derive Lance read schema" +
+                      LanceFormatErrorSuffix());
+  }
+  LanceCoerceArrowSchemaForDuckDB(&read.arrow_schema);
+  if (schema.n_children != read.arrow_schema.n_children) {
+    throw InternalException(
+        "Lance read schema changed the top-level column count");
+  }
+  std::vector<std::string> changed;
+  for (idx_t i = 0; i < static_cast<idx_t>(schema.n_children); i++) {
+    if (!SameArrowReadType(*schema.children[i],
+                           *read.arrow_schema.children[i])) {
+      changed.emplace_back(schema.children[i]->name);
+    }
+  }
+  schema.release(&schema);
+  schema = read.arrow_schema;
+  read.arrow_schema.release = nullptr;
+  return changed;
+}
 
 bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema) {
   return SchemaNeedsCoercion(schema);

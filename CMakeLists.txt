@@ -190,6 +190,7 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/exec_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/filter_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/arrow_export.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/read_schema.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dataset.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dir_namespace.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/exec.rs

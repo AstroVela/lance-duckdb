@@ -89,8 +89,8 @@ public:
 
   // Top-level catalog columns whose declared type was coerced to a
   // DuckDB-compatible shape by the Arrow-compat reader-boundary layer
-  // (e.g. FloatingPoint(HALF) → FloatingPoint(SINGLE)). Writers must refuse
-  // to operate on such columns — DuckDB would hand back values in the
+  // (e.g. Float16 widening or Blob v2 descriptor views). Writers must refuse
+  // INSERT/UPDATE/MERGE on such tables — DuckDB would hand back values in the
   // coerced type and silently widen / otherwise corrupt the on-disk storage.
   bool HasCoercedColumns() const { return !coerced_column_names.empty(); }
   const vector<string> &CoercedColumnNames() const {
