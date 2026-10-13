@@ -11,7 +11,6 @@ use datafusion::logical_expr::Expr;
 use datafusion::object_store::ObjectStoreExt;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::scalar::ScalarValue;
-use datafusion_sql::unparser::expr_to_sql;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::DatasetStatisticsExt;
@@ -34,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
+use crate::filter_ir::filter_expr_to_sql;
 use crate::runtime;
 
 use super::session::record_dataset_open;
@@ -1811,11 +1811,9 @@ fn delete_transaction_with_storage_options_inner(
         )?
     };
     let predicate = match filter {
-        Some(expr) => expr_to_sql(&expr)
-            .map_err(|err| {
-                FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}"))
-            })?
-            .to_string(),
+        Some(expr) => filter_expr_to_sql(&expr).map_err(|err| {
+            FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}"))
+        })?,
         None => "true".to_string(),
     };
     let session = unsafe { optional_session_handle(session)? };
@@ -1966,11 +1964,9 @@ fn dataset_delete_inner(
         )?
     };
     let predicate = match filter {
-        Some(expr) => expr_to_sql(&expr)
-            .map_err(|err| {
-                FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}"))
-            })?
-            .to_string(),
+        Some(expr) => filter_expr_to_sql(&expr).map_err(|err| {
+            FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}"))
+        })?,
         None => "true".to_string(),
     };
 

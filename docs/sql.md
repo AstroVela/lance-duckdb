@@ -45,8 +45,10 @@ Ordinary binary columns and unmarked structs retain their existing types.
 `INSERT`, `UPDATE`, and `MERGE INTO` are rejected for attached tables containing
 Blob v2 columns, even when only another column is assigned, because the read
 view cannot be written back as the storage schema. `DELETE` and `TRUNCATE`
-continue to use the original storage schema. Blob byte reading and writing are
-not provided by this descriptor support.
+continue to use the original storage schema. `DELETE` rejects predicates that
+cannot be fully preserved by the Lance delete path, including unsupported
+Blob descriptor filters; it never executes a partially translated predicate.
+Blob byte reading and writing are not provided by this descriptor support.
 
 ## Search
 

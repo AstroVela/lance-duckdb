@@ -107,15 +107,15 @@ static bool TryBuildLanceDeleteFilterIR(LogicalDelete &op,
     types.push_back(col.Type());
   }
 
-  vector<string> parts;
-
-  vector<ColumnIndex> column_indexes = get->GetColumnIds();
-  TableFunctionInitInput init_input(get->bind_data.get(),
-                                    std::move(column_indexes),
-                                    get->projection_ids, &get->table_filters);
-  auto table_filters =
-      BuildLanceTableFilterIRParts(names, types, init_input, false);
-  parts = std::move(table_filters.parts);
+  // LogicalGet filters use table column ids, not projected scan positions.
+  // Unlike a scan, this operator has no DuckDB filter fallback: every
+  // predicate must survive before a DELETE transaction can be created.
+  auto table_filters = ProbeLanceTableFilterIR(*get, names, types);
+  if (!table_filters.all_filters_pushed) {
+    out_error = "Lance DELETE cannot preserve all pushed table filters";
+    return false;
+  }
+  auto parts = std::move(table_filters.parts);
 
   vector<const Expression *> predicates;
   if (!TryCollectDeleteFilterPredicates(*op.children[0], predicates,

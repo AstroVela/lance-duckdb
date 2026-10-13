@@ -17,6 +17,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
@@ -353,6 +354,11 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
   };
 
   switch (filter.filter_type) {
+  case TableFilterType::OPTIONAL_FILTER: {
+    auto &f = filter.Cast<OptionalFilter>();
+    return f.child_filter &&
+           TryBuildLanceTableFilterIRExpr(col_ref_ir, *f.child_filter, out_ir);
+  }
   case TableFilterType::CONSTANT_COMPARISON: {
     auto &f = filter.Cast<ConstantFilter>();
     uint8_t op = 0;

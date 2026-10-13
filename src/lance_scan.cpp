@@ -1282,6 +1282,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
   DataChunk scan_converted;
+  ArrowTableSchema batch_arrow_table;
   DataChunk deferred_converted;
   shared_ptr<ArrowArrayWrapper> deferred_arrow_owner;
   void *stream = nullptr;
@@ -3069,6 +3070,52 @@ static bool LanceScanOpenStream(ClientContext &context,
   return true;
 }
 
+static void LancePrepareNamespaceScanBatch(LanceScanLocalState &local_state,
+                                           ArrowSchema &schema,
+                                           ArrowArray &array) {
+  auto &global_state = *local_state.global_state;
+  if (schema.n_children != array.n_children) {
+    throw IOException(
+        "Lance namespace batch schema/array column count mismatch");
+  }
+
+  // The catalog retains SQL types, which erase Arrow offset widths. Decode
+  // with the producer's schema and check the complete logical types instead,
+  // including every field of nested Blob descriptors.
+  LanceCoerceArrowSchemaForDuckDB(&schema);
+  unordered_map<string, idx_t> idx_by_name;
+  for (idx_t i = 0; i < NumericCast<idx_t>(schema.n_children); i++) {
+    auto *field = schema.children[i];
+    if (!field->name || !idx_by_name.emplace(field->name, i).second) {
+      throw IOException(
+          "Lance namespace batch has missing or duplicate column names");
+    }
+  }
+  ArrowTableSchema batch_table;
+  ArrowTableFunction::PopulateArrowTableSchema(local_state.context, batch_table,
+                                               schema);
+  vector<column_t> column_ids;
+  for (idx_t i = 0; i < global_state.scan_column_names.size(); i++) {
+    auto &name = global_state.scan_column_names[i];
+    auto it = idx_by_name.find(name);
+    if (it == idx_by_name.end()) {
+      throw IOException("Missing expected column in Arrow batch: " + name);
+    }
+    if (batch_table.GetTypes()[it->second] !=
+        global_state.scan_converted_types[i]) {
+      throw IOException("Lance namespace batch schema does not match the bound "
+                        "output for column '" +
+                        name + "'");
+    }
+    column_ids.push_back(NumericCast<column_t>(it->second));
+  }
+  // Keep the producer's array order and map both schema and array indices.
+  // This also accepts servers returning extra columns without rewriting the
+  // producer-owned child pointers.
+  local_state.column_ids = std::move(column_ids);
+  local_state.batch_arrow_table = std::move(batch_table);
+}
+
 static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state,
                                    const LanceScanBindData &bind_data) {
   if (!local_state.stream) {
@@ -3117,9 +3164,17 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state,
   // `tmp_schema` still carries the original "e" format codes, so do this
   // before it is released.
   LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
-  LanceValidateBlobReadSchema(bind_data.schema_root.arrow_schema, tmp_schema);
+  const bool namespace_query =
+      local_state.global_state && local_state.global_state->use_namespace_query;
+  if (namespace_query) {
+    LancePrepareNamespaceScanBatch(local_state, tmp_schema,
+                                   new_chunk->arrow_array);
+  } else {
+    LanceValidateBlobReadSchema(bind_data.schema_root.arrow_schema, tmp_schema);
+  }
 
-  if (local_state.global_state && tmp_schema.n_children > 0 &&
+  if (!namespace_query && local_state.global_state &&
+      tmp_schema.n_children > 0 &&
       new_chunk->arrow_array.n_children == tmp_schema.n_children &&
       !local_state.global_state->scan_column_names.empty()) {
     unordered_map<string, idx_t> idx_by_name;
@@ -3373,8 +3428,12 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
 
     local_state.scan_converted.Reset();
     local_state.scan_converted.SetCardinality(output_size);
-    ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
-                                      local_state.scan_converted);
+    ArrowTableFunction::ArrowToDuckDB(
+        local_state,
+        global_state.use_namespace_query
+            ? local_state.batch_arrow_table.GetColumns()
+            : arrow_columns,
+        local_state.scan_converted, !global_state.use_namespace_query);
 
     auto fill_output_from_converted = [&](DataChunk &target) {
       if (target.ColumnCount() !=
