@@ -14,3 +14,10 @@ query I
 SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30;
 ----
 3
+
+# Common Blob descriptor support must be available in both builds.
+query II
+SELECT video.kind, video.size
+FROM 'test/data/blob_v2_fixture.lance' WHERE id = 3;
+----
+3	19

@@ -179,7 +179,7 @@ pub unsafe extern "C" fn lance_get_hybrid_schema(dataset: *mut c_void) -> *mut c
 
 fn get_hybrid_schema_inner(dataset: *mut c_void) -> FfiResult<SchemaHandle> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
-    Ok(projection::build_hybrid_schema(&handle.arrow_schema))
+    Ok(projection::build_hybrid_schema(&handle.read_arrow_schema))
 }
 
 #[no_mangle]

@@ -61,14 +61,14 @@
 
 namespace duckdb {
 
-#ifdef LANCE_VANE_DISTRIBUTED
 static ArrowTableSchema
 LanceSearchBatchSchema(ClientContext &context, ArrowSchema &schema,
                        ArrowArray &array, const vector<string> &names,
                        const vector<LogicalType> &types) {
   // SQL types describe the bound output, not the physical layout of a Lance
-  // batch. In particular, VARCHAR does not distinguish Arrow string offsets
-  // or views. Always build the reader from the producer's actual schema.
+  // batch. In particular, LIST/VARCHAR/BLOB do not preserve Arrow offset
+  // widths or views, including inside nested types. Always build the reader
+  // from the producer's actual schema.
   LanceCoerceArrowArrayForDuckDB(&schema, &array);
   LanceCoerceArrowSchemaForDuckDB(&schema);
   ArrowTableSchema result;
@@ -79,7 +79,6 @@ LanceSearchBatchSchema(ClientContext &context, ArrowSchema &schema,
   }
   return result;
 }
-#endif
 
 static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
                                const vector<float> &query, uint64_t k,
@@ -512,9 +511,7 @@ struct LanceKnnLocalState : public ArrowScanLocalState {
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
   void *stream = nullptr;
-#ifdef LANCE_VANE_DISTRIBUTED
   ArrowTableSchema batch_arrow_table;
-#endif
   LanceKnnGlobalState *global_state = nullptr;
   bool filter_pushed_down = false;
   SelectionVector filter_sel;
@@ -1087,12 +1084,8 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   return std::move(result);
 }
 
-#ifdef LANCE_VANE_DISTRIBUTED
 static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state,
                                   const LanceKnnBindData &bind_data) {
-#else
-static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
-#endif
   if (!local_state.stream) {
     return false;
   }
@@ -1118,12 +1111,8 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
 
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
   memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-#ifdef LANCE_VANE_DISTRIBUTED
   ArrowSchemaWrapper batch_schema;
   auto &tmp_schema = batch_schema.arrow_schema;
-#else
-  ArrowSchema tmp_schema;
-#endif
   memset(&tmp_schema, 0, sizeof(tmp_schema));
 
   if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
@@ -1142,26 +1131,15 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
 
   lance_free_batch(batch);
 
-#ifdef LANCE_VANE_DISTRIBUTED
   local_state.batch_arrow_table = LanceSearchBatchSchema(
       local_state.context, tmp_schema, new_chunk->arrow_array, bind_data.names,
       bind_data.types);
-#else
-  // Widen Float16 columns before DuckDB consumes the batch.
-  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
-#endif
 
   if (local_state.global_state) {
     local_state.global_state->record_batches.fetch_add(1);
     auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
     local_state.global_state->record_batch_rows.fetch_add(rows);
   }
-
-#ifndef LANCE_VANE_DISTRIBUTED
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
-  }
-#endif
 
   local_state.chunk = std::move(new_chunk);
   local_state.Reset();
@@ -1181,11 +1159,7 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
   while (true) {
     if (local_state.chunk_offset >=
         NumericCast<idx_t>(local_state.chunk->arrow_array.length)) {
-#ifdef LANCE_VANE_DISTRIBUTED
       if (!LanceKnnLoadNextBatch(local_state, bind_data)) {
-#else
-      if (!LanceKnnLoadNextBatch(local_state)) {
-#endif
         return;
       }
     }
@@ -1198,15 +1172,9 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetCardinality(output_size);
-#ifdef LANCE_VANE_DISTRIBUTED
       ArrowTableFunction::ArrowToDuckDB(
           local_state, local_state.batch_arrow_table.GetColumns(),
           local_state.all_columns, false);
-#else
-      ArrowTableFunction::ArrowToDuckDB(local_state,
-                                        bind_data.arrow_table.GetColumns(),
-                                        local_state.all_columns, false);
-#endif
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
@@ -1217,14 +1185,9 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
       output.SetCardinality(local_state.all_columns);
     } else {
       output.SetCardinality(output_size);
-#ifdef LANCE_VANE_DISTRIBUTED
       ArrowTableFunction::ArrowToDuckDB(
           local_state, local_state.batch_arrow_table.GetColumns(), output,
           false);
-#else
-      ArrowTableFunction::ArrowToDuckDB(
-          local_state, bind_data.arrow_table.GetColumns(), output, false);
-#endif
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
@@ -2355,9 +2318,7 @@ struct LanceSearchLocalState : public ArrowScanLocalState {
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
   void *stream = nullptr;
-#ifdef LANCE_VANE_DISTRIBUTED
   ArrowTableSchema batch_arrow_table;
-#endif
   LanceSearchGlobalState *global_state = nullptr;
   bool filter_pushed_down = false;
   SelectionVector filter_sel;
@@ -2552,12 +2513,8 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
 
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
   memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-#ifdef LANCE_VANE_DISTRIBUTED
   ArrowSchemaWrapper batch_schema;
   auto &tmp_schema = batch_schema.arrow_schema;
-#else
-  ArrowSchema tmp_schema;
-#endif
   memset(&tmp_schema, 0, sizeof(tmp_schema));
 
   if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
@@ -2575,24 +2532,13 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
   }
   lance_free_batch(batch);
 
-#ifdef LANCE_VANE_DISTRIBUTED
   local_state.batch_arrow_table =
       LanceSearchBatchSchema(context, tmp_schema, new_chunk->arrow_array,
                              bind_data.names, bind_data.types);
-#else
-  // Widen Float16 columns before DuckDB consumes the batch.
-  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
-#endif
 
   local_state.global_state->record_batches.fetch_add(1);
   auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
   local_state.global_state->record_batch_rows.fetch_add(rows);
-
-#ifndef LANCE_VANE_DISTRIBUTED
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
-  }
-#endif
 
   local_state.chunk = std::move(new_chunk);
   local_state.Reset();
@@ -3085,15 +3031,9 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetCardinality(output_size);
-#ifdef LANCE_VANE_DISTRIBUTED
       ArrowTableFunction::ArrowToDuckDB(
           local_state, local_state.batch_arrow_table.GetColumns(),
           local_state.all_columns, false);
-#else
-      ArrowTableFunction::ArrowToDuckDB(local_state,
-                                        bind_data.arrow_table.GetColumns(),
-                                        local_state.all_columns, false);
-#endif
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
@@ -3104,14 +3044,9 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
       output.SetCardinality(local_state.all_columns);
     } else {
       output.SetCardinality(output_size);
-#ifdef LANCE_VANE_DISTRIBUTED
       ArrowTableFunction::ArrowToDuckDB(
           local_state, local_state.batch_arrow_table.GetColumns(), output,
           false);
-#else
-      ArrowTableFunction::ArrowToDuckDB(
-          local_state, bind_data.arrow_table.GetColumns(), output, false);
-#endif
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,

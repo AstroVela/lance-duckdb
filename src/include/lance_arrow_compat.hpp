@@ -7,6 +7,16 @@
 
 namespace duckdb {
 
+// Replace an owned storage schema with the default Lance scan view and then
+// apply DuckDB type coercions. No arrays or Blob payloads are materialized.
+// Return affected top-level columns for the catalog's write protection.
+std::vector<std::string> LancePrepareArrowSchemaForRead(ArrowSchema &schema);
+
+// Before Arrow conversion, reject incompatible batch layouts for columns
+// containing Blob descriptors. Call after array coercion; metadata may differ.
+void LanceValidateBlobReadSchema(const ArrowSchema &expected,
+                                 ArrowSchema &actual);
+
 // Compatibility shim between the Arrow types Lance emits and the subset
 // DuckDB's bundled Arrow consumer supports.
 //

@@ -30,6 +30,7 @@ pub(crate) struct SessionHandle {
 pub(crate) struct DatasetHandle {
     pub(crate) dataset: Arc<Dataset>,
     pub(crate) arrow_schema: SchemaHandle,
+    pub(crate) read_arrow_schema: SchemaHandle,
     pub(crate) base_projection: Arc<[String]>,
     pub(crate) fts_projection: Arc<[String]>,
     #[cfg(feature = "vane-distributed")]
@@ -38,6 +39,7 @@ pub(crate) struct DatasetHandle {
 
 impl DatasetHandle {
     pub(crate) fn new(dataset: Arc<Dataset>) -> Self {
+        let read_arrow_schema = super::read_schema::dataset_read_schema(dataset.schema());
         let arrow_schema: Schema = dataset.schema().into();
         let arrow_schema = Arc::new(arrow_schema);
         let base_projection = projection::build_base_projection(&arrow_schema);
@@ -45,6 +47,7 @@ impl DatasetHandle {
         Self {
             dataset,
             arrow_schema,
+            read_arrow_schema,
             base_projection,
             fts_projection,
             #[cfg(feature = "vane-distributed")]

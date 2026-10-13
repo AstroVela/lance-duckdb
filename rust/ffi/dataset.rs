@@ -1297,6 +1297,26 @@ fn get_schema_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandl
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn lance_get_read_schema(dataset: *mut c_void) -> *mut c_void {
+    match get_read_schema_inner(dataset) {
+        Ok(schema) => {
+            clear_last_error();
+            Box::into_raw(Box::new(schema)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn get_read_schema_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandle> {
+    // SAFETY: The FFI caller owns a live DatasetHandle; null is rejected.
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+    Ok(handle.read_arrow_schema.clone())
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lance_get_schema_for_scan(dataset: *mut c_void) -> *mut c_void {
     match get_schema_for_scan_inner(dataset) {
         Ok(schema) => {
@@ -1313,7 +1333,7 @@ pub unsafe extern "C" fn lance_get_schema_for_scan(dataset: *mut c_void) -> *mut
 fn get_schema_for_scan_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandle> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
 
-    let mut schema: Schema = (*handle.arrow_schema).clone();
+    let mut schema: Schema = (*handle.read_arrow_schema).clone();
     let has_row_id = schema.fields.iter().any(|f| f.name() == ROW_ID_COLUMN);
     if !has_row_id {
         let mut fields = schema.fields.iter().cloned().collect::<Vec<_>>();

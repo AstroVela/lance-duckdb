@@ -120,9 +120,9 @@ statement error
 INSERT INTO ns.main.float16_fixture
 VALUES (99, 1.0, [1.0, 2.0, 3.0], [1.0], {'half': 1.0, 'f32': 1.0}, []);
 ----
-Arrow types DuckDB cannot represent
+read types that differ from their Lance storage types
 
 statement error
 UPDATE ns.main.float16_fixture SET half_scalar = 0 WHERE id = 0;
 ----
-Arrow types DuckDB cannot represent
+read types that differ from their Lance storage types

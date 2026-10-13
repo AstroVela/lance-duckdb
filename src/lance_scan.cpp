@@ -706,8 +706,17 @@ unique_ptr<FunctionData> LanceScanBindData::Copy() const {
   result->dataset_entry = dataset_entry;
   result->dataset = dataset;
   result->dataset_cache_hit = dataset_cache_hit;
-  // ArrowTableSchema owns shared schema state. The move-only ArrowSchemaWrapper
-  // roots are intentionally not copied and must not be read from a bind copy.
+  // ArrowTableSchema owns shared schema state. Keep an independently owned
+  // read schema for Blob batch validation; never copy Arrow release callbacks
+  // by value. The scan_schema_root is not needed by a bind copy.
+  memset(&result->schema_root.arrow_schema, 0,
+         sizeof(result->schema_root.arrow_schema));
+  if (schema_root.arrow_schema.release &&
+      lance_arrow_schema_to_read(&schema_root.arrow_schema,
+                                 &result->schema_root.arrow_schema) != 0) {
+    throw IOException("Failed to copy Lance read schema" +
+                      LanceScanErrorSuffix(*this));
+  }
   result->arrow_table = arrow_table;
   result->scan_arrow_table = scan_arrow_table;
   result->names = names;
@@ -1728,7 +1737,7 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
 #ifdef LANCE_VANE_DISTRIBUTED
 static void PopulateLanceDistributedScanSchemas(ClientContext &context,
                                                 LanceScanBindData &bind_data) {
-  auto *schema_handle = lance_get_schema(bind_data.dataset);
+  auto *schema_handle = lance_get_read_schema(bind_data.dataset);
   if (!schema_handle) {
     throw IOException("Failed to get schema from fixed Lance snapshot" +
                       LanceScanErrorSuffix(bind_data));
@@ -1993,7 +2002,7 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
   }
 #endif
 
-  auto *schema_handle = lance_get_schema(result->dataset);
+  auto *schema_handle = lance_get_read_schema(result->dataset);
   if (!schema_handle) {
 #ifdef LANCE_VANE_DISTRIBUTED
     throw IOException("Failed to get schema from Lance dataset: " +
@@ -2136,7 +2145,7 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
                       result->file_path + LanceFormatErrorSuffix());
 #endif
   }
-  auto *schema_handle = lance_get_schema(result->dataset);
+  auto *schema_handle = lance_get_read_schema(result->dataset);
   if (!schema_handle) {
 #ifdef LANCE_VANE_DISTRIBUTED
     throw IOException(
@@ -3060,7 +3069,8 @@ static bool LanceScanOpenStream(ClientContext &context,
   return true;
 }
 
-static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
+static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state,
+                                   const LanceScanBindData &bind_data) {
   if (!local_state.stream) {
     return false;
   }
@@ -3084,7 +3094,8 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
 
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
   memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
+  ArrowSchemaWrapper batch_schema;
+  auto &tmp_schema = batch_schema.arrow_schema;
   memset(&tmp_schema, 0, sizeof(tmp_schema));
 
   if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
@@ -3106,6 +3117,7 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
   // `tmp_schema` still carries the original "e" format codes, so do this
   // before it is released.
   LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+  LanceValidateBlobReadSchema(bind_data.schema_root.arrow_schema, tmp_schema);
 
   if (local_state.global_state && tmp_schema.n_children > 0 &&
       new_chunk->arrow_array.n_children == tmp_schema.n_children &&
@@ -3216,7 +3228,8 @@ static void LanceFillDeferredColumns(ClientContext &context,
 
   auto take_arrow = make_shared_ptr<ArrowArrayWrapper>();
   memset(&take_arrow->arrow_array, 0, sizeof(take_arrow->arrow_array));
-  ArrowSchema take_schema;
+  ArrowSchemaWrapper take_schema_root;
+  auto &take_schema = take_schema_root.arrow_schema;
   memset(&take_schema, 0, sizeof(take_schema));
   if (lance_batch_to_arrow(batch, &take_arrow->arrow_array, &take_schema) !=
       0) {
@@ -3248,6 +3261,7 @@ static void LanceFillDeferredColumns(ClientContext &context,
   // still has "e" formats), then rewrite the schema formats to "f".
   LanceCoerceArrowArrayForDuckDB(&take_schema, &take_arrow->arrow_array);
   LanceCoerceArrowSchemaForDuckDB(&take_schema);
+  LanceValidateBlobReadSchema(bind_data.schema_root.arrow_schema, take_schema);
 
   ArrowTableSchema take_table;
   ArrowTableFunction::PopulateArrowTableSchema(context, take_table,
@@ -3342,7 +3356,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
 
     if (local_state.chunk_offset >=
         NumericCast<idx_t>(local_state.chunk->arrow_array.length)) {
-      if (!LanceScanLoadNextBatch(local_state)) {
+      if (!LanceScanLoadNextBatch(local_state, bind_data)) {
         if (global_state.use_dataset_scanner) {
           return;
         }
@@ -5047,7 +5061,7 @@ static void PopulateLanceTableSchemaFromDataset(
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  auto coerced = LancePrepareArrowSchemaForRead(schema_root.arrow_schema);
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
   }
@@ -5603,7 +5617,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   }
 #endif
 
-  auto *schema_handle = lance_get_schema(result->dataset);
+  auto *schema_handle = lance_get_read_schema(result->dataset);
   if (!schema_handle) {
 #ifdef LANCE_VANE_DISTRIBUTED
     throw IOException("Failed to get schema from Lance dataset: " +

@@ -314,7 +314,7 @@ pub unsafe extern "C" fn lance_vane_plan_namespace_filter(
                 "namespace filter must not be empty",
             ));
         }
-        encode_namespace_filter_plan(handle.arrow_schema.clone(), sql)
+        encode_namespace_filter_plan(handle.read_arrow_schema.clone(), sql)
     })();
     match result {
         Ok(bytes) => {

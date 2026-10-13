@@ -25,6 +25,29 @@ FROM 'path/to/dataset.lance'
 LIMIT 10;
 ```
 
+### Blob v2 descriptor columns
+
+Lance Blob v2 columns expose the default Lance scan view:
+`STRUCT(kind UTINYINT, position UBIGINT, size UBIGINT, blob_id UINTEGER, blob_uri VARCHAR)`.
+This applies to direct scans, attached tables, and search results, including
+Blob fields nested inside structs and lists.
+
+```sql
+SELECT video.kind, video.size
+FROM 'path/to/videos.lance';
+```
+
+These values describe stored blobs; reading them does not fetch video bytes.
+The descriptor is not the logical write representation
+`STRUCT(data BLOB, uri VARCHAR, position UBIGINT, size UBIGINT)`.
+Ordinary binary columns and unmarked structs retain their existing types.
+
+`INSERT`, `UPDATE`, and `MERGE INTO` are rejected for attached tables containing
+Blob v2 columns, even when only another column is assigned, because the read
+view cannot be written back as the storage schema. `DELETE` and `TRUNCATE`
+continue to use the original storage schema. Blob byte reading and writing are
+not provided by this descriptor support.
+
 ## Search
 
 ### Vector search: `lance_vector_search`
