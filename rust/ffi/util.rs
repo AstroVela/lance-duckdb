@@ -13,8 +13,9 @@ use lance::session::Session;
 use lance_core::datatypes::Schema as LanceSchema;
 #[cfg(feature = "vane-distributed")]
 use lance_io::object_store::uri_to_url;
+use object_store::aws::AwsCredential;
 #[cfg(feature = "vane-distributed")]
-use object_store::{aws::AwsCredential, StaticCredentialProvider};
+use object_store::StaticCredentialProvider;
 #[cfg(feature = "vane-distributed")]
 use url::Url;
 
@@ -174,7 +175,6 @@ pub(crate) fn to_c_string(s: impl AsRef<str>) -> CString {
     }
 }
 
-#[cfg(feature = "vane-distributed")]
 pub(crate) fn explicit_aws_credentials(
     storage_options: &std::collections::HashMap<String, String>,
 ) -> Option<AwsCredential> {

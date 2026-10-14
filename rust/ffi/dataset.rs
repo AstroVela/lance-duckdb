@@ -7,7 +7,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use datafusion::logical_expr::Expr;
-#[cfg(feature = "vane-distributed")]
 use datafusion::object_store::ObjectStoreExt;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::scalar::ScalarValue;
@@ -591,13 +590,17 @@ unsafe fn vane_storage_options_from_ffi(
     Ok(storage_options)
 }
 
+pub(super) fn exact_version_builder(path: &str, version: u64) -> DatasetBuilder {
+    DatasetBuilder::from_uri(path).with_version(version)
+}
+
 #[cfg(feature = "vane-distributed")]
 fn vane_versioned_dataset_builder(
     path: &str,
     version: u64,
     storage_options: Option<&HashMap<String, String>>,
 ) -> DatasetBuilder {
-    let mut builder = DatasetBuilder::from_uri(path).with_version(version);
+    let mut builder = exact_version_builder(path, version);
     if let Some(storage_options) = storage_options {
         builder = with_explicit_aws_credentials(builder, storage_options);
         builder = builder.with_storage_options(storage_options.clone());
@@ -1094,7 +1097,6 @@ pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     }
 }
 
-#[cfg(feature = "vane-distributed")]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void) -> u64 {
     match dataset_version_inner(dataset) {
@@ -1109,16 +1111,13 @@ pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void) -> u64 {
     }
 }
 
-#[cfg(feature = "vane-distributed")]
 fn dataset_version_inner(dataset: *mut c_void) -> FfiResult<u64> {
     // SAFETY: dataset_handle validates the opaque pointer before dereferencing it.
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     Ok(handle.dataset.version_id())
 }
 
-#[cfg(feature = "vane-distributed")]
 pub(super) async fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiResult<String> {
-    let manifest = dataset.manifest();
     let location = dataset.manifest_location();
     let mut size = location.size;
     let mut e_tag = location.e_tag.clone();
@@ -1143,12 +1142,23 @@ pub(super) async fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiRe
         }
     }
 
+    format_snapshot_identity(dataset, size.unwrap_or_default(), e_tag.as_deref())
+}
+
+// This tuple serialization is part of the Blob URI v1 identity. Keep its order
+// and defaults stable, and preserve the existing Vane generation representation.
+pub(super) fn format_snapshot_identity(
+    dataset: &lance::Dataset,
+    size: u64,
+    e_tag: Option<&str>,
+) -> FfiResult<String> {
+    let manifest = dataset.manifest();
     serde_json::to_string(&(
         manifest.version,
         manifest.timestamp_nanos,
         manifest.transaction_file.as_deref().unwrap_or_default(),
-        size.unwrap_or_default(),
-        e_tag.as_deref().unwrap_or_default(),
+        size,
+        e_tag.unwrap_or_default(),
     ))
     .map_err(|err| {
         FfiError::new(
@@ -1158,7 +1168,6 @@ pub(super) async fn dataset_snapshot_identity(dataset: &lance::Dataset) -> FfiRe
     })
 }
 
-#[cfg(feature = "vane-distributed")]
 async fn manifest_snapshot_metadata(
     store: &dyn object_store::ObjectStore,
     path: &object_store::path::Path,
@@ -1171,7 +1180,6 @@ async fn manifest_snapshot_metadata(
     })
 }
 
-#[cfg(feature = "vane-distributed")]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_generation_id(dataset: *mut c_void) -> *const c_char {
     match dataset_generation_id_inner(dataset) {
@@ -1186,7 +1194,6 @@ pub unsafe extern "C" fn lance_dataset_generation_id(dataset: *mut c_void) -> *c
     }
 }
 
-#[cfg(feature = "vane-distributed")]
 fn dataset_generation_id_inner(dataset: *mut c_void) -> FfiResult<std::ffi::CString> {
     // SAFETY: dataset_handle validates the opaque pointer before dereferencing it.
     let handle = unsafe { super::util::dataset_handle(dataset)? };
@@ -1203,7 +1210,6 @@ fn dataset_generation_id_inner(dataset: *mut c_void) -> FfiResult<std::ffi::CStr
     })
 }
 
-#[cfg(feature = "vane-distributed")]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_checkout_version(
     dataset: *mut c_void,
@@ -1221,7 +1227,6 @@ pub unsafe extern "C" fn lance_dataset_checkout_version(
     }
 }
 
-#[cfg(feature = "vane-distributed")]
 fn dataset_checkout_version_inner(dataset: *mut c_void, version: u64) -> FfiResult<DatasetHandle> {
     // SAFETY: dataset_handle validates the opaque pointer before dereferencing it.
     let handle = unsafe { super::util::dataset_handle(dataset)? };

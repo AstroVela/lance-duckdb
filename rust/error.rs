@@ -69,6 +69,12 @@ pub enum ErrorCode {
     NamespaceQueryTable = 54,
     #[cfg(feature = "vane-distributed")]
     DistributedWrite = 55,
+    BlobOpen = 56,
+    BlobRead = 57,
+    BlobRange = 58,
+    BlobSnapshot = 59,
+    BlobAccess = 60,
+    BlobNotFound = 61,
 }
 
 struct LastError {

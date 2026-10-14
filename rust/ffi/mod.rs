@@ -1,4 +1,8 @@
 mod arrow_export;
+mod blob;
+mod blob_store;
+#[cfg(test)]
+mod blob_test_support;
 mod dataset;
 mod dir_namespace;
 #[cfg(feature = "vane-distributed")]
