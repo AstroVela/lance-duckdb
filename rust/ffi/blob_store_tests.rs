@@ -965,6 +965,339 @@ fn short_response_is_rejected_before_the_lance_scheduler_slices_it() {
     .unwrap();
 }
 
+// Exercise the pinned upstream HTTP clients without cloud credentials or
+// process-global endpoint changes. Each reply serves exactly one request.
+fn object_http_server(replies: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for body in replies {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no object request received"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("object listener: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count != 0 && request.len() < 65536);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"test\"\r\nLast-Modified: Wed, 14 Oct 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            if !request.starts_with("HEAD ") {
+                socket.write_all(body.as_bytes()).unwrap();
+            }
+            requests.push(request.lines().next().unwrap().to_owned());
+        }
+        requests
+    });
+    (endpoint, server)
+}
+
+fn s3_http_options(endpoint: String, opendal: bool) -> HashMap<String, String> {
+    HashMap::from([
+        ("use_opendal".into(), opendal.to_string()),
+        ("access_key_id".into(), "test-access".into()),
+        ("secret_access_key".into(), "test-secret".into()),
+        ("region".into(), "us-east-1".into()),
+        ("aws_allow_http".into(), "true".into()),
+        ("client_max_retries".into(), "0".into()),
+        ("endpoint".into(), endpoint),
+    ])
+}
+
+#[test]
+fn opendal_reads_preserve_literal_percent_keys_and_metadata() {
+    for opendal in [false, true] {
+        for head in [false, true] {
+            let (endpoint, server) = object_http_server(vec!["data".into()]);
+            crate::runtime::block_on(async {
+                let access = Access::new();
+                access
+                    .policy
+                    .scopes
+                    .lock()
+                    .unwrap()
+                    .push(("s3://".into(), s3_http_options(endpoint, opendal)));
+                // This key is a different object from the literal percent key.
+                access.deny("s3://bucket/private/object", None);
+                let (store, path) = ObjectStore::from_uri_and_params(
+                    session(access.context()).store_registry(),
+                    "s3://bucket/private%252Fobject",
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(path.as_ref(), "private%2Fobject");
+                let result = store
+                    .inner
+                    .get_opts(
+                        &path,
+                        GetOptions {
+                            head,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.meta.location, path);
+                assert_eq!(result.meta.size, 4);
+                if !head {
+                    assert_eq!(result.bytes().await.unwrap().as_ref(), b"data");
+                }
+                {
+                    let calls = access.policy.calls.lock().unwrap();
+                    assert!(calls
+                        .iter()
+                        .any(|(uri, op, _)| uri == "s3://bucket/private%252Fobject"
+                            && *op == if head { METADATA } else { READ }));
+                }
+                // Denying the literal key also applies on the already cached client.
+                access.deny("s3://bucket/private%252Fobject", None);
+                assert!(matches!(
+                    store.inner.get(&path).await.unwrap_err(),
+                    object_store::Error::PermissionDenied { .. }
+                ));
+            })
+            .unwrap();
+            let method = if head { "HEAD" } else { "GET" };
+            assert_eq!(
+                server.join().unwrap(),
+                [format!("{method} /bucket/private%252Fobject HTTP/1.1")]
+            );
+        }
+    }
+}
+
+#[test]
+fn opendal_listing_preserves_percent_prefixes_and_returned_paths() {
+    for delimiter in [false, true] {
+        let common = if delimiter {
+            "<CommonPrefixes><Prefix>private%2Fprefix/sub%2Fdir/</Prefix></CommonPrefixes>"
+        } else {
+            ""
+        };
+        let body = format!("<ListBucketResult><IsTruncated>false</IsTruncated>{common}<Contents><Key>private%2Fprefix/a%2Fobject</Key><LastModified>2026-10-14T00:00:00Z</LastModified><ETag>test</ETag><Size>4</Size></Contents></ListBucketResult>");
+        let (endpoint, server) = object_http_server(vec![body, "data".into()]);
+        crate::runtime::block_on(async {
+            let access = Access::new();
+            access
+                .policy
+                .scopes
+                .lock()
+                .unwrap()
+                .push(("s3://".into(), s3_http_options(endpoint, true)));
+            access.deny("s3://bucket/private/prefix", None);
+            let (store, prefix) = ObjectStore::from_uri_and_params(
+                session(access.context()).store_registry(),
+                "s3://bucket/private%252Fprefix",
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+            let objects = if delimiter {
+                let listed = store
+                    .inner
+                    .list_with_delimiter(Some(&prefix))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    listed.common_prefixes,
+                    [Path::parse("private%2Fprefix/sub%2Fdir").unwrap()]
+                );
+                listed.objects
+            } else {
+                store
+                    .inner
+                    .list(Some(&prefix))
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(objects.len(), 1);
+            assert_eq!(
+                objects[0].location,
+                Path::parse("private%2Fprefix/a%2Fobject").unwrap()
+            );
+            let result = store.inner.get(&objects[0].location).await.unwrap();
+            assert_eq!(result.meta.location, objects[0].location);
+            assert_eq!(result.bytes().await.unwrap().as_ref(), b"data");
+            let calls = access.policy.calls.lock().unwrap();
+            assert!(calls
+                .iter()
+                .any(|(uri, op, _)| uri == "s3://bucket/private%252Fprefix" && *op == LIST));
+            assert!(calls.iter().any(|(uri, op, _)| uri
+                == "s3://bucket/private%252Fprefix/a%252Fobject"
+                && *op == READ));
+        })
+        .unwrap();
+        let requests = server.join().unwrap();
+        let list_url = Url::parse(&format!(
+            "http://localhost{}",
+            requests[0].split_whitespace().nth(1).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(
+            list_url
+                .query_pairs()
+                .find(|(key, _)| key == "prefix")
+                .unwrap()
+                .1,
+            "private%2Fprefix/"
+        );
+        assert_eq!(
+            requests[1],
+            "GET /bucket/private%252Fprefix/a%252Fobject HTTP/1.1"
+        );
+    }
+}
+
+#[test]
+fn azure_and_gcs_opendal_clients_do_not_duplicate_object_paths() {
+    for scheme in ["az", "gs"] {
+        let mut requests = Vec::new();
+        for wrapped in [false, true] {
+            let (endpoint, server) = object_http_server(vec!["data".into()]);
+            crate::runtime::block_on(async {
+                let mut options = HashMap::from([("use_opendal".into(), "true".into())]);
+                if scheme == "az" {
+                    options.extend([
+                        ("azure_storage_account_name".into(), "testaccount".into()),
+                        (
+                            "azure_storage_account_key".into(),
+                            "dGVzdC1zZWNyZXQ=".into(),
+                        ),
+                        ("azure_storage_endpoint".into(), endpoint),
+                    ]);
+                } else {
+                    options.extend([
+                        ("endpoint".into(), endpoint),
+                        ("token".into(), "test-token".into()),
+                        ("disable_config_load".into(), "true".into()),
+                        ("disable_vm_metadata".into(), "true".into()),
+                    ]);
+                }
+                let access = Access::new();
+                access
+                    .policy
+                    .scopes
+                    .lock()
+                    .unwrap()
+                    .push((format!("{scheme}://"), options.clone()));
+                access.deny("private/object/private/object", None);
+                let registry = if wrapped {
+                    session(access.context()).store_registry()
+                } else {
+                    Arc::new(ObjectStoreRegistry::default())
+                };
+                let params = ObjectStoreParams {
+                    storage_options_accessor: Some(Arc::new(
+                        StorageOptionsAccessor::with_static_options(options),
+                    )),
+                    ..Default::default()
+                };
+                // The control constructs the upstream client at the bucket root.
+                // The mediated client must preserve its paths for child objects.
+                let (store, _) = ObjectStore::from_uri_and_params(
+                    registry,
+                    &format!("{scheme}://bucket"),
+                    &params,
+                )
+                .await
+                .unwrap();
+                let path = Path::from("private/object");
+                let result = store.inner.get(&path).await.unwrap();
+                assert_eq!(result.bytes().await.unwrap().as_ref(), b"data");
+                if wrapped {
+                    assert!(access
+                        .policy
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(
+                            |(uri, op, _)| uri == &format!("{scheme}://bucket/private/object")
+                                && *op == READ
+                        ));
+                }
+            })
+            .unwrap();
+            requests.push(server.join().unwrap());
+        }
+        assert_eq!(
+            requests[0], requests[1],
+            "{scheme} changed the physical object"
+        );
+    }
+}
+
+#[test]
+fn hf_repository_aliases_share_authorization_before_cache_and_io() {
+    crate::runtime::block_on(async {
+        for (singular, plural) in [
+            ("model", "models"),
+            ("dataset", "datasets"),
+            ("space", "spaces"),
+            ("bucket", "buckets"),
+        ] {
+            let canonical = format!("hf://{plural}/owner/repo/private/object");
+            let access = Access::new();
+            let registry = session(access.context()).store_registry();
+            // Construction is network-free for the pinned HF provider. Seed its
+            // cache, then deny the canonical identity before trying every alias.
+            registry
+                .get_store(
+                    Url::parse(&canonical).unwrap(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap();
+            access.deny(&canonical, None);
+            for spelling in [
+                singular.to_owned(),
+                plural.to_owned(),
+                singular.to_uppercase(),
+                plural.to_uppercase(),
+            ] {
+                let uri = format!("hf://{spelling}/owner/repo/private/object");
+                let error = registry
+                    .get_store(Url::parse(&uri).unwrap(), &ObjectStoreParams::default())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                    ErrorCode::BlobAccess as i32
+                );
+            }
+            assert!(access
+                .policy
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(uri, _, _)| uri == &canonical));
+        }
+    })
+    .unwrap();
+}
+
 pub(crate) async fn dataset_without_manifest_etag(uri: &str) -> lance::Dataset {
     let access = Access::new();
     let registry = Arc::new(ObjectStoreRegistry::empty());

@@ -74,6 +74,14 @@ upstream client for each actual object or listing prefix using that target's
 resolved options. Clients are initialized once per target within an open; HEAD,
 reads and listing cannot fall back to a base URI's credentials or endpoint.
 
+For OpenDAL-backed providers, the wrapper adapts request paths and listing
+results to preserve literal percent sequences across `object_store_opendal`'s
+extra decoding step. HEAD/GET metadata retains the original object path.
+Azure and GCS OpenDAL clients are constructed at the bucket/container origin,
+while authorization and option selection still use the full object or prefix
+URI. This prevents the URL path from also becoming a client root and being
+applied twice.
+
 The supported providers are `file`, `file-object-store`, `file+uring` (when
 available upstream), `s3`, `gs`, `az`, `oss` and `hf`. Local providers are
 constructed with Lance's explicit `file-object-store` route so optimized local
@@ -84,6 +92,11 @@ ports ignored by a provider from creating an alternate permission target for the
 same physical object. Network endpoint ports remain valid in target-scoped
 storage options. `s3+ddb` is excluded because its separate commit handler cannot
 be mediated by this store hook.
+
+HF repository types use the canonical plural authorities `models`, `datasets`,
+`spaces` and `buckets`. Singular and case variants are normalized before
+callbacks, cache lookup and client construction, so aliases share one policy
+target. Unrecognized HF repository types fail closed.
 
 Blob diagnostics use fixed safe messages, never arbitrary callback/provider
 text or storage options. Common codes 56–60 identify open, read, range, snapshot
@@ -124,6 +137,13 @@ Cloud URI port tests cover S3, GCS, Azure, OSS and HF, asserting rejection befor
 callbacks or provider construction. A local HTTP mock exercises OpenDAL HEAD
 and GET permission failures while preserving error codes and redacting response
 diagnostics; its endpoint uses an explicit port.
+
+Additional local HTTP tests verify literal percent keys on native S3 and OpenDAL
+HEAD/GET requests, plus OpenDAL listing prefixes, returned object/common-prefix
+paths and subsequent reads of listed objects. Azure and GCS OpenDAL requests are
+compared with upstream clients constructed at the storage origin. HF alias tests
+cover singular/plural and case variants for all four repository types, including
+denial after a store has been cached, without network access.
 
 `test/cpp/blob_access_probe.cpp` separately exercises the pinned native DuckDB
 and Vane APIs. It checks native allowed-path/directory exceptions with external
@@ -182,13 +202,16 @@ link/runtime validation, not a fresh release-LTO distribution build.
 Follow-up Rust validation covers object-scoped clients, missing-row
 classification, encoded separators, local URI normalization and authority
 rejection, cloud URI port rejection, missing deletion metadata, and wrapped OS
-and OpenDAL permission errors. All 46 native and 99 Vane Rust unit tests passed,
-including 32 Blob tests, along with all-targets Clippy with `-D warnings` in both
-modes. The regression tests reproduced the reviewed failures before their
-corresponding fixes: the six earlier regressions failed against `d69e757`, and
-the three port/OpenDAL regression tests failed against `acbebc8`. The mode-000
-OS permission check ran without skipping in both modes. Rust formatting and
-the repository formatter passed; the latter used the existing `.venv` because
+and OpenDAL permission errors. It also covers literal percent paths, HF authority
+aliases and Azure/GCS OpenDAL client roots. All 50 native and 103 Vane Rust unit
+tests passed, including 36 Blob tests, along with all-targets Clippy with
+`-D warnings` in both modes. The regression tests reproduced the reviewed
+failures before their corresponding fixes: the six earlier regressions failed
+against `d69e757`, and
+the three port/OpenDAL regression tests failed against `acbebc8`. The four new
+path/alias regression tests also failed against `160e7ba` in the native build.
+The mode-000 OS permission check ran without skipping in both modes. Rust
+formatting and the repository formatter passed; the latter used the existing `.venv` because
 `uv` was unavailable. C++ probes, SQL suites and live cloud integration were
 not rerun for these Rust-only fixes.
 
