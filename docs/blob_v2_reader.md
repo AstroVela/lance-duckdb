@@ -105,6 +105,23 @@ same physical object. Network endpoint ports remain valid in target-scoped
 storage options. `s3+ddb` is excluded because its separate commit handler cannot
 be mediated by this store hook.
 
+All local schemes normalize to a `file:///...` policy URI through the upstream
+URL/filesystem path conversion, after validating the original authority. Their
+provider registrations share the same resolved credentials and raw-client cache.
+The `file-object-store` scheme is used only at the backend delegation boundary.
+This preserves literal percent sequences, spaces, Unicode names and platform
+path semantics without filesystem I/O or symlink resolution during normalization.
+
+S3, GCS, Azure and OSS bucket/container authorities must use literal lowercase
+ASCII naming characters. Empty names, dot segments, percent escapes, encoded
+delimiters and uppercase aliases fail before callbacks, cache lookup or provider
+construction. For example, `s3://%2e/bucket/private/object` is rejected before an
+HTTP client can remove the encoded dot segment. S3-compatible underscores and
+GCS dots/underscores remain accepted, as do Azure's dollar-prefixed reserved
+containers such as `$root`, `$web` and `$logs`.
+Length and other service-specific naming restrictions remain upstream concerns.
+These identity checks do not decode or restrict the separately parsed object key.
+
 HF repository types use the canonical plural authorities `models`, `datasets`,
 `spaces` and `buckets`. Singular and case variants are normalized before
 callbacks, cache lookup and client construction, so aliases share one policy
@@ -243,6 +260,18 @@ The mode-000 OS permission check ran without skipping in both modes. Rust
 formatting and the repository formatter passed; the latter used the existing `.venv` because
 `uv` was unavailable. C++ probes, SQL suites and live cloud integration were
 not rerun for these Rust-only fixes.
+
+The bucket-authority and local-scheme follow-up adds six tests: five regressions
+fail against `5fb1f9a`, while the valid S3 HTTP control passes. Coverage includes
+rejection before callbacks/provider construction and HTTP access, native/OpenDAL
+HEAD and GET requests with dotted or hyphenated bucket names, canonical local
+credential scopes, shared alias clients, cached-store GET/HEAD/LIST denial,
+binding/snapshot aliases, and known/unknown-size external Blob reads through FFI.
+Local path controls include spaces, Unicode, literal percent sequences and Unix
+backslashes. All 61 native and 114 Vane Rust unit tests pass, including 47 Blob
+tests, along with strict all-targets Clippy in both modes, Rust formatting and
+`uv run make format`. This follow-up does not rerun C++ probes, SQL suites or
+live cloud integration.
 
 Normal reproduction commands (run from the extension root) are:
 

@@ -6,6 +6,7 @@ use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use lance::dataset::{WriteMode, WriteParams};
 use lance_core::datatypes::BLOB_V2_USER_TYPE;
+use lance_io::object_store::ObjectStoreRegistry;
 use lance_table::format::BasePath;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -656,6 +657,52 @@ fn local_uri_authorities_cannot_bypass_dataset_policy() {
     }
 }
 
+#[test]
+fn local_scheme_aliases_share_dataset_snapshot_and_policy() {
+    let _counter_guard = counter_guard();
+    let fixture = Fixture::new(false, false);
+    let canonical = url::Url::from_file_path(fixture.uri.to_str().unwrap()).unwrap();
+    let access = Access::new();
+    let binding = Binding::new(&fixture.uri, &access);
+    for scheme in ["file", "file-object-store", "file+uring"] {
+        let alias = CString::new(
+            canonical
+                .as_str()
+                .replacen("file:", &format!("{scheme}:"), 1),
+        )
+        .unwrap();
+        let alias_binding = Binding::new(&alias, &access);
+        assert_eq!(alias_binding.token, binding.token);
+        let blob = Blob::open(&alias, &binding, &access, 0, "video").unwrap();
+        assert_eq!(blob.read(0, 3), b"abc");
+    }
+    access.deny(canonical.as_str(), None);
+    for scheme in ["file", "file-object-store", "file+uring"] {
+        let alias = CString::new(
+            canonical
+                .as_str()
+                .replacen("file:", &format!("{scheme}:"), 1),
+        )
+        .unwrap();
+        let error = Blob::open(&alias, &binding, &access, 0, "video")
+            .err()
+            .unwrap();
+        assert_eq!(error.0, ErrorCode::BlobAccess as i32);
+        // SAFETY: The URI and access context outlive the binding call.
+        assert!(
+            unsafe { lance_blob_open_binding_dataset(alias.as_ptr(), access.handle) }.is_null()
+        );
+        assert_eq!(lance_last_error_code(), ErrorCode::BlobAccess as i32);
+    }
+    assert!(access
+        .policy
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(uri, _, _)| uri.starts_with("file:///")));
+}
+
 fn external_uri_fixture(fixture: &Fixture, external_uri: &str) -> (CString, Arc<Dataset>) {
     let blob = fixture
         .batch
@@ -772,6 +819,69 @@ fn external_local_uri_alias_uses_canonical_policy_targets() {
         .err()
         .unwrap();
     assert_eq!(failure.0, ErrorCode::BlobAccess as i32);
+}
+
+#[test]
+fn external_local_scheme_aliases_use_canonical_permissions() {
+    let _counter_guard = counter_guard();
+    for scheme in ["file", "file-object-store", "file+uring"] {
+        if ObjectStoreRegistry::default()
+            .get_provider(scheme)
+            .is_none()
+        {
+            continue;
+        }
+        let fixture = Fixture::new(false, false);
+        let canonical = url::Url::from_file_path(&fixture.external).unwrap();
+        let alias = canonical
+            .as_str()
+            .replacen("file:", &format!("{scheme}:"), 1);
+        let (uri, _) = external_uri_fixture(&fixture, &alias);
+        let access = Access::new();
+        let binding = Binding::new(&uri, &access);
+        for row in [4, 5] {
+            let blob = Blob::open(&uri, &binding, &access, row, "video").unwrap();
+            let expected = fixture.expected[row as usize].as_ref().unwrap();
+            assert_eq!(blob.read(0, expected.len()), *expected);
+            drop(blob);
+            // Open the client before revocation, but force a fresh backing read
+            // rather than asking Lance to return bytes it has already buffered.
+            let blob = Blob::open(&uri, &binding, &access, row, "video").unwrap();
+            access.deny(canonical.as_str(), Some(READ));
+            let mut buffer = [91u8; 3];
+            let mut read = 123;
+            // SAFETY: Live Blob and writable output buffers for this read.
+            assert_eq!(
+                unsafe {
+                    lance_blob_read_at(blob.0, 0, buffer.as_mut_ptr(), buffer.len(), &mut read)
+                },
+                -1
+            );
+            assert_eq!(lance_last_error_code(), ErrorCode::BlobAccess as i32);
+            assert_eq!(buffer, [91; 3]);
+            assert_eq!(read, 0);
+            access.policy.deny.lock().unwrap().clear();
+        }
+        access.deny(canonical.as_str(), Some(METADATA));
+        let error = Blob::open(&uri, &binding, &access, 5, "video")
+            .err()
+            .unwrap();
+        assert_eq!(error.0, ErrorCode::BlobAccess as i32);
+        access.deny(canonical.as_str(), None);
+        for row in [4, 5] {
+            let error = Blob::open(&uri, &binding, &access, row, "video")
+                .err()
+                .unwrap();
+            assert_eq!(error.0, ErrorCode::BlobAccess as i32);
+        }
+        assert!(access
+            .policy
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(uri, _, _)| uri.starts_with("file:///")));
+    }
 }
 
 #[test]

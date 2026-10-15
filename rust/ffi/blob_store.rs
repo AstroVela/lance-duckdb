@@ -283,12 +283,24 @@ pub(super) fn normalize_uri(uri: &str) -> FfiResult<Url> {
         || url.port().is_some()
         // The local provider can ignore an authority while extracting its
         // filesystem path. Never authorize a different identity for that path.
-        || (matches!(url.scheme(), "file" | "file-object-store" | "file+uring")
-            && !url.authority().is_empty())
+        || (is_local_scheme(url.scheme()) && !url.authority().is_empty())
     {
         return Err(access_error(
             "unsupported or credential-bearing Blob target",
         ));
+    }
+    if is_local_scheme(url.scheme()) {
+        // All local schemes address the same filesystem. Convert through the
+        // upstream OS path types, after checking the original authority, so
+        // scheme conversion cannot reinterpret backslashes or encoded names.
+        // This is lexical normalization; it neither resolves symlinks nor does I/O.
+        let path = url
+            .to_file_path()
+            .map_err(|_| access_error("invalid local Blob target"))?;
+        url = Url::from_file_path(path).map_err(|_| access_error("invalid local Blob target"))?;
+    }
+    if matches!(url.scheme(), "s3" | "gs" | "az" | "oss") {
+        validate_bucket_authority(&url)?;
     }
     if url.scheme() == "hf" {
         // OpenDAL accepts singular/plural and case-insensitive repository types.
@@ -320,6 +332,38 @@ pub(super) fn normalize_uri(uri: &str) -> FfiResult<Url> {
         url.set_path(&path);
     }
     Ok(url)
+}
+
+fn is_local_scheme(scheme: &str) -> bool {
+    matches!(scheme, "file" | "file-object-store" | "file+uring")
+}
+
+fn validate_bucket_authority(url: &Url) -> FfiResult<()> {
+    let bucket = url.host_str().unwrap_or_default();
+    // Azure's reserved containers, including $root, $web and $logs, use a
+    // dollar prefix. The service owns the set of valid reserved names.
+    let name = if url.scheme() == "az" {
+        bucket.strip_prefix('$').unwrap_or(bucket)
+    } else {
+        bucket
+    };
+    // Providers interpolate this identifier into HTTP paths or hostnames.
+    // Require literal naming characters: encoded dot segments, delimiters and
+    // case-folding must never turn an authorized bucket into another target.
+    // Keep S3-compatible underscores and GCS dots/underscores; leave length and
+    // service-specific creation rules to the upstream provider/service.
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || byte == b'-'
+                || (matches!(url.scheme(), "s3" | "gs") && matches!(byte, b'.' | b'_'))
+        })
+    {
+        return Err(access_error("invalid Blob bucket or container identity"));
+    }
+    Ok(())
 }
 
 fn hf_identity_component(encoded: &str) -> FfiResult<String> {
@@ -437,16 +481,24 @@ pub(super) unsafe fn clone_access(access: *mut c_void) -> FfiResult<Arc<BlobAcce
 pub(super) fn session(access: Arc<BlobAccessContext>) -> Arc<Session> {
     let defaults = ObjectStoreRegistry::default();
     let registry = ObjectStoreRegistry::empty();
+    let mut local_provider = None;
     for scheme in SUPPORTED_SCHEMES {
         if let Some(inner) = defaults.get_provider(scheme) {
-            registry.insert(
-                scheme,
+            let make_provider = || {
                 Arc::new(BlobStoreProvider {
                     inner,
                     access: access.clone(),
                     resolutions: Default::default(),
-                }),
-            );
+                })
+            };
+            // Aliases share frozen credentials and raw clients even when the
+            // upstream registry drops or bypasses its weak store cache.
+            let provider = if is_local_scheme(scheme) {
+                local_provider.get_or_insert_with(make_provider).clone()
+            } else {
+                make_provider()
+            };
+            registry.insert(scheme, provider);
         }
     }
     // In particular, the historical manifest cannot come from a shared cache.
@@ -647,7 +699,7 @@ impl StoreTarget {
 
     fn backing_url(&self, opendal: bool) -> lance::Result<Url> {
         let mut url = self.url.clone();
-        if matches!(url.scheme(), "file" | "file+uring") {
+        if url.scheme() == "file" {
             // Disable upstream local fast paths, which bypass the wrapper.
             url = Url::parse(&format!(
                 "file-object-store{}",

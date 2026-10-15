@@ -203,6 +203,185 @@ fn cloud_ports_are_rejected_before_callbacks_and_provider_io() {
 }
 
 #[test]
+fn cloud_authority_aliases_are_rejected_before_callbacks_and_provider_io() {
+    crate::runtime::block_on(async {
+        for scheme in ["s3", "gs", "az", "oss"] {
+            let access = Access::new();
+            let created = Arc::new(AtomicUsize::new(0));
+            let registry = ObjectStoreRegistry::empty();
+            registry.insert(
+                scheme,
+                provider(
+                    &access,
+                    Arc::new(RecordingProvider {
+                        inner: Arc::new(InMemory::new()),
+                        created: created.clone(),
+                        options: Default::default(),
+                    }),
+                ),
+            );
+            for authority in [
+                "%2e",
+                "",
+                ".",
+                "..",
+                "%2E%2e",
+                ".%2e",
+                "%62ucket",
+                "bucket%2Fother",
+                "bucket%5cother",
+                "bucket\\other",
+                "%252e",
+                "bucket%00",
+                "bucket%20",
+                "bucket%3Fother",
+                "bucket%23other",
+                "bucket%40other",
+                "bucket%",
+                "BUCKET",
+                "[::1]",
+            ] {
+                let uri = format!("{scheme}://{authority}/bucket/private/object");
+                let Ok(url) = Url::parse(&uri) else {
+                    assert_eq!(
+                        normalize_uri(&uri).unwrap_err().code as i32,
+                        ErrorCode::BlobAccess as i32
+                    );
+                    continue;
+                };
+                let error = registry
+                    .get_store(url, &ObjectStoreParams::default())
+                    .await
+                    .expect_err(&uri);
+                assert_eq!(
+                    io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                    ErrorCode::BlobAccess as i32,
+                    "{uri}"
+                );
+            }
+            assert_eq!(access.call_count(), 0);
+            assert_eq!(created.load(Ordering::SeqCst), 0);
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn local_scheme_aliases_share_policy_and_cached_clients() {
+    crate::runtime::block_on(async {
+        let directory = TempDir::new();
+        let file = directory.0.join(if cfg!(unix) {
+            "private 文件%2F\\name.bin"
+        } else {
+            "private 文件%2F.bin"
+        });
+        std::fs::write(&file, b"private-data").unwrap();
+        let canonical = Url::from_file_path(&file).unwrap();
+        let access = Access::new();
+        let registry = session(access.context()).store_registry();
+        let local = registry.get_provider("file").unwrap();
+        let (cached, path) = ObjectStore::from_uri_and_params(
+            registry.clone(),
+            canonical.as_str(),
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        for scheme in ["file", "file-object-store", "file+uring"] {
+            let Some(provider) = registry.get_provider(scheme) else {
+                continue;
+            };
+            // Alias registrations must also share the provider's resolved
+            // credentials and raw-client cache, not only the registry cache.
+            assert!(Arc::ptr_eq(&local, &provider));
+            let mut alias = canonical
+                .as_str()
+                .replacen("file:", &format!("{scheme}:"), 1);
+            if cfg!(unix) && scheme != "file" {
+                // Non-special local schemes also accept literal backslashes.
+                // Converting them to file: must preserve the filename.
+                alias = alias.replace("%5C", "\\");
+            }
+            let (store, alias_path) = ObjectStore::from_uri_and_params(
+                registry.clone(),
+                &alias,
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+            assert!(Arc::ptr_eq(&store.inner, &cached.inner));
+            assert_eq!(alias_path, path);
+            assert_eq!(store.scheme(), "file-object-store");
+            assert_eq!(
+                store
+                    .inner
+                    .get(&path)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"private-data"
+            );
+        }
+        access.deny(canonical.as_str(), None);
+        for scheme in ["file", "file-object-store", "file+uring"] {
+            if registry.get_provider(scheme).is_none() {
+                continue;
+            }
+            let alias = canonical
+                .as_str()
+                .replacen("file:", &format!("{scheme}:"), 1);
+            let error = registry
+                .get_store(Url::parse(&alias).unwrap(), &ObjectStoreParams::default())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                ErrorCode::BlobAccess as i32
+            );
+        }
+        // The same denial applies to already-open handles and every read-only
+        // operation, even after the file is removed: no NotFound may escape.
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(
+            cached.inner.get(&path).await.unwrap_err(),
+            object_store::Error::PermissionDenied { .. }
+        ));
+        assert!(matches!(
+            cached.inner.head(&path).await.unwrap_err(),
+            object_store::Error::PermissionDenied { .. }
+        ));
+        assert!(matches!(
+            cached
+                .inner
+                .list(Some(&path))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err(),
+            object_store::Error::PermissionDenied { .. }
+        ));
+        assert!(matches!(
+            cached
+                .inner
+                .list_with_delimiter(Some(&path))
+                .await
+                .unwrap_err(),
+            object_store::Error::PermissionDenied { .. }
+        ));
+        assert!(access
+            .policy
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(uri, _, _)| uri == canonical.as_str()));
+    })
+    .unwrap();
+}
+
+#[test]
 fn nested_store_permissions_keep_safe_error_categories() {
     for source in [
         Box::new(std::io::Error::new(
@@ -709,7 +888,16 @@ fn every_local_scheme_mediates_large_known_and_unknown_size_reads() {
         std::fs::write(&file, vec![42; 128 * 1024]).unwrap();
         for scheme in ["file", "file+uring", "file-object-store"] {
             let access = Access::new();
+            let canonical = Url::from_file_path(&file).unwrap();
+            let scoped_options = HashMap::from([("scope-marker".into(), "local-object".into())]);
+            access
+                .policy
+                .scopes
+                .lock()
+                .unwrap()
+                .push((canonical.to_string(), scoped_options.clone()));
             let reads = Arc::new(AtomicUsize::new(0));
+            let options = Arc::new(Mutex::new(Vec::new()));
             let registry = Arc::new(ObjectStoreRegistry::empty());
             registry.insert(
                 scheme,
@@ -723,7 +911,7 @@ fn every_local_scheme_mediates_large_known_and_unknown_size_reads() {
                             omit_etag: false,
                         }),
                         created: Default::default(),
-                        options: Default::default(),
+                        options: options.clone(),
                     }),
                 ),
             );
@@ -740,11 +928,12 @@ fn every_local_scheme_mediates_large_known_and_unknown_size_reads() {
             assert_eq!(reader.get_range(0..8192).await.unwrap().len(), 8192);
             let count = reads.load(Ordering::SeqCst);
             assert!(count > 0, "local fast path bypassed the recording store");
-            access.deny("large%20object", Some(READ));
+            access.deny(canonical.as_str(), Some(READ));
             assert!(reader.get_range(8192..16384).await.is_err());
             let unknown = store.open(&path).await.unwrap();
             assert!(unknown.get_range(0..8192).await.is_err());
             assert_eq!(reads.load(Ordering::SeqCst), count);
+            assert_eq!(*options.lock().unwrap(), [scoped_options]);
         }
     })
     .unwrap();
@@ -755,8 +944,15 @@ fn provider_path_inverse_preserves_hf_repository_and_encoded_names() {
     let defaults = ObjectStoreRegistry::default();
     for uri in [
         "s3://bucket/dir/a%20b%25x",
+        "s3://bucket.with-dots/dir/a%20b%25x",
+        "s3://compatible_bucket/dir/a%20b%25x",
         "gs://bucket/dir/a%20b",
+        "gs://bucket.with_underscores/dir/a%20b",
         "az://container/dir/file",
+        "az://$root/dir/file",
+        "az://$web/dir/file",
+        "az://$logs/dir/file",
+        "az://$blobchangefeed/dir/file",
         "oss://bucket/dir/file",
         "file:///tmp/a%20b%25x",
         "hf://datasets/owner/repo/table.lance",
@@ -816,14 +1012,22 @@ fn provider_path_inverse_preserves_encoded_separators() {
             assert_eq!(path.as_ref(), decoded, "{url}");
             let target = StoreTarget::new(&url, provider.as_ref()).unwrap();
             let reconstructed = target.uri(&path).unwrap();
-            assert_eq!(reconstructed.as_str(), format!("{root}/{canonical}"));
+            let canonical_root = if root == "file-object-store://" {
+                "file://"
+            } else {
+                root
+            };
+            assert_eq!(
+                reconstructed.as_str(),
+                format!("{canonical_root}/{canonical}")
+            );
             assert_eq!(provider.extract_path(&reconstructed).unwrap(), path);
             assert_eq!(
                 target
                     .uri(&Path::from("other/payload.bin"))
                     .unwrap()
                     .as_str(),
-                format!("{root}/other/payload.bin")
+                format!("{canonical_root}/other/payload.bin")
             );
         }
     }
@@ -862,7 +1066,7 @@ fn local_provider_path_inverse_uses_filesystem_normalization() {
             let canonical = target.uri(&path).unwrap();
             assert_eq!(
                 canonical.as_str(),
-                format!("{scheme}:///{drive}dir/table.lance")
+                format!("file:///{drive}dir/table.lance")
             );
             assert_eq!(provider.extract_path(&canonical).unwrap(), path);
             assert_eq!(
@@ -870,7 +1074,7 @@ fn local_provider_path_inverse_uses_filesystem_normalization() {
                     .uri(&Path::from(format!("{drive}other/payload.bin")))
                     .unwrap()
                     .as_str(),
-                format!("{scheme}:///{drive}other/payload.bin")
+                format!("file:///{drive}other/payload.bin")
             );
         }
     }
@@ -1021,6 +1225,116 @@ fn s3_http_options(endpoint: String, opendal: bool) -> HashMap<String, String> {
         ("client_max_retries".into(), "0".into()),
         ("endpoint".into(), endpoint),
     ])
+}
+
+#[test]
+fn s3_authority_aliases_fail_before_http_and_cached_client_lookup() {
+    for opendal in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        crate::runtime::block_on(async {
+            let access = Access::new();
+            access
+                .policy
+                .scopes
+                .lock()
+                .unwrap()
+                .push(("s3://".into(), s3_http_options(endpoint, opendal)));
+            let registry = session(access.context()).store_registry();
+            let canonical = "s3://bucket/private/object";
+            let _cached = registry
+                .get_store(
+                    Url::parse(canonical).unwrap(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap();
+            access.deny(canonical, None);
+            let calls = access.call_count();
+            for uri in [
+                "s3://%2e/bucket/private/object",
+                "s3://./bucket/private/object",
+                "s3://%2e%2e/bucket/private/object",
+                "s3://%62ucket/private/object",
+            ] {
+                let error = registry
+                    .get_store(Url::parse(uri).unwrap(), &ObjectStoreParams::default())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                    ErrorCode::BlobAccess as i32
+                );
+            }
+            assert_eq!(access.call_count(), calls);
+            assert_eq!(registry.stats().hits, 0);
+        })
+        .unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn s3_bucket_identity_matches_native_and_opendal_http_requests() {
+    for opendal in [false, true] {
+        for bucket in [
+            "bucket.with-dots",
+            "bucket-with-hyphens",
+            "compatible_bucket",
+        ] {
+            let (endpoint, server) = object_http_server(vec!["data".into(); 2]);
+            crate::runtime::block_on(async {
+                let access = Access::new();
+                let uri = format!("s3://{bucket}/private%252Fobject");
+                access
+                    .policy
+                    .scopes
+                    .lock()
+                    .unwrap()
+                    .push((uri.clone(), s3_http_options(endpoint, opendal)));
+                let (store, path) = ObjectStore::from_uri_and_params(
+                    session(access.context()).store_registry(),
+                    &uri,
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(path.as_ref(), "private%2Fobject");
+                assert_eq!(store.inner.head(&path).await.unwrap().location, path);
+                assert_eq!(
+                    store
+                        .inner
+                        .get(&path)
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    b"data"
+                );
+                assert!(access
+                    .policy
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(target, _, _)| target == &uri));
+            })
+            .unwrap();
+            assert_eq!(
+                server.join().unwrap(),
+                [
+                    format!("HEAD /{bucket}/private%252Fobject HTTP/1.1"),
+                    format!("GET /{bucket}/private%252Fobject HTTP/1.1")
+                ]
+            );
+        }
+    }
 }
 
 #[test]
