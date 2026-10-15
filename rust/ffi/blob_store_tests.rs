@@ -111,6 +111,231 @@ fn provider(access: &Access, inner: Arc<dyn ObjectStoreProvider>) -> Arc<BlobSto
 }
 
 #[test]
+fn configured_roots_are_rejected_before_provider_construction() {
+    crate::runtime::block_on(async {
+        for uri in [
+            "file:///tmp/public/object",
+            "s3://bucket/public/object",
+            "gs://bucket/public/object",
+            "az://bucket/public/object",
+            "oss://bucket/public/object",
+            "hf://datasets/owner/repo/public/object",
+        ] {
+            let access = Access::new();
+            let created = Arc::new(AtomicUsize::new(0));
+            let provider = provider(
+                &access,
+                Arc::new(RecordingProvider {
+                    inner: Arc::new(InMemory::new()),
+                    created: created.clone(),
+                    options: Default::default(),
+                }),
+            );
+            for key in ["root", "hf_root"] {
+                for root in ["private", "/private/", "//private//", ".", "..", " ", "%2F"] {
+                    // A no-op alias must not hide a conflicting root option.
+                    let mut options = HashMap::from([
+                        ("use_opendal".into(), "true".into()),
+                        ("root".into(), "/".into()),
+                        ("hf_root".into(), "/".into()),
+                    ]);
+                    options.insert(key.into(), root.into());
+                    *access.policy.scopes.lock().unwrap() = vec![(uri.into(), options)];
+                    let error = provider
+                        .new_store(Url::parse(uri).unwrap(), &ObjectStoreParams::default())
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                        ErrorCode::BlobAccess as i32,
+                        "{uri}: {key}={root}"
+                    );
+                    assert_eq!(created.load(Ordering::SeqCst), 0);
+                    assert!(provider.resolutions.lock().unwrap().is_empty());
+                    assert_eq!(
+                        access.policy.results_released.load(Ordering::SeqCst),
+                        access.call_count()
+                    );
+                }
+            }
+            for root in ["", "/", "///"] {
+                *access.policy.scopes.lock().unwrap() = vec![(
+                    uri.into(),
+                    HashMap::from([
+                        ("root".into(), root.into()),
+                        ("hf_root".into(), root.into()),
+                        ("azure_storage_account_name".into(), "testaccount".into()),
+                    ]),
+                )];
+                provider
+                    .new_store(Url::parse(uri).unwrap(), &ObjectStoreParams::default())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(created.load(Ordering::SeqCst), 1);
+            let policy = access.policy.clone();
+            drop(provider);
+            drop(access);
+            assert_released(&policy);
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn configured_roots_are_rejected_before_upstream_clients_and_http() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    crate::runtime::block_on(async {
+        for (uri, key) in [
+            ("az://bucket/public/object", "root"),
+            ("gs://bucket/public/object", "root"),
+            ("hf://datasets/owner/repo/public/object", "root"),
+            ("hf://datasets/owner/repo/public/object", "hf_root"),
+        ] {
+            let access = Access::new();
+            let options = HashMap::from([
+                ("use_opendal".into(), "true".into()),
+                (key.into(), "private".into()),
+                ("endpoint".into(), endpoint.clone()),
+                ("azure_storage_account_name".into(), "testaccount".into()),
+                (
+                    "azure_storage_account_key".into(),
+                    "dGVzdC1zZWNyZXQ=".into(),
+                ),
+                ("token".into(), "test-token".into()),
+                ("hf_token".into(), "test-token".into()),
+                ("disable_config_load".into(), "true".into()),
+                ("disable_vm_metadata".into(), "true".into()),
+            ]);
+            access
+                .policy
+                .scopes
+                .lock()
+                .unwrap()
+                .push((uri.into(), options));
+            let error = ObjectStore::from_uri_and_params(
+                session(access.context()).store_registry(),
+                uri,
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                ErrorCode::BlobAccess as i32
+            );
+            assert_eq!(
+                access.policy.results_released.load(Ordering::SeqCst),
+                access.call_count()
+            );
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn cached_clients_reject_root_changes_before_metadata_reads_and_lists() {
+    crate::runtime::block_on(async {
+        let access = Access::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let created = Arc::new(AtomicUsize::new(0));
+        let memory = Arc::new(InMemory::new());
+        let path = Path::from("public/object");
+        memory.put(&path, b"data".to_vec().into()).await.unwrap();
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert(
+            "az",
+            provider(
+                &access,
+                Arc::new(RecordingProvider {
+                    inner: Arc::new(RecordingStore {
+                        inner: memory,
+                        reads: reads.clone(),
+                        short: false,
+                        omit_etag: false,
+                    }),
+                    created: created.clone(),
+                    options: Default::default(),
+                }),
+            ),
+        );
+        let url = Url::parse("az://bucket/public/object").unwrap();
+        let options = HashMap::from([
+            ("use_opendal".into(), "true".into()),
+            ("root".into(), "/".into()),
+            ("azure_storage_account_name".into(), "testaccount".into()),
+        ]);
+        *access.policy.scopes.lock().unwrap() = vec![("az://".into(), options.clone())];
+        let cached = registry
+            .get_store(url.clone(), &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            cached
+                .inner
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"data"
+        );
+        let initial_reads = reads.load(Ordering::SeqCst);
+        let initial_clients = created.load(Ordering::SeqCst);
+        for key in ["root", "hf_root"] {
+            let mut invalid = options.clone();
+            invalid.insert(key.into(), "private".into());
+            *access.policy.scopes.lock().unwrap() = vec![("az://".into(), invalid)];
+            assert!(registry
+                .get_store(url.clone(), &ObjectStoreParams::default())
+                .await
+                .is_err());
+            for head in [false, true] {
+                assert!(matches!(
+                    cached
+                        .inner
+                        .get_opts(
+                            &path,
+                            GetOptions {
+                                head,
+                                ..Default::default()
+                            }
+                        )
+                        .await
+                        .unwrap_err(),
+                    object_store::Error::PermissionDenied { .. }
+                ));
+            }
+            assert!(cached
+                .inner
+                .list(Some(&path))
+                .try_collect::<Vec<_>>()
+                .await
+                .is_err());
+            assert!(cached.inner.list_with_delimiter(Some(&path)).await.is_err());
+            assert_eq!(reads.load(Ordering::SeqCst), initial_reads);
+            assert_eq!(created.load(Ordering::SeqCst), initial_clients);
+        }
+        *access.policy.scopes.lock().unwrap() = vec![("az://".into(), options)];
+        assert_eq!(cached.inner.head(&path).await.unwrap().size, 4);
+        assert_eq!(created.load(Ordering::SeqCst), initial_clients);
+        assert_eq!(
+            access.policy.results_released.load(Ordering::SeqCst),
+            access.call_count()
+        );
+    })
+    .unwrap();
+}
+
+#[test]
 fn local_authorities_are_rejected_before_callbacks_and_provider_io() {
     crate::runtime::block_on(async {
         for scheme in ["file", "file-object-store", "file+uring"] {
@@ -1485,12 +1710,22 @@ fn opendal_listing_preserves_percent_prefixes_and_returned_paths() {
 
 #[test]
 fn azure_and_gcs_opendal_clients_do_not_duplicate_object_paths() {
-    for scheme in ["az", "gs"] {
+    for (scheme, root) in [
+        ("az", ""),
+        ("az", "/"),
+        ("az", "///"),
+        ("gs", ""),
+        ("gs", "/"),
+        ("gs", "///"),
+    ] {
         let mut requests = Vec::new();
         for wrapped in [false, true] {
             let (endpoint, server) = object_http_server(vec!["data".into()]);
             crate::runtime::block_on(async {
-                let mut options = HashMap::from([("use_opendal".into(), "true".into())]);
+                let mut options = HashMap::from([
+                    ("use_opendal".into(), "true".into()),
+                    ("root".into(), root.into()),
+                ]);
                 if scheme == "az" {
                     options.extend([
                         ("azure_storage_account_name".into(), "testaccount".into()),
@@ -1557,7 +1792,7 @@ fn azure_and_gcs_opendal_clients_do_not_duplicate_object_paths() {
         }
         assert_eq!(
             requests[0], requests[1],
-            "{scheme} changed the physical object"
+            "{scheme} with root={root:?} changed the physical object"
         );
     }
 }
@@ -1595,6 +1830,10 @@ fn hf_repository_aliases_share_authorization_before_cache_and_io() {
                     "%6fwner/repo",
                     "owner/%72epo",
                     "%6Fwner/%72epo",
+                    "OWNER/repo",
+                    "owner/REPO",
+                    "OwNeR/RePo",
+                    "%4fWNER/%52EPO",
                 ] {
                     let uri = format!("hf://{spelling}/{repo}/private/object");
                     let error = registry
@@ -1816,8 +2055,18 @@ fn hf_encoded_repositories_use_canonical_http_targets_and_cached_policy() {
     // HF only exposes its endpoint through an environment variable. Isolate
     // that setting in a child process, never mutate the test runner's environment.
     const CHILD: &str = "LANCE_BLOB_HF_HTTP_CHILD";
+    const ALIASES: [&str; 8] = [
+        "owner/repo",
+        "%6fwner/repo",
+        "owner/%72epo",
+        "%6Fwner/%72epo",
+        "OWNER/repo",
+        "owner/REPO",
+        "OwNeR/RePo",
+        "%4fWNER/%52EPO",
+    ];
     if std::env::var_os(CHILD).is_none() {
-        let (endpoint, server) = object_http_server(vec!["data".into(); 4]);
+        let (endpoint, server) = object_http_server(vec!["data".into(); ALIASES.len()]);
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "ffi::blob_store::tests::hf_encoded_repositories_use_canonical_http_targets_and_cached_policy", "--nocapture"])
             .env(CHILD, "1")
@@ -1829,16 +2078,25 @@ fn hf_encoded_repositories_use_canonical_http_targets_and_cached_policy() {
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
-        let expected = vec!["GET /datasets/owner/repo/resolve/main/private%252Fobject HTTP/1.1"; 4];
+        let expected = vec![
+            "GET /datasets/owner/repo/resolve/main/Private%252FObject HTTP/1.1";
+            ALIASES.len()
+        ];
         assert_eq!(server.join().unwrap(), expected);
         return;
     }
     crate::runtime::block_on(async {
-        let canonical = "hf://datasets/owner/repo/private%252Fobject";
+        let canonical = "hf://datasets/owner/repo/Private%252FObject";
         let access = Access::new();
+        // Repository names fold case, but object keys must remain distinct.
+        access.deny("hf://datasets/owner/repo/private%252Fobject", None);
         access.policy.scopes.lock().unwrap().push((
             canonical.into(),
-            HashMap::from([("hf_token".into(), "test-token".into())]),
+            HashMap::from([
+                ("hf_token".into(), "test-token".into()),
+                ("root".into(), "/".into()),
+                ("hf_root".into(), "///".into()),
+            ]),
         ));
         let registry = session(access.context()).store_registry();
         let cached = registry
@@ -1848,31 +2106,25 @@ fn hf_encoded_repositories_use_canonical_http_targets_and_cached_policy() {
             )
             .await
             .unwrap();
-        let aliases = [
-            "owner/repo",
-            "%6fwner/repo",
-            "owner/%72epo",
-            "%6Fwner/%72epo",
-        ];
-        for repo in aliases {
+        for repo in ALIASES {
             let (store, path) = ObjectStore::from_uri_and_params(
                 registry.clone(),
-                &format!("hf://DATASET/{repo}/private%252Fobject"),
+                &format!("hf://DATASET/{repo}/Private%252FObject"),
                 &ObjectStoreParams::default(),
             )
             .await
             .unwrap();
             assert!(Arc::ptr_eq(&store.inner, &cached.inner));
-            assert_eq!(path.as_ref(), "private%2Fobject");
+            assert_eq!(path.as_ref(), "Private%2FObject");
             let result = store.inner.get(&path).await.unwrap();
             assert_eq!(result.meta.location, path);
             assert_eq!(result.bytes().await.unwrap().as_ref(), b"data");
         }
         access.deny(canonical, None);
-        for repo in aliases {
+        for repo in ALIASES {
             assert!(registry
                 .get_store(
-                    Url::parse(&format!("hf://datasets/{repo}/private%252Fobject")).unwrap(),
+                    Url::parse(&format!("hf://datasets/{repo}/Private%252FObject")).unwrap(),
                     &ObjectStoreParams::default()
                 )
                 .await
@@ -1881,7 +2133,7 @@ fn hf_encoded_repositories_use_canonical_http_targets_and_cached_policy() {
         assert!(matches!(
             cached
                 .inner
-                .get(&Path::parse("private%2Fobject").unwrap())
+                .get(&Path::parse("Private%2FObject").unwrap())
                 .await
                 .unwrap_err(),
             object_store::Error::PermissionDenied { .. }

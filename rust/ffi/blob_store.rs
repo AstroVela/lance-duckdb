@@ -142,6 +142,13 @@ impl BlobAccessContext {
                         cstr_to_str(*result.option_values.add(index), "option value")?,
                     )
                 };
+                // The target URI already contains the full physical object path.
+                // OpenDAL roots must not silently prepend a different prefix
+                // after authorization. Apply the same contract to every provider
+                // and callback, including callbacks before a cached-store lookup.
+                if matches!(key, "root" | "hf_root") && opendal::raw::normalize_root(value) != "/" {
+                    return Err(access_error("storage options changed the backing target"));
+                }
                 options.insert(key.to_owned(), value.to_owned());
             }
             Ok(options)
@@ -383,7 +390,9 @@ fn hf_identity_component(encoded: &str) -> FfiResult<String> {
     {
         return Err(access_error("invalid HF repository identity"));
     }
-    Ok(component.to_string())
+    // HF resolves owner/repository case variants to the same repository. Fold
+    // only these identity components; object names retain their original case.
+    Ok(component.as_ref().to_ascii_lowercase())
 }
 
 // An empty registry, populated only with mediated providers, fails closed for

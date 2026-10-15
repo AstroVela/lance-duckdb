@@ -128,6 +128,8 @@ enum LanceBlobAccessOperation : uint32_t {
 
 struct LanceBlobAccessResult {
   // On success return the same normalized target and target-scoped options.
+  // Put path prefixes in the target URI. The root and hf_root options may only
+  // denote the store root (empty or slash-only), never a directory prefix.
   // Rust copies the strings before release_result, including on failure.
   const char *normalized_uri;
   const char *const *option_keys;

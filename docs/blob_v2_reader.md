@@ -93,6 +93,15 @@ Azure and GCS OpenDAL clients are constructed at the bucket/container origin,
 while authorization and option selection still use the full object or prefix
 URI. This prevents the URL path from also becoming a client root and being
 applied twice.
+The callback's `root` and `hf_root` options may only denote the store root:
+empty strings or slash-only values such as `/` and `///`. Other values fail
+with an access error before provider construction, cache lookup or object I/O,
+even if the selected provider would otherwise ignore that option. The check uses
+OpenDAL's root normalization and runs for every callback result. Directory
+prefixes belong in the target URI, not in storage options. For example, read
+`az://bucket/private/public/object` directly; do not combine
+`az://bucket/public/object` with `root=private`. Both option names are checked
+independently so an unused alias cannot hide a conflicting prefix.
 
 The supported providers are `file`, `file-object-store`, `file+uring` (when
 available upstream), `s3`, `gs`, `az`, `oss` and `hf`. Local providers are
@@ -128,7 +137,11 @@ callbacks, cache lookup and client construction, so aliases share one policy
 target. Owner and repository components are decoded once to the repository-name
 characters documented by
 [Hugging Face](https://huggingface.co/docs/huggingface_hub/package_reference/utilities#huggingface_hub.utils.validate_repo_id).
-For example, `%6fwner/%72epo` becomes `owner/repo` for both policy and HTTP access.
+Owner and repository names are then folded to lowercase, matching HF's
+case-insensitive repository identity. For example, both `%6fwner/%72epo` and
+`%4fWNER/%52EPO` become `owner/repo` for policy, scoped options, caches and HTTP
+access. Object paths retain their original case: `Private/Object` and
+`private/object` are distinct targets.
 Empty identities, encoded delimiters, nested escapes and invalid name characters
 fail closed. Repository normalization does not decode the object key a second
 time. Unrecognized HF repository types also fail closed.
@@ -272,6 +285,18 @@ backslashes. All 61 native and 114 Vane Rust unit tests pass, including 47 Blob
 tests, along with strict all-targets Clippy in both modes, Rust formatting and
 `uv run make format`. This follow-up does not rerun C++ probes, SQL suites or
 live cloud integration.
+
+The HF repository-case and storage-root follow-up adds three tests and expands
+the existing HF alias and Azure/GCS HTTP tests. All five regression checks fail
+against `ce4b2c0`; the Azure/GCS HTTP control with empty and slash-only roots
+passes on both revisions. Coverage includes canonical HF policy and HTTP
+targets, case-sensitive object names, rejection of directory roots before
+provider construction or HTTP access, and callback changes after client caching
+across GET, HEAD and LIST operations. All 64 native and 117 Vane Rust unit tests
+pass, including 50 Blob tests, along with strict all-targets Clippy in both modes,
+Rust formatting and `uv run make format`. The Rust harness uses the dev/unwind
+configuration described above. C++ probes, SQL suites and live cloud integration
+were not rerun for this follow-up.
 
 Normal reproduction commands (run from the extension root) are:
 
