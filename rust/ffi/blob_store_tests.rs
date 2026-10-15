@@ -147,6 +147,62 @@ fn local_authorities_are_rejected_before_callbacks_and_provider_io() {
 }
 
 #[test]
+fn cloud_ports_are_rejected_before_callbacks_and_provider_io() {
+    crate::runtime::block_on(async {
+        for uri in [
+            "s3://bucket/private/object",
+            "gs://bucket/private/object",
+            "az://container/private/object",
+            "oss://bucket/private/object",
+            "hf://datasets/owner/repo/private/object",
+        ] {
+            let access = Access::new();
+            access.deny(uri, None);
+            let created = Arc::new(AtomicUsize::new(0));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let registry = Arc::new(ObjectStoreRegistry::empty());
+            let mut alias = Url::parse(uri).unwrap();
+            registry.insert(
+                alias.scheme(),
+                provider(
+                    &access,
+                    Arc::new(RecordingProvider {
+                        inner: Arc::new(RecordingStore {
+                            inner: Arc::new(InMemory::new()),
+                            reads: reads.clone(),
+                            short: false,
+                            omit_etag: false,
+                        }),
+                        created: created.clone(),
+                        options: Default::default(),
+                    }),
+                ),
+            );
+            for port in [0, 443, 65535] {
+                alias.set_port(Some(port)).unwrap();
+                // Providers ignore this port, so accepting it would authorize
+                // an alias of the canonical object denied above.
+                let error = ObjectStore::from_uri_and_params(
+                    registry.clone(),
+                    alias.as_str(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                    ErrorCode::BlobAccess as i32
+                );
+            }
+            assert_eq!(access.call_count(), 0);
+            assert_eq!(created.load(Ordering::SeqCst), 0);
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+        }
+    })
+    .unwrap();
+}
+
+#[test]
 fn nested_store_permissions_keep_safe_error_categories() {
     for source in [
         Box::new(std::io::Error::new(
@@ -157,6 +213,10 @@ fn nested_store_permissions_keep_safe_error_categories() {
             path: "private-file".to_owned(),
             source: "secret-key".into(),
         }),
+        Box::new(opendal::Error::new(
+            opendal::ErrorKind::PermissionDenied,
+            "private-file secret-key",
+        )),
     ] {
         let error = object_store::Error::Generic {
             store: "test-provider",
@@ -169,12 +229,20 @@ fn nested_store_permissions_keep_safe_error_categories() {
         assert!(!error.message.contains("private-file"));
         assert!(!error.message.contains("secret-key"));
     }
-    let safe = safe_store_error(object_store::Error::Generic {
-        store: "test-provider",
-        source: "permission denied: arbitrary provider text".into(),
-    });
-    let error = io_error(ErrorCode::BlobRead, &safe.into(), "read");
-    assert_eq!(error.code as i32, ErrorCode::BlobRead as i32);
+    for source in [
+        "permission denied: arbitrary provider text".into(),
+        Box::new(opendal::Error::new(
+            opendal::ErrorKind::Unexpected,
+            "permission denied: arbitrary provider text",
+        )) as Box<dyn std::error::Error + Send + Sync>,
+    ] {
+        let safe = safe_store_error(object_store::Error::Generic {
+            store: "test-provider",
+            source,
+        });
+        let error = io_error(ErrorCode::BlobRead, &safe.into(), "read");
+        assert_eq!(error.code as i32, ErrorCode::BlobRead as i32);
+    }
 }
 
 #[test]
@@ -440,6 +508,93 @@ fn s3_object_requests_use_the_object_scoped_signing_credentials() {
                 b"bytes"
             );
         }
+    }
+}
+
+#[test]
+fn opendal_http_permissions_keep_access_category() {
+    use std::io::{Read, Write};
+    for head in [true, false] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no OpenDAL request received"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("OpenDAL listener: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count != 0 && request.len() < 65536);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body = "<Error><Code>AccessDenied</Code><Message>secret-sentinel</Message></Error>";
+            write!(socket, "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            if !head {
+                socket.write_all(body.as_bytes()).unwrap();
+            }
+            let request = String::from_utf8(request).unwrap();
+            let method = if head { "HEAD" } else { "GET" };
+            assert!(request.starts_with(&format!("{method} /bucket/private/object ")));
+        });
+        let result = crate::runtime::block_on(async {
+            let access = Access::new();
+            access.policy.scopes.lock().unwrap().push((
+                "s3://".into(),
+                HashMap::from([
+                    ("use_opendal".into(), "true".into()),
+                    ("access_key_id".into(), "OBJECT".into()),
+                    ("secret_access_key".into(), "test-secret".into()),
+                    ("region".into(), "us-east-1".into()),
+                    // Endpoint ports remain valid; only storage URI ports are rejected.
+                    ("endpoint".into(), endpoint),
+                ]),
+            ));
+            let session = session(access.context());
+            let (store, path) = ObjectStore::from_uri_and_params(
+                session.store_registry(),
+                "s3://bucket/private/object",
+                &ObjectStoreParams::default(),
+            )
+            .await?;
+            store
+                .inner
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        head,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(lance::Error::from)
+        })
+        .unwrap();
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(!error.to_string().contains("secret-sentinel"));
+        let code = if head {
+            ErrorCode::BlobOpen
+        } else {
+            ErrorCode::BlobRead
+        };
+        let error = io_error(code, &error, "access Blob");
+        assert_eq!(error.code as i32, ErrorCode::BlobAccess as i32);
     }
 }
 

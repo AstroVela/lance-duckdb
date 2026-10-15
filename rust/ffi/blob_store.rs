@@ -224,6 +224,11 @@ fn is_access_denied(mut error: &(dyn std::error::Error + 'static)) -> bool {
             || error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            // object_store_opendal wraps PermissionDenied in Generic, retaining
+            // the typed OpenDAL error as its source.
+            || error
+                .downcast_ref::<opendal::Error>()
+                .is_some_and(|error| error.kind() == opendal::ErrorKind::PermissionDenied)
         {
             return true;
         }
@@ -235,8 +240,8 @@ fn is_access_denied(mut error: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 fn safe_store_error(error: object_store::Error) -> object_store::Error {
-    // LocalFileSystem wraps OS permission errors in Generic. Inspect typed
-    // sources before discarding their possibly sensitive paths and messages.
+    // LocalFileSystem and OpenDAL wrap permission errors in Generic. Inspect
+    // typed sources before discarding their possibly sensitive diagnostics.
     if is_access_denied(&error) {
         return store_denied();
     }
@@ -273,6 +278,9 @@ pub(super) fn normalize_uri(uri: &str) -> FfiResult<Url> {
         || url.query().is_some()
         || url.fragment().is_some()
         || !SUPPORTED_SCHEMES.contains(&url.scheme())
+        // Storage providers ignore URI ports when selecting buckets/repos.
+        // Network endpoint ports belong in the resolved storage options.
+        || url.port().is_some()
         // The local provider can ignore an authority while extracting its
         // filesystem path. Never authorize a different identity for that path.
         || (matches!(url.scheme(), "file" | "file-object-store" | "file+uring")

@@ -78,10 +78,12 @@ The supported providers are `file`, `file-object-store`, `file+uring` (when
 available upstream), `s3`, `gs`, `az`, `oss` and `hf`. Local providers are
 constructed with Lance's explicit `file-object-store` route so optimized local
 readers cannot bypass the wrapper. Unknown schemes, URI userinfo, query strings,
-fragments and nonempty local URI authorities fail closed before access callbacks
-or provider construction. This prevents hostnames ignored by a local provider
-from creating an alternate permission target. `s3+ddb` is excluded because its
-separate commit handler cannot be mediated by this store hook.
+fragments, explicit URI ports and nonempty local URI authorities fail closed
+before access callbacks or provider construction. This prevents authorities or
+ports ignored by a provider from creating an alternate permission target for the
+same physical object. Network endpoint ports remain valid in target-scoped
+storage options. `s3+ddb` is excluded because its separate commit handler cannot
+be mediated by this store hook.
 
 Blob diagnostics use fixed safe messages, never arbitrary callback/provider
 text or storage options. Common codes 56–60 identify open, read, range, snapshot
@@ -91,8 +93,9 @@ metadata remains an open failure; missing historical versions remain snapshot
 failures; missing backing bytes during a read remain read failures. Typed
 permission and authentication errors are recognized throughout the source chain
 before provider diagnostics are discarded, including OS permission errors
-wrapped by LocalFileSystem. Denial is never reported as absence. Errors return
-to the caller thread before updating FFI thread-local state.
+wrapped by LocalFileSystem and typed OpenDAL permission errors wrapped by
+`object_store_opendal`. Denial is never reported as absence. Errors return to the
+caller thread before updating FFI thread-local state.
 
 ## Prototype results and limits
 
@@ -117,6 +120,10 @@ cover dataset reopening, external Blob reads, and denial at the canonical
 physical object URI. Local authority aliases are rejected for all three local
 schemes before provider I/O, including dataset binding, historical Blob opens
 and external Blob targets.
+Cloud URI port tests cover S3, GCS, Azure, OSS and HF, asserting rejection before
+callbacks or provider construction. A local HTTP mock exercises OpenDAL HEAD
+and GET permission failures while preserving error codes and redacting response
+diagnostics; its endpoint uses an explicit port.
 
 `test/cpp/blob_access_probe.cpp` separately exercises the pinned native DuckDB
 and Vane APIs. It checks native allowed-path/directory exceptions with external
@@ -174,15 +181,16 @@ link/runtime validation, not a fresh release-LTO distribution build.
 
 Follow-up Rust validation covers object-scoped clients, missing-row
 classification, encoded separators, local URI normalization and authority
-rejection, missing deletion metadata, and wrapped OS permission errors. All 44
-native and 97 Vane Rust unit tests passed, including 30 Blob tests, along with
-Clippy with `-D warnings` in both modes. The new regression tests reproduced the
-reviewed failures before their corresponding fixes. The six latest regressions
-all failed against `d69e757` before the fixes; the mode-000 OS permission check
-ran without skipping in both modes. Rust formatting and the
-repository formatter passed; the latter used the existing `.venv` because `uv`
-was unavailable. C++ probes, SQL suites and live cloud integration were not
-rerun for these Rust-only fixes.
+rejection, cloud URI port rejection, missing deletion metadata, and wrapped OS
+and OpenDAL permission errors. All 46 native and 99 Vane Rust unit tests passed,
+including 32 Blob tests, along with all-targets Clippy with `-D warnings` in both
+modes. The regression tests reproduced the reviewed failures before their
+corresponding fixes: the six earlier regressions failed against `d69e757`, and
+the three port/OpenDAL regression tests failed against `acbebc8`. The mode-000
+OS permission check ran without skipping in both modes. Rust formatting and
+the repository formatter passed; the latter used the existing `.venv` because
+`uv` was unavailable. C++ probes, SQL suites and live cloud integration were
+not rerun for these Rust-only fixes.
 
 Normal reproduction commands (run from the extension root) are:
 
