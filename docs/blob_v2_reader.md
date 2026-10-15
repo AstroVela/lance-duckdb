@@ -68,6 +68,12 @@ mediated upstream providers. A target's opaque SHA-256 cache prefix separates
 even two secret scopes in the same bucket, and registries are never shared
 between access contexts. Provider path extraction is inverted to reconstruct
 full object URIs, including HF repository prefixes and escaped path components.
+One `StoreTarget` representation owns the canonical URI, provider root and
+object path. Provider construction, callbacks, credential selection, cache keys
+and object operations all use this representation. Equivalent URI spellings
+therefore share the same policy target and cached client. Parsing reuses Lance's
+provider extraction and the upstream URL/Path types; backend adaptations are
+applied only at the delegation boundary.
 Every cached store operation still performs its per-object policy check. Since
 upstream registries bind clients to base URIs, the wrapper also selects an
 upstream client for each actual object or listing prefix using that target's
@@ -77,6 +83,12 @@ reads and listing cannot fall back to a base URI's credentials or endpoint.
 For OpenDAL-backed providers, the wrapper adapts request paths and listing
 results to preserve literal percent sequences across `object_store_opendal`'s
 extra decoding step. HEAD/GET metadata retains the original object path.
+Before provider construction or any operation, the target is checked with
+OpenDAL's own path normalizer. Nonempty paths that would change, including
+leading or trailing Unicode whitespace, fail with an access error before backing
+I/O. Native stores retain their original path semantics; native S3 can still
+read objects with leading or trailing spaces. Interior spaces and literal
+percent sequences remain distinct object-key characters.
 Azure and GCS OpenDAL clients are constructed at the bucket/container origin,
 while authorization and option selection still use the full object or prefix
 URI. This prevents the URL path from also becoming a client root and being
@@ -96,7 +108,13 @@ be mediated by this store hook.
 HF repository types use the canonical plural authorities `models`, `datasets`,
 `spaces` and `buckets`. Singular and case variants are normalized before
 callbacks, cache lookup and client construction, so aliases share one policy
-target. Unrecognized HF repository types fail closed.
+target. Owner and repository components are decoded once to the repository-name
+characters documented by
+[Hugging Face](https://huggingface.co/docs/huggingface_hub/package_reference/utilities#huggingface_hub.utils.validate_repo_id).
+For example, `%6fwner/%72epo` becomes `owner/repo` for both policy and HTTP access.
+Empty identities, encoded delimiters, nested escapes and invalid name characters
+fail closed. Repository normalization does not decode the object key a second
+time. Unrecognized HF repository types also fail closed.
 
 Blob diagnostics use fixed safe messages, never arbitrary callback/provider
 text or storage options. Common codes 56–60 identify open, read, range, snapshot
@@ -127,7 +145,7 @@ cover wrapped permission/authentication errors and diagnostic redaction.
 The pinned HF provider is constructed and its repository/path mapping is
 verified without requesting a public dataset. Path inversion covers encoded
 separators (`%2F`), literal percent sequences (`%252F`), and empty relative paths
-while retaining the original repository prefix. Local URI aliases with repeated
+while retaining the canonical repository prefix. Local URI aliases with repeated
 or encoded separators reuse the filesystem provider's normalized path. Tests
 cover dataset reopening, external Blob reads, and denial at the canonical
 physical object URI. Local authority aliases are rejected for all three local
@@ -142,8 +160,15 @@ Additional local HTTP tests verify literal percent keys on native S3 and OpenDAL
 HEAD/GET requests, plus OpenDAL listing prefixes, returned object/common-prefix
 paths and subsequent reads of listed objects. Azure and GCS OpenDAL requests are
 compared with upstream clients constructed at the storage origin. HF alias tests
-cover singular/plural and case variants for all four repository types, including
-denial after a store has been cached, without network access.
+cover singular/plural and case variants for all four repository types, plus
+encoded owner/repository aliases and denial after a store has been cached.
+A child process isolates HF's endpoint environment setting while its real HTTP
+client reads from a local server. The test checks canonical repository routes,
+literal percent object keys, shared clients and denial after cache population.
+OpenDAL whitespace tests check provider creation, GET, HEAD and both listing
+methods with backing-I/O counters. HTTP tests also preserve native S3 whitespace
+keys and OpenDAL interior spaces. These tests require no cloud credentials or
+public datasets.
 
 `test/cpp/blob_access_probe.cpp` separately exercises the pinned native DuckDB
 and Vane APIs. It checks native allowed-path/directory exceptions with external
@@ -203,13 +228,17 @@ Follow-up Rust validation covers object-scoped clients, missing-row
 classification, encoded separators, local URI normalization and authority
 rejection, cloud URI port rejection, missing deletion metadata, and wrapped OS
 and OpenDAL permission errors. It also covers literal percent paths, HF authority
-aliases and Azure/GCS OpenDAL client roots. All 50 native and 103 Vane Rust unit
-tests passed, including 36 Blob tests, along with all-targets Clippy with
+and repository aliases, Azure/GCS OpenDAL client roots, OpenDAL whitespace
+rejection, and canonical targets shared by callbacks and cached clients.
+All 55 native and 108 Vane Rust unit tests passed, including 41 Blob tests,
+along with all-targets Clippy with
 `-D warnings` in both modes. The regression tests reproduced the reviewed
 failures before their corresponding fixes: the six earlier regressions failed
 against `d69e757`, and
 the three port/OpenDAL regression tests failed against `acbebc8`. The four new
 path/alias regression tests also failed against `160e7ba` in the native build.
+Five new or expanded target-identity regression checks failed against `495dc71`
+in the native build, while the native S3 whitespace control still passed.
 The mode-000 OS permission check ran without skipping in both modes. Rust
 formatting and the repository formatter passed; the latter used the existing `.venv` because
 `uv` was unavailable. C++ probes, SQL suites and live cloud integration were

@@ -790,7 +790,7 @@ fn provider_path_inverse_preserves_encoded_separators() {
         "file://",
         "file-object-store://",
         "hf://datasets/owner/repo",
-        "hf://datasets/owner%20name/repo%252Fname",
+        "hf://datasets/owner-name/repo.name",
     ] {
         for (encoded, decoded, canonical) in [
             ("dir%2Ftable.lance", "dir/table.lance", "dir/table.lance"),
@@ -1276,9 +1276,349 @@ fn hf_repository_aliases_share_authorization_before_cache_and_io() {
                 singular.to_uppercase(),
                 plural.to_uppercase(),
             ] {
-                let uri = format!("hf://{spelling}/owner/repo/private/object");
+                for repo in [
+                    "owner/repo",
+                    "%6fwner/repo",
+                    "owner/%72epo",
+                    "%6Fwner/%72epo",
+                ] {
+                    let uri = format!("hf://{spelling}/{repo}/private/object");
+                    let error = registry
+                        .get_store(Url::parse(&uri).unwrap(), &ObjectStoreParams::default())
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                        ErrorCode::BlobAccess as i32
+                    );
+                }
+            }
+            assert!(access
+                .policy
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(uri, _, _)| uri == &canonical));
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn opendal_path_rewrites_are_denied_before_provider_and_object_io() {
+    crate::runtime::block_on(async {
+        let access = Access::new();
+        access.policy.scopes.lock().unwrap().push((
+            "s3://".into(),
+            HashMap::from([("use_opendal".into(), "true".into())]),
+        ));
+        // Even an allowing callback cannot make a rewritten object name safe.
+        let created = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let memory = Arc::new(InMemory::new());
+        let provider = provider(
+            &access,
+            Arc::new(RecordingProvider {
+                inner: Arc::new(RecordingStore {
+                    inner: memory.clone(),
+                    reads: reads.clone(),
+                    short: false,
+                    omit_etag: false,
+                }),
+                created: created.clone(),
+                options: Default::default(),
+            }),
+        );
+        let store = provider
+            .new_store(
+                Url::parse("s3://bucket/").unwrap(),
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+        for (encoded, decoded) in [
+            ("%20private/object", " private/object"),
+            ("private/object%20", "private/object "),
+            ("%C2%A0private/object", "\u{a0}private/object"),
+            ("private/object%C2%A0", "private/object\u{a0}"),
+            ("%20%C2%A0", " \u{a0}"),
+        ] {
+            let uri = format!("s3://bucket/{encoded}");
+            let path = Path::parse(decoded).unwrap();
+            memory.put(&path, b"data".to_vec().into()).await.unwrap();
+            let error = provider
+                .new_store(Url::parse(&uri).unwrap(), &ObjectStoreParams::default())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                ErrorCode::BlobAccess as i32
+            );
+            for head in [false, true] {
+                assert!(matches!(
+                    store
+                        .inner
+                        .get_opts(
+                            &path,
+                            GetOptions {
+                                head,
+                                ..Default::default()
+                            }
+                        )
+                        .await
+                        .unwrap_err(),
+                    object_store::Error::PermissionDenied { .. }
+                ));
+            }
+            assert!(matches!(
+                store
+                    .inner
+                    .list(Some(&path))
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap_err(),
+                object_store::Error::PermissionDenied { .. }
+            ));
+            assert!(matches!(
+                store
+                    .inner
+                    .list_with_delimiter(Some(&path))
+                    .await
+                    .unwrap_err(),
+                object_store::Error::PermissionDenied { .. }
+            ));
+            let calls = access.policy.calls.lock().unwrap();
+            for operation in [PROVIDER, READ, METADATA, LIST] {
+                assert!(calls
+                    .iter()
+                    .any(|(target, op, _)| target == &uri && *op == operation));
+            }
+        }
+        assert_eq!(created.load(Ordering::SeqCst), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    })
+    .unwrap();
+}
+
+#[test]
+fn s3_whitespace_keys_preserve_native_and_opendal_semantics() {
+    for opendal in [false, true] {
+        for head in [false, true] {
+            for (encoded, opendal_preserves_name) in [
+                ("%20private/object", false),
+                ("private/object%20", false),
+                ("%C2%A0private/object", false),
+                ("private/object%C2%A0", false),
+                ("private/%20object/leaf", true),
+                ("private/literal%2520object", true),
+            ] {
+                if opendal && !opendal_preserves_name {
+                    continue;
+                }
+                let (endpoint, server) = object_http_server(vec!["data".into()]);
+                crate::runtime::block_on(async {
+                    let access = Access::new();
+                    access
+                        .policy
+                        .scopes
+                        .lock()
+                        .unwrap()
+                        .push(("s3://".into(), s3_http_options(endpoint, opendal)));
+                    let (store, path) = ObjectStore::from_uri_and_params(
+                        session(access.context()).store_registry(),
+                        &format!("s3://bucket/{encoded}"),
+                        &ObjectStoreParams::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let result = store
+                        .inner
+                        .get_opts(
+                            &path,
+                            GetOptions {
+                                head,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(result.meta.location, path);
+                    if !head {
+                        assert_eq!(result.bytes().await.unwrap().as_ref(), b"data");
+                    }
+                })
+                .unwrap();
+                let method = if head { "HEAD" } else { "GET" };
+                assert_eq!(
+                    server.join().unwrap(),
+                    [format!("{method} /bucket/{encoded} HTTP/1.1")]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hf_invalid_repository_identity_is_rejected_before_callbacks() {
+    crate::runtime::block_on(async {
+        let access = Access::new();
+        let registry = session(access.context()).store_registry();
+        for repo in [
+            "owner",
+            "owner/",
+            "owner%20name/repo",
+            "owner/repo%252Fname",
+            "%2Fowner/repo",
+            "owner/repo%2f",
+            "owner%2Frepo/other",
+            "owner/repo%3Fother",
+            "owner/repo%23other",
+            "owner/repo%5Cother",
+            "owner/%FF",
+            "owner/%00",
+            "owner/%25",
+            "owner/%",
+        ] {
+            let error = registry
+                .get_store(
+                    Url::parse(&format!("hf://datasets/{repo}")).unwrap(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                io_error(ErrorCode::BlobOpen, &error, "open").code as i32,
+                ErrorCode::BlobAccess as i32
+            );
+        }
+        assert!(access.policy.calls.lock().unwrap().is_empty());
+    })
+    .unwrap();
+}
+
+#[test]
+fn hf_encoded_repositories_use_canonical_http_targets_and_cached_policy() {
+    // HF only exposes its endpoint through an environment variable. Isolate
+    // that setting in a child process, never mutate the test runner's environment.
+    const CHILD: &str = "LANCE_BLOB_HF_HTTP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let (endpoint, server) = object_http_server(vec!["data".into(); 4]);
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ffi::blob_store::tests::hf_encoded_repositories_use_canonical_http_targets_and_cached_policy", "--nocapture"])
+            .env(CHILD, "1")
+            .env("HF_ENDPOINT", endpoint)
+            .output().unwrap();
+        assert!(
+            result.status.success(),
+            "HF child failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let expected = vec!["GET /datasets/owner/repo/resolve/main/private%252Fobject HTTP/1.1"; 4];
+        assert_eq!(server.join().unwrap(), expected);
+        return;
+    }
+    crate::runtime::block_on(async {
+        let canonical = "hf://datasets/owner/repo/private%252Fobject";
+        let access = Access::new();
+        access.policy.scopes.lock().unwrap().push((
+            canonical.into(),
+            HashMap::from([("hf_token".into(), "test-token".into())]),
+        ));
+        let registry = session(access.context()).store_registry();
+        let cached = registry
+            .get_store(
+                Url::parse(canonical).unwrap(),
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+        let aliases = [
+            "owner/repo",
+            "%6fwner/repo",
+            "owner/%72epo",
+            "%6Fwner/%72epo",
+        ];
+        for repo in aliases {
+            let (store, path) = ObjectStore::from_uri_and_params(
+                registry.clone(),
+                &format!("hf://DATASET/{repo}/private%252Fobject"),
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+            assert!(Arc::ptr_eq(&store.inner, &cached.inner));
+            assert_eq!(path.as_ref(), "private%2Fobject");
+            let result = store.inner.get(&path).await.unwrap();
+            assert_eq!(result.meta.location, path);
+            assert_eq!(result.bytes().await.unwrap().as_ref(), b"data");
+        }
+        access.deny(canonical, None);
+        for repo in aliases {
+            assert!(registry
+                .get_store(
+                    Url::parse(&format!("hf://datasets/{repo}/private%252Fobject")).unwrap(),
+                    &ObjectStoreParams::default()
+                )
+                .await
+                .is_err());
+        }
+        assert!(matches!(
+            cached
+                .inner
+                .get(&Path::parse("private%2Fobject").unwrap())
+                .await
+                .unwrap_err(),
+            object_store::Error::PermissionDenied { .. }
+        ));
+        assert!(access
+            .policy
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(uri, _, _)| uri == canonical));
+    })
+    .unwrap();
+}
+
+#[test]
+fn provider_path_aliases_share_authorization_and_cached_clients() {
+    crate::runtime::block_on(async {
+        for opendal in [false, true] {
+            let access = Access::new();
+            access.policy.scopes.lock().unwrap().push((
+                "s3://".into(),
+                s3_http_options("http://127.0.0.1:1".into(), opendal),
+            ));
+            let registry = session(access.context()).store_registry();
+            let canonical = "s3://bucket/private/object";
+            let cached = registry
+                .get_store(
+                    Url::parse(canonical).unwrap(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap();
+            let aliases = ["%70rivate/object", "private%2Fobject", "private%2fobject"];
+            for path in aliases {
+                let store = registry
+                    .get_store(
+                        Url::parse(&format!("s3://bucket/{path}")).unwrap(),
+                        &ObjectStoreParams::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(&store.inner, &cached.inner));
+            }
+            access.deny(canonical, None);
+            for path in aliases {
                 let error = registry
-                    .get_store(Url::parse(&uri).unwrap(), &ObjectStoreParams::default())
+                    .get_store(
+                        Url::parse(&format!("s3://bucket/{path}")).unwrap(),
+                        &ObjectStoreParams::default(),
+                    )
                     .await
                     .unwrap_err();
                 assert_eq!(
@@ -1292,7 +1632,7 @@ fn hf_repository_aliases_share_authorization_before_cache_and_io() {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|(uri, _, _)| uri == &canonical));
+                .all(|(uri, _, _)| uri == canonical));
         }
     })
     .unwrap();

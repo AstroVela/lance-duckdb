@@ -307,8 +307,39 @@ pub(super) fn normalize_uri(uri: &str) -> FfiResult<Url> {
         };
         url.set_host(Some(repo_type))
             .map_err(|_| access_error("invalid HF repository type"))?;
+        // Lance passes the encoded owner/repository directly to the HF HTTP
+        // client. Decode those identity components once, before callbacks and
+        // client construction. Object keys keep their separate Path semantics.
+        let mut segments = url.path().trim_start_matches('/').splitn(3, '/');
+        let owner = hf_identity_component(segments.next().unwrap_or_default())?;
+        let repo = hf_identity_component(segments.next().unwrap_or_default())?;
+        let path = match segments.next() {
+            Some(path) => format!("/{owner}/{repo}/{path}"),
+            None => format!("/{owner}/{repo}"),
+        };
+        url.set_path(&path);
     }
     Ok(url)
+}
+
+fn hf_identity_component(encoded: &str) -> FfiResult<String> {
+    // These are HF's repository-name characters, not arbitrary object-key
+    // characters. Reject encoded delimiters and nested escapes instead of
+    // allowing an HTTP route or another decoding pass to reinterpret them.
+    if encoded.to_ascii_lowercase().contains("%2f") {
+        return Err(access_error("invalid HF repository identity"));
+    }
+    let component =
+        Path::from_url_path(encoded).map_err(|_| access_error("invalid HF repository identity"))?;
+    if component.is_root()
+        || !component
+            .as_ref()
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(access_error("invalid HF repository identity"));
+    }
+    Ok(component.to_string())
 }
 
 // An empty registry, populated only with mediated providers, fails closed for
@@ -443,13 +474,13 @@ impl fmt::Debug for BlobStoreProvider {
 }
 
 impl BlobStoreProvider {
-    fn resolve(&self, url: &Url, operation: u32) -> lance::Result<Arc<ResolvedStore>> {
-        let url = normalize_uri(url.as_str()).map_err(|_| denied())?;
+    fn resolve(&self, target: &StoreTarget, operation: u32) -> lance::Result<Arc<ResolvedStore>> {
+        let url = &target.url;
         // Authorization precedes the upstream cache lookup and any delegation.
         if operation != PROVIDER {
-            self.access.resolve(&url, PROVIDER).map_err(|_| denied())?;
+            self.access.resolve(url, PROVIDER).map_err(|_| denied())?;
         }
-        let options = self.access.resolve(&url, operation).map_err(|_| denied())?;
+        let options = self.access.resolve(url, operation).map_err(|_| denied())?;
         let mut resolutions = self.resolutions.lock().map_err(|_| denied())?;
         if let Some(resolved) = resolutions.get(url.as_str()) {
             return Ok(resolved.clone());
@@ -484,35 +515,22 @@ impl BlobStoreProvider {
 
     async fn backing_store(
         &self,
-        url: &Url,
+        target: &StoreTarget,
         resolved: &ResolvedStore,
-    ) -> lance::Result<ObjectStore> {
+    ) -> lance::Result<(ObjectStore, Path)> {
+        // Validate the backend's interpretation before construction or I/O,
+        // including operations that reuse a cached client.
+        let path = target.backing_path(resolved.opendal)?;
         // Upstream registries bind a store to a base URI. Child objects can have
         // different secret scopes, so select their own upstream clients here.
         // Cache only raw clients: retaining a policy wrapper would form a cycle
         // back to this provider and keep the access context alive indefinitely.
-        resolved
+        let store = resolved
             .store
             .get_or_try_init(|| async {
-                let mut delegated_url = if matches!(url.scheme(), "file" | "file+uring") {
-                    // Disable upstream local fast paths, which bypass the wrapper.
-                    Url::parse(&format!(
-                        "file-object-store{}",
-                        &url[url::Position::AfterScheme..]
-                    ))
-                    .map_err(|_| denied())?
-                } else {
-                    url.clone()
-                };
-                if resolved.opendal && matches!(url.scheme(), "az" | "gs") {
-                    // These providers turn the URL path into an OpenDAL root.
-                    // Operations already carry the complete bucket-relative path;
-                    // only client configuration belongs at the bucket origin.
-                    delegated_url.set_path("");
-                }
                 let mut store = self
                     .inner
-                    .new_store(delegated_url, &resolved.params)
+                    .new_store(target.backing_url(resolved.opendal)?, &resolved.params)
                     .await
                     .map_err(|error| {
                         if is_access_denied(&error) {
@@ -522,18 +540,18 @@ impl BlobStoreProvider {
                         }
                     })?;
                 store.store_prefix = resolved.prefix.clone();
-                Ok(store)
+                Ok::<_, lance::Error>(store)
             })
             .await
-            .cloned()
+            .cloned()?;
+        Ok((store, path))
     }
 }
 
 #[async_trait]
 impl ObjectStoreProvider for BlobStoreProvider {
     fn extract_path(&self, url: &Url) -> lance::Result<Path> {
-        let url = normalize_uri(url.as_str()).map_err(|_| denied())?;
-        self.inner.extract_path(&url).map_err(|_| denied())
+        Ok(StoreTarget::new(url, self.inner.as_ref())?.path)
     }
 
     fn calculate_object_store_prefix(
@@ -541,7 +559,8 @@ impl ObjectStoreProvider for BlobStoreProvider {
         url: &Url,
         _inherited_options: Option<&HashMap<String, String>>,
     ) -> lance::Result<String> {
-        Ok(self.resolve(url, PROVIDER)?.prefix.clone())
+        let target = StoreTarget::new(url, self.inner.as_ref())?;
+        Ok(self.resolve(&target, PROVIDER)?.prefix.clone())
     }
 
     async fn new_store(
@@ -549,10 +568,9 @@ impl ObjectStoreProvider for BlobStoreProvider {
         url: Url,
         _inherited: &ObjectStoreParams,
     ) -> lance::Result<ObjectStore> {
-        let url = normalize_uri(url.as_str()).map_err(|_| denied())?;
-        let resolved = self.resolve(&url, PROVIDER)?;
         let target = StoreTarget::new(&url, self.inner.as_ref())?;
-        let mut store = self.backing_store(&url, &resolved).await?;
+        let resolved = self.resolve(&target, PROVIDER)?;
+        let (mut store, _) = self.backing_store(&target, &resolved).await?;
         store.inner = Arc::new(BlobPolicyStore {
             target,
             provider: self.clone(),
@@ -561,47 +579,50 @@ impl ObjectStoreProvider for BlobStoreProvider {
     }
 }
 
-// Invert the provider's path extraction instead of mistaking its cache prefix
-// for a URI. HF retains repository components; bucket stores retain authority.
+// One parsed identity drives callbacks, credentials, caches and backend access.
+// Reuse Lance's extraction and URL/Path encoding instead of parsing object keys
+// independently in each operation. Only backend-specific adaptations live here.
 #[derive(Clone, Debug)]
 struct StoreTarget {
+    url: Url,
     root: Url,
+    path: Path,
 }
 
 impl StoreTarget {
     fn new(url: &Url, provider: &dyn ObjectStoreProvider) -> lance::Result<Self> {
-        let path = provider.extract_path(url).map_err(|_| denied())?;
+        let url = normalize_uri(url.as_str()).map_err(|_| denied())?;
+        let path = provider.extract_path(&url).map_err(|_| denied())?;
         // Rebuild from the provider's canonical path when its root is the URI
         // origin. In particular, filesystem extraction normalizes repeated
         // separators that a generic URL-path decoder would reject.
         let mut root = url.clone();
         root.set_path("");
-        let mut target = Self { root };
+        let mut target = Self { url, root, path };
+        let canonical = target.uri(&target.path)?;
         if provider
-            .extract_path(&target.uri(&path)?)
-            .is_ok_and(|candidate| candidate == path)
+            .extract_path(&canonical)
+            .is_ok_and(|candidate| candidate == target.path)
         {
+            target.url = canonical;
             return Ok(target);
         }
         // Providers such as HF also need a repository prefix in their root.
         // Match the decoded object path at an encoded URL segment boundary.
         // Counting decoded components would over-trim repository prefixes when
         // one URL segment contains encoded separators such as `dir%2Ftable`.
-        let url_path = url.path();
+        let url_path = target.url.path();
         let prefix_len = std::iter::once(0)
             .chain(url_path.match_indices('/').map(|(index, _)| index + 1))
             .chain(std::iter::once(url_path.len()))
             .find(|&start| {
-                Path::from_url_path(&url_path[start..]).is_ok_and(|suffix| suffix == path)
+                Path::from_url_path(&url_path[start..]).is_ok_and(|suffix| suffix == target.path)
             })
             .ok_or_else(denied)?;
         target.root.set_path(&url_path[..prefix_len]);
         // Reject a mapping that cannot faithfully reproduce the upstream path.
-        if provider
-            .extract_path(&target.uri(&path)?)
-            .map_err(|_| denied())?
-            != path
-        {
+        target.url = target.uri(&target.path)?;
+        if provider.extract_path(&target.url).map_err(|_| denied())? != target.path {
             return Err(denied());
         }
         Ok(target)
@@ -614,6 +635,49 @@ impl StoreTarget {
             .pop_if_empty()
             .extend(path.parts().map(|part| part.as_ref().to_owned()));
         Ok(url)
+    }
+
+    fn with_path(&self, path: &Path) -> lance::Result<Self> {
+        Ok(Self {
+            url: self.uri(path)?,
+            root: self.root.clone(),
+            path: path.clone(),
+        })
+    }
+
+    fn backing_url(&self, opendal: bool) -> lance::Result<Url> {
+        let mut url = self.url.clone();
+        if matches!(url.scheme(), "file" | "file+uring") {
+            // Disable upstream local fast paths, which bypass the wrapper.
+            url = Url::parse(&format!(
+                "file-object-store{}",
+                &url[url::Position::AfterScheme..]
+            ))
+            .map_err(|_| denied())?;
+        }
+        if opendal && matches!(url.scheme(), "az" | "gs") {
+            // These providers turn the URL path into an OpenDAL root. The
+            // operation already carries the complete bucket-relative path.
+            url.set_path("");
+        }
+        Ok(url)
+    }
+
+    fn backing_path(&self, opendal: bool) -> lance::Result<Path> {
+        if !opendal {
+            return Ok(self.path.clone());
+        }
+        // OpenDAL trims Unicode whitespace and normalizes separators on every
+        // operation. Reject a changed object identity instead of authorizing
+        // one name and accessing another. The empty Path denotes the root.
+        if !self.path.is_root()
+            && opendal::raw::normalize_path(self.path.as_ref()) != self.path.as_ref()
+        {
+            return Err(denied());
+        }
+        // object_store_opendal 0.57 decodes its input Path again. Preserve a
+        // literal percent sequence by encoding it at this single boundary.
+        Ok(Path::from(self.path.as_ref()))
     }
 }
 
@@ -637,20 +701,11 @@ impl fmt::Display for BlobPolicyStore {
 
 struct BackingStore {
     inner: Arc<dyn Store>,
+    path: Path,
     opendal: bool,
 }
 
 impl BackingStore {
-    fn path(&self, path: &Path) -> Path {
-        if self.opendal {
-            // object_store_opendal 0.57 decodes its input Path again. Supply an
-            // encoded path so a literal `%2F` key cannot become a `/` separator.
-            Path::from(path.as_ref())
-        } else {
-            path.clone()
-        }
-    }
-
     fn listed_path(&self, path: Path) -> object_store::Result<Path> {
         if self.opendal {
             // OpenDAL listing entries go through Path::from, which encodes raw
@@ -674,7 +729,7 @@ impl BlobPolicyStore {
         path: &Path,
         operation: u32,
     ) -> object_store::Result<BackingStore> {
-        let target = self.target.uri(path).map_err(|_| store_denied())?;
+        let target = self.target.with_path(path).map_err(|_| store_denied())?;
         let resolved = self
             .provider
             .resolve(&target, operation)
@@ -682,8 +737,9 @@ impl BlobPolicyStore {
         self.provider
             .backing_store(&target, &resolved)
             .await
-            .map(|store| BackingStore {
+            .map(|(store, path)| BackingStore {
                 inner: store.inner,
+                path,
                 opendal: resolved.opendal,
             })
             .map_err(|error| {
@@ -709,7 +765,7 @@ impl Store for BlobPolicyStore {
         let requested_range = options.range.clone();
         let mut result = store
             .inner
-            .get_opts(&store.path(location), options)
+            .get_opts(&store.path, options)
             .await
             .map_err(safe_store_error)?;
         result.meta.location = location.clone();
@@ -762,11 +818,10 @@ impl Store for BlobPolicyStore {
             let store = policy
                 .backing_store(&prefix.clone().unwrap_or_default(), LIST)
                 .await?;
-            let prefix = prefix.as_ref().map(|path| store.path(path));
             Ok::<_, object_store::Error>(
                 store
                     .inner
-                    .list(prefix.as_ref())
+                    .list(prefix.as_ref().map(|_| &store.path))
                     .map(move |result| {
                         // The stream can outlive its caller and the original store.
                         let _lease = &policy;
@@ -785,10 +840,9 @@ impl Store for BlobPolicyStore {
         let store = self
             .backing_store(&prefix.cloned().unwrap_or_default(), LIST)
             .await?;
-        let prefix = prefix.map(|path| store.path(path));
         let result = store
             .inner
-            .list_with_delimiter(prefix.as_ref())
+            .list_with_delimiter(prefix.map(|_| &store.path))
             .await
             .map_err(safe_store_error)?;
         Ok(ListResult {
