@@ -13,6 +13,8 @@ option(LANCE_VANE_DISTRIBUTED
        "Build the Vane distributed Lance scan and write adapters" OFF)
 option(LANCE_VANE_DYNAMIC_PROVIDER
        "Build a self-contained Vane dynamic-provider artifact" OFF)
+option(LANCE_BLOB_ACCESS_PROBE
+       "Build the standalone Blob access feasibility experiment" OFF)
 
 if(LANCE_VANE_DYNAMIC_PROVIDER AND NOT LANCE_VANE_DISTRIBUTED)
   message(FATAL_ERROR
@@ -190,6 +192,11 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/exec_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/filter_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/arrow_export.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/blob.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/blob_tests.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/blob_store.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/blob_store_tests.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/blob_test_support.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/read_schema.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dataset.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dir_namespace.rs
@@ -335,6 +342,15 @@ add_dependencies(${EXTENSION_NAME} lance_duckdb_ffi_build)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} debug "${RUST_DEBUG_LIB}"
                       optimized "${RUST_RELEASE_LIB}" ${PLATFORM_LIBS})
 add_dependencies(${LOADABLE_EXTENSION_NAME} lance_duckdb_ffi_build)
+
+if(LANCE_BLOB_ACCESS_PROBE)
+  find_package(Threads REQUIRED)
+  add_executable(lance_blob_access_probe test/cpp/blob_access_probe.cpp)
+  target_link_libraries(
+    lance_blob_access_probe duckdb_static dummy_static_extension_loader Threads::Threads
+    debug "${RUST_DEBUG_LIB}" optimized "${RUST_RELEASE_LIB}" ${PLATFORM_LIBS})
+  add_dependencies(lance_blob_access_probe lance_duckdb_ffi_build)
+endif()
 
 if(LANCE_VANE_DYNAMIC_PROVIDER)
   # The provider carries the Rust closure and its matching DuckDB engine in one
