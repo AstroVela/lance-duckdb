@@ -189,3 +189,28 @@ operations: their SQL maintenance rewrites are not currently portable Ray plans.
 These tests qualify indexed reads and frozen snapshots, not distributed index
 maintenance (tracked in [#31](https://github.com/AstroVela/lance-duckdb/issues/31)).
 The standalone DuckDB implementations are unchanged.
+
+## Independent provider release numbers
+
+Lance uses `X.Y.Z.N` public wheel versions: `X.Y.Z` is the exact
+Vane release and each provider owns its positive `release_number` in
+`vane-provider-release.toml`. The first numbered release is `0.2.0.1`;
+increment only the changed provider to `0.2.0.2`, then `.3`, and so on.
+Reset the counter only when the numeric Vane `X.Y.Z` changes, for example
+from `0.2.0` to the first `0.3.0.1` provider release. Keep incrementing across
+dev, rc, final and post stages of the same `X.Y.Z`: `0.2.0.2rc1` must advance
+to `0.2.0.3`, rather than resetting to `0.2.0.1`. Stage suffixes stay attached,
+for example `0.2.0.1.dev612`.
+
+Changed artifact bytes, metadata or dependency pins require a new number.
+An existing version/tag can be retried only with identical wheel bytes, and
+the shared index gate rejects lower release numbers. Provider dependencies
+use the exact versions of the supplied wheels. Artifact hashes, signatures
+and engine compatibility identities continue to be verified independently.
+
+The `[packaging]` table pins the official Vane packaging tools separately
+from the engine/runtime manifest. CI checks out that exact commit, exports
+`VANE_PROVIDER_PACKAGING_SOURCE`, and calls the shared `vane_provider_build.py`
+adapter for both building and verification. For local packaging, set that
+variable to the same clean, pinned checkout. This lets the provider use
+numbered releases while retaining its exact Vane `0.2.0` runtime pin.

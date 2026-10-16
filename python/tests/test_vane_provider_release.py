@@ -28,7 +28,7 @@ sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
 
 VANE_VERSION = "0.2.0.dev612"
-PROVIDER_VERSION = "0.2.0.0.612.1"
+PROVIDER_VERSION = "0.2.0.1.dev612"
 INTERPRETERS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 PLATFORM = "manylinux_2_28_x86_64"
 
@@ -54,23 +54,27 @@ def _tools_revision() -> str:
 
 
 def _write_wheel(
-    directory: Path, interpreter: str, *, requirement: str = f"vane-ai==={VANE_VERSION}"
+    directory: Path,
+    interpreter: str,
+    *,
+    requirement: str = f"vane-ai==={VANE_VERSION}",
+    vane_version: str = VANE_VERSION,
 ) -> Path:
     distribution = "vane_extension_lance"
-    path = (
-        directory
-        / f"{distribution}-{PROVIDER_VERSION}-{interpreter}-none-{PLATFORM}.whl"
+    version = (
+        PROVIDER_VERSION.removesuffix(".dev612")
+        if vane_version == "0.2.0"
+        else PROVIDER_VERSION
     )
+    path = directory / f"{distribution}-{version}-{interpreter}-none-{PLATFORM}.whl"
     metadata = (
         "Metadata-Version: 2.4\n"
         "Name: vane-extension-lance\n"
-        f"Version: {PROVIDER_VERSION}\n"
+        f"Version: {version}\n"
         f"Requires-Dist: {requirement}\n\n"
     )
     with zipfile.ZipFile(path, "w") as wheel:
-        wheel.writestr(
-            f"{distribution}-{PROVIDER_VERSION}.dist-info/METADATA", metadata
-        )
+        wheel.writestr(f"{distribution}-{version}.dist-info/METADATA", metadata)
     return path
 
 
@@ -100,7 +104,9 @@ def test_config_declares_the_built_lance_matrix() -> None:
     assert config.interpreters == INTERPRETERS
     assert config.platforms == (PLATFORM,)
     assert config.max_wheel_bytes == 100_000_000
-    assert config.providers == (release.Provider("lance", "vane-extension-lance", ()),)
+    assert config.providers == (
+        release.Provider("lance", "vane-extension-lance", (), 1),
+    )
     native = release._load_source_tools()
     manifest = native.load_manifest(ROOT / "vane-extension.toml", ROOT)
     assert manifest.name == "lance"
@@ -320,11 +326,12 @@ def test_production_and_development_manifests_pin_vane_020() -> None:
 def test_production_promotion_requires_the_exact_staged_lance_matrix(
     tmp_path, monkeypatch
 ) -> None:
-    paths = _write_release(tmp_path)
-    for path in paths:
-        # Keep the existing immutable provider version shape; only the exact
-        # runtime requirement distinguishes this synthetic production candidate.
-        _write_wheel(tmp_path, path.name.split("-")[2], requirement="vane-ai===0.2.0")
+    paths = tuple(
+        _write_wheel(
+            tmp_path, interpreter, requirement="vane-ai===0.2.0", vane_version="0.2.0"
+        )
+        for interpreter in INTERPRETERS
+    )
     document = {
         "urls": [
             {
@@ -336,7 +343,7 @@ def test_production_promotion_requires_the_exact_staged_lance_matrix(
         ]
     }
     monkeypatch.setattr(release, "verify_sources", Mock())
-    request = Mock(side_effect=[(200, document), (404, None)])
+    request = Mock(side_effect=[(200, document), (404, None), (404, None)])
     monkeypatch.setattr(release, "_request_json", request)
     command = [
         "verify-promotion",
@@ -350,8 +357,9 @@ def test_production_promotion_requires_the_exact_staged_lance_matrix(
     ]
     assert release.main(command) == 0
     assert [call.args[0] for call in request.call_args_list] == [
-        f"https://test.pypi.org/pypi/vane-extension-lance/{PROVIDER_VERSION}/json",
-        f"https://pypi.org/pypi/vane-extension-lance/{PROVIDER_VERSION}/json",
+        f"https://test.pypi.org/pypi/vane-extension-lance/{PROVIDER_VERSION.removesuffix('.dev612')}/json",
+        f"https://pypi.org/pypi/vane-extension-lance/{PROVIDER_VERSION.removesuffix('.dev612')}/json",
+        "https://pypi.org/pypi/vane-extension-lance/json",
     ]
     document["urls"][0]["digests"]["sha256"] = "0" * 64
     request.side_effect = [(200, document)]
