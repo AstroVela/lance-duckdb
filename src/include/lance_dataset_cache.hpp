@@ -21,7 +21,8 @@ private:
 
 shared_ptr<LanceDatasetCacheEntry>
 LanceGetOrOpenDatasetEntry(ClientContext &context, const string &path,
-                           bool *out_cache_hit = nullptr);
+                           bool *out_cache_hit = nullptr,
+                           void *blob_access = nullptr);
 
 string
 LanceBuildResolvedPathDatasetCacheKey(const string &open_path,
@@ -52,6 +53,10 @@ void LanceInvalidateDatasetCache(ClientContext &context,
                                  const string &cache_key);
 void LanceInvalidateDatasetCacheForPath(ClientContext &context,
                                         const string &path);
+// Preserve a shared snapshot through binding/execution, then reopen on the next
+// query.
+void LanceExpireDatasetCacheAfterQuery(ClientContext &context,
+                                       const string &path);
 void LanceInvalidateDatasetCacheForTable(ClientContext &context,
                                          const LanceTableEntry &table);
 

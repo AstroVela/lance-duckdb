@@ -72,6 +72,7 @@ jobs:
           path: |
             build/release/test/unittest
             build/release/src/libduckdb.so*
+            build/release/extension/lance/lance_blob_filesystem_test
           if-no-files-found: error
 
       - name: Save ccache
@@ -102,6 +103,14 @@ jobs:
       - name: Run tests
         run: |
           ./build/release/test/unittest "test/*"
+
+      - name: Test Blob FileHandle semantics and snapshot mutations
+        run: |
+          chmod +x build/release/extension/lance/lance_blob_filesystem_test
+          python3 -m venv build/blob-tests
+          build/blob-tests/bin/pip install pylance==9.0.1 pyarrow==22.0.0
+          build/blob-tests/bin/python test/scripts/run_blob_filesystem_tests.py \
+            build/release/extension/lance/lance_blob_filesystem_test
 
   test_s3:
     name: Test S3 (MinIO)
@@ -154,6 +163,13 @@ jobs:
               mc mb --ignore-existing local/lance-test
               mc mirror --overwrite /fixtures/test_data.lance local/lance-test/test_data.lance
               mc mirror --overwrite /fixtures/search_test_data.lance local/lance-test/search_test_data.lance
+              mc mirror --overwrite /fixtures/blob_v2_fixture.lance local/lance-test/blob_v2_fixture.lance
+              mc admin user add local blob-dataset blob-dataset-password
+              mc admin user add local blob-external blob-external-password
+              mc admin policy create local blob-dataset /fixtures/blob_s3_dataset_policy.json
+              mc admin policy create local blob-external /fixtures/blob_s3_external_policy.json
+              mc admin policy attach local blob-dataset --user blob-dataset
+              mc admin policy attach local blob-external --user blob-external
             '
 
       - name: Run S3 tests
@@ -161,6 +177,20 @@ jobs:
           LANCE_TEST_S3: "1"
         run: |
           ./build/release/test/unittest "test/*"
+
+      - name: Test Blob target secrets and bounded HTTP reads
+        env:
+          LANCE_TEST_S3: "1"
+          LANCE_BLOB_S3_DATASET_KEY: blob-dataset
+          LANCE_BLOB_S3_DATASET_SECRET: blob-dataset-password
+          LANCE_BLOB_S3_EXTERNAL_KEY: blob-external
+          LANCE_BLOB_S3_EXTERNAL_SECRET: blob-external-password
+        run: |
+          chmod +x build/release/extension/lance/lance_blob_filesystem_test
+          python3 -m venv build/blob-tests
+          build/blob-tests/bin/pip install pylance==9.0.1 pyarrow==22.0.0 boto3
+          build/blob-tests/bin/python test/scripts/run_s3_blob_filesystem_tests.py \
+            build/release/extension/lance/lance_blob_filesystem_test
 
       - name: Cleanup MinIO
         if: always()

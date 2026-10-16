@@ -33,7 +33,7 @@ ATTACH 'test/.tmp' AS maintenance_ns (TYPE LANCE);
 query TTT
 OPTIMIZE maintenance_ns.main.maintenance_smoke;
 ----
-compact	test/.tmp/maintenance_smoke.lance	<REGEX>:\{.*\}
+compact	<REGEX>:.*[/\\]test[/\\]\.tmp[/\\]maintenance_smoke\.lance	<REGEX>:\{.*\}
 
 query TTT
 VACUUM LANCE maintenance_ns.main.maintenance_smoke WITH (
@@ -42,7 +42,7 @@ VACUUM LANCE maintenance_ns.main.maintenance_smoke WITH (
   error_if_tagged_old_versions = true
 );
 ----
-cleanup	test/.tmp/maintenance_smoke.lance	<REGEX>:\{.*\}
+cleanup	<REGEX>:.*[/\\]test[/\\]\.tmp[/\\]maintenance_smoke\.lance	<REGEX>:\{.*\}
 
 statement error
 VACUUM LANCE maintenance_ns.main.maintenance_smoke WITH (

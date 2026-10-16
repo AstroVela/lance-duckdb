@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::blob_store::*;
@@ -18,6 +18,8 @@ pub(super) struct Policy {
     pub retained: AtomicUsize,
     pub released: AtomicUsize,
     pub results_released: AtomicUsize,
+    pub option_requests: AtomicUsize,
+    pub provider_options_only: AtomicBool,
 }
 
 struct ResultOwner {
@@ -52,6 +54,7 @@ unsafe extern "C" fn resolve(
     context: *mut c_void,
     uri: *const c_char,
     operation: u32,
+    resolve_options: bool,
     result: *mut LanceBlobAccessResult,
 ) -> i32 {
     // SAFETY: Rust supplies live callback arguments for this synchronous call.
@@ -62,6 +65,9 @@ unsafe extern "C" fn resolve(
             &mut *result,
         )
     };
+    if resolve_options {
+        policy.option_requests.fetch_add(1, Ordering::SeqCst);
+    }
     policy
         .calls
         .lock()
@@ -78,7 +84,7 @@ unsafe extern "C" fn resolve(
         result.safe_error = c"DENIED secret-key-must-not-leak https://host/?sig=private".as_ptr();
         return -1;
     }
-    let options = policy
+    let mut options = policy
         .scopes
         .lock()
         .unwrap()
@@ -86,6 +92,11 @@ unsafe extern "C" fn resolve(
         .find(|(prefix, _)| uri.contains(prefix))
         .map(|(_, options)| options.clone())
         .unwrap_or_default();
+    if (!resolve_options || operation != PROVIDER)
+        && policy.provider_options_only.load(Ordering::SeqCst)
+    {
+        options.clear();
+    }
     let (keys, values): (Vec<_>, Vec<_>) = options
         .into_iter()
         .map(|(key, value)| (CString::new(key).unwrap(), CString::new(value).unwrap()))

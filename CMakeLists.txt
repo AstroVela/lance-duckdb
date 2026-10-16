@@ -50,6 +50,9 @@ set(EXTENSION_SOURCES
     src/lance_scan.cpp
     src/lance_search.cpp
     src/lance_common.cpp
+    src/lance_blob.cpp
+    src/lance_blob_access.cpp
+    src/lance_blob_filesystem.cpp
     src/lance_dataset_cache.cpp
     src/lance_session_state.cpp
     src/lance_secrets.cpp
@@ -350,6 +353,17 @@ if(LANCE_BLOB_ACCESS_PROBE)
     lance_blob_access_probe duckdb_static dummy_static_extension_loader Threads::Threads
     debug "${RUST_DEBUG_LIB}" optimized "${RUST_RELEASE_LIB}" ${PLATFORM_LIBS})
   add_dependencies(lance_blob_access_probe lance_duckdb_ffi_build)
+endif()
+
+if(BUILD_UNITTESTS)
+  find_package(Threads REQUIRED)
+  add_executable(lance_blob_filesystem_test test/cpp/test_blob_filesystem.cpp)
+  target_include_directories(lance_blob_filesystem_test PRIVATE
+                             "${DuckDB_SOURCE_DIR}/extension/core_functions/include")
+  target_link_libraries(lance_blob_filesystem_test ${EXTENSION_NAME}
+                       core_functions_extension duckdb_static
+                       Threads::Threads)
+  link_extension_libraries(lance_blob_filesystem_test "")
 endif()
 
 if(LANCE_VANE_DYNAMIC_PROVIDER)

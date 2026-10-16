@@ -1,0 +1,122 @@
+# name: test/sql/blob_filesystem.test
+# description: Snapshot-bound Blob URIs through the public DuckDB filesystem
+# group: [sql]
+
+require lance
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'lance_blob_uri';
+----
+1
+
+statement error
+SELECT lance_blob_uri(NULL, 'video', NULL);
+----
+non-null constants
+
+statement error
+SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', NULL, NULL);
+----
+non-null constants
+
+statement error
+SELECT lance_blob_uri(path, 'video', 0) FROM (VALUES ('test/data/blob_v2_fixture.lance')) t(path);
+----
+non-null constants
+
+statement error
+SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'plain', 0);
+----
+Blob v2 column
+
+statement error
+SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'clips.item', 0);
+----
+Blob v2 column
+
+query I
+SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', NULL) IS NULL;
+----
+true
+
+query I
+SELECT ends_with(lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', 18446744073709551615::UBIGINT), '&rowid=18446744073709551615');
+----
+true
+
+query III
+SELECT count(*), count(uri), bool_and(uri IS NULL OR ends_with(uri, '&rowid=' || i::VARCHAR))
+FROM (
+  SELECT i, lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', CASE WHEN i % 3 = 0 THEN NULL ELSE i::UBIGINT END) AS uri
+  FROM range(5000) t(i) WHERE i % 5 <> 0
+);
+----
+4000	2667	true
+
+statement ok
+SET VARIABLE blob_uri = (SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', _rowid) FROM 'test/data/blob_v2_fixture.lance' WHERE id=0);
+
+query TII
+SELECT content, size, last_modified = TIMESTAMP '1970-01-01' FROM read_blob(getvariable('blob_uri'));
+----
+abc	3	true
+
+query I
+SELECT count(*) FROM glob(getvariable('blob_uri'));
+----
+1
+
+statement ok
+SET VARIABLE blob_uri = (SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', _rowid) FROM 'test/data/blob_v2_fixture.lance' WHERE id=1);
+
+query II
+SELECT size, content = repeat('p', 64)::BLOB FROM read_blob(getvariable('blob_uri'));
+----
+64	true
+
+statement ok
+SET VARIABLE blob_uri = (SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', _rowid) FROM 'test/data/blob_v2_fixture.lance' WHERE id=2);
+
+query II
+SELECT size, content = repeat('d', 256)::BLOB FROM read_blob(getvariable('blob_uri'));
+----
+256	true
+
+statement ok
+SET VARIABLE blob_uri = (SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', _rowid) FROM 'test/data/blob_v2_fixture.lance' WHERE id=4);
+
+query II
+SELECT size, octet_length(content) FROM read_blob(getvariable('blob_uri'));
+----
+0	0
+
+statement error
+SELECT * FROM read_blob('lance-blob://v2/?dataset=x');
+----
+Invalid lance-blob URI
+
+statement error
+SELECT * FROM read_blob(getvariable('blob_uri') || '&rowid=0');
+----
+Invalid lance-blob URI
+
+statement error
+SELECT * FROM read_blob(replace(getvariable('blob_uri'), '&version=1', '&version=0'));
+----
+Invalid lance-blob URI
+
+statement ok
+SET VARIABLE blob_uri = (SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'info.video', _rowid) FROM 'test/data/blob_v2_fixture.lance' WHERE id=0);
+
+query T
+SELECT content FROM read_blob(getvariable('blob_uri'));
+----
+abc
+
+statement ok
+PREPARE blob_routes AS SELECT count(*), bool_and(contains(lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', _rowid), '&version=1&')) FROM 'test/data/blob_v2_fixture.lance';
+
+query II
+EXECUTE blob_routes;
+----
+6	true

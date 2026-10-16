@@ -126,6 +126,16 @@ enum LanceBlobAccessOperation : uint32_t {
   LANCE_BLOB_READ = 4
 };
 
+// Keep these internal categories in sync with rust/error.rs.
+enum LanceBlobErrorCode : int32_t {
+  LANCE_BLOB_ERROR_OPEN = 56,
+  LANCE_BLOB_ERROR_READ = 57,
+  LANCE_BLOB_ERROR_RANGE = 58,
+  LANCE_BLOB_ERROR_SNAPSHOT = 59,
+  LANCE_BLOB_ERROR_ACCESS = 60,
+  LANCE_BLOB_ERROR_NOT_FOUND = 61
+};
+
 struct LanceBlobAccessResult {
   // On success return the same normalized target and target-scoped options.
   // Put path prefixes in the target URI. The root and hf_root options may only
@@ -145,8 +155,10 @@ struct LanceBlobAccessCallbacks {
   void (*retain)(void *context);
   void (*release)(void *context);
   // Zero authorizes; any nonzero status denies before backing I/O.
+  // Resolve options only on the first provider lookup for a target. Later
+  // callbacks still authorize but reuse the options already owned by Rust.
   int32_t (*resolve)(void *context, const char *target_uri, uint32_t operation,
-                     LanceBlobAccessResult *result);
+                     bool resolve_options, LanceBlobAccessResult *result);
   // Called exactly once after every resolve, even for a denied/empty result.
   void (*release_result)(void *context, LanceBlobAccessResult *result);
 };
@@ -181,6 +193,10 @@ void lance_blob_free(void *blob);
 void *lance_blob_open_binding_dataset(const char *dataset_uri,
                                       void *access_context);
 const char *lance_blob_snapshot_token(void *dataset, void *access_context);
+// Owned normalized URI or (for local targets) OS path; release with
+// lance_free_string.
+const char *lance_blob_normalize_uri(const char *uri, bool local_path);
+int32_t lance_blob_validate_column(void *dataset, const char *column_path);
 
 #ifdef LANCE_VANE_DISTRIBUTED
 void *lance_vane_open_dataset_version_with_session(const char *path,

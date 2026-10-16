@@ -111,6 +111,72 @@ fn provider(access: &Access, inner: Arc<dyn ObjectStoreProvider>) -> Arc<BlobSto
 }
 
 #[test]
+fn provider_options_survive_authorization_only_callbacks() {
+    crate::runtime::block_on(async {
+        let access = Access::new();
+        access
+            .policy
+            .provider_options_only
+            .store(true, Ordering::SeqCst);
+        let expected = HashMap::from([("endpoint".to_owned(), "target-specific".to_owned())]);
+        access
+            .policy
+            .scopes
+            .lock()
+            .unwrap()
+            .push(("s3://bucket".into(), expected.clone()));
+        let memory = Arc::new(InMemory::new());
+        let path = Path::from("dataset/object");
+        memory.put(&path, b"data".to_vec().into()).await.unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let provider = provider(
+            &access,
+            Arc::new(RecordingProvider {
+                inner: memory,
+                created: Default::default(),
+                options: observed.clone(),
+            }),
+        );
+        let store = provider
+            .new_store(
+                Url::parse("s3://bucket/dataset").unwrap(),
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.inner.head(&path).await.unwrap().size, 4);
+        let option_requests = access.policy.option_requests.load(Ordering::SeqCst);
+        access.policy.scopes.lock().unwrap().clear();
+        assert_eq!(
+            store
+                .inner
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"data"
+        );
+        assert_eq!(
+            access.policy.option_requests.load(Ordering::SeqCst),
+            option_requests,
+            "reading an open object must not request credentials again"
+        );
+        assert!(observed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|options| options == &expected));
+        let calls = access.policy.calls.lock().unwrap();
+        assert!(calls.iter().any(|(_, operation, _)| *operation == METADATA));
+        assert!(calls.iter().any(|(_, operation, _)| *operation == READ));
+    })
+    .unwrap();
+}
+
+#[test]
 fn configured_roots_are_rejected_before_provider_construction() {
     crate::runtime::block_on(async {
         for uri in [
@@ -496,12 +562,13 @@ fn local_scheme_aliases_share_policy_and_cached_clients() {
     crate::runtime::block_on(async {
         let directory = TempDir::new();
         let file = directory.0.join(if cfg!(unix) {
-            "private 文件%2F\\name.bin"
+            "private 文件%2F?query#fragment\\name.bin"
         } else {
             "private 文件%2F.bin"
         });
         std::fs::write(&file, b"private-data").unwrap();
         let canonical = Url::from_file_path(&file).unwrap();
+        assert_eq!(normalize_uri(file.to_str().unwrap()).unwrap(), canonical);
         let access = Access::new();
         let registry = session(access.context()).store_registry();
         let local = registry.get_provider("file").unwrap();
@@ -1247,6 +1314,16 @@ fn provider_path_inverse_preserves_encoded_separators() {
                 format!("{canonical_root}/{canonical}")
             );
             assert_eq!(provider.extract_path(&reconstructed).unwrap(), path);
+            if !is_local_scheme(url.scheme()) {
+                let normalized = normalize_uri(url.as_str()).unwrap();
+                let expected = if encoded.ends_with('/') {
+                    format!("{reconstructed}/")
+                } else {
+                    reconstructed.to_string()
+                };
+                assert_eq!(normalized.as_str(), expected, "{url}");
+                assert_eq!(normalize_uri(normalized.as_str()).unwrap(), normalized);
+            }
             assert_eq!(
                 target
                     .uri(&Path::from("other/payload.bin"))
