@@ -193,6 +193,9 @@ BindBlobUri(ClientContext &context, ScalarFunction &,
             vector<unique_ptr<Expression>> &arguments) {
   vector<string> constants;
   for (idx_t index = 0; index < 2; index++) {
+    if (arguments[index]->HasParameter()) {
+      throw ParameterNotResolvedException();
+    }
     if (!arguments[index]->IsFoldable()) {
       throw BinderException(
           "lance_blob_uri dataset and column must be non-null constants");

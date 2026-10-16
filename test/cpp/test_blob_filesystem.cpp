@@ -625,6 +625,33 @@ static void CheckFlagsAndErrors(Connection &connection,
          "malformed URI is not absence");
 }
 
+static void CheckPreparedUris(Connection &connection, const string &dataset,
+                              const string &other_dataset) {
+  auto prepared = connection.Prepare("SELECT lance_blob_uri(?, ?, 0::UBIGINT)");
+  Check(!prepared->HasError(), "prepare dataset and column parameters");
+  for (const auto &target :
+       vector<pair<string, string>>{{dataset, "video"},
+                                    {dataset, "info.`clip.with.dot`"},
+                                    {other_dataset, "video"},
+                                    {dataset, "video"}}) {
+    if (target.first.empty()) {
+      continue;
+    }
+    vector<Value> parameters{Value(target.first), Value(target.second)};
+    auto result = prepared->Execute(parameters, false);
+    Check(!result->HasError(), "execute dataset and column parameters");
+    auto chunk = result->Fetch();
+    Check(chunk && chunk->size() == 1, "one prepared Blob URI");
+    auto uri = chunk->GetValue(0, 0).GetValue<string>();
+    auto expected =
+        Query(connection, "SELECT lance_blob_uri(" + Quote(target.first) +
+                              ", " + Quote(target.second) + ", 0::UBIGINT)");
+    Check(uri == expected->GetValue(0, 0).GetValue<string>(),
+          "repeated execution binds the current dataset and column");
+    CheckFile(connection, uri, "abc");
+  }
+}
+
 static void CheckPolicy(const string &dataset, const string &external,
                         const vector<string> &paths) {
   for (idx_t mode = 0; mode < 5; mode++) {
@@ -1100,12 +1127,15 @@ static void CheckSnapshots(Connection &connection, const string &dataset,
   ExtensionLoader loader(DatabaseInstance::GetDatabase(*connection.context),
                          "blob_test");
   loader.RegisterFunction(append);
-  auto prepared = connection.Prepare(RouteSQL(dataset));
+  auto prepared =
+      connection.Prepare("SELECT lance_blob_uri(?, ?, _rowid) FROM " +
+                         Quote(dataset) + " ORDER BY id");
   Check(!prepared->HasError(), "prepare route query");
+  vector<Value> parameters{Value(dataset), Value("video")};
   auto alias =
       connection.Prepare(RouteSQL(ParseLanceBlobUri(paths[0]).dataset));
   Check(!alias->HasError(), "prepare file URI alias");
-  auto initial = prepared->Execute();
+  auto initial = prepared->Execute(parameters, false);
   Check(!initial->HasError(), "execute initial prepared route query");
   auto initial_chunk = initial->Fetch();
   Check(initial_chunk && initial_chunk->size() == 8 &&
@@ -1126,7 +1156,7 @@ static void CheckSnapshots(Connection &connection, const string &dataset,
   connection.Commit();
   // DuckDB requires rebinding CONSISTENT_WITHIN_QUERY functions at execution.
   // The scan and URI must both advance, while materialized old URIs stay valid.
-  auto rebound = prepared->Execute();
+  auto rebound = prepared->Execute(parameters, false);
   Check(!rebound->HasError(), "execute rebound prepared route query");
   auto chunk = rebound->Fetch();
   Check(chunk && chunk->size() == 9, "prepared scan rebinds to version two");
@@ -1205,6 +1235,7 @@ static void Run(const string &dataset, const string &external,
   auto paths = Routes(connection, dataset);
   Check(paths.size() == 8, "fixture rows");
   CheckSql(connection, dataset);
+  CheckPreparedUris(connection, dataset, snapshot_dataset);
   CheckUriParser(paths[0]);
   auto expected = Expected();
   for (idx_t row = 0; row < expected.size(); row++) {

@@ -16,6 +16,8 @@ The first two arguments are non-null foldable VARCHAR expressions; `_rowid` is
 UBIGINT. NULL row IDs return NULL. Binding validates the original Lance schema,
 accepting Blob v2 fields through structs and Lance backtick-quoted field names.
 Lists/maps and ordinary binary or descriptor-like structs are rejected.
+Dataset and column names may also be prepared-statement parameters. Their
+constant and schema checks run after the parameter values are bound at execution.
 
 Binding shares the connection's existing dataset cache with scans. Cache keys
 include normalized paths and resolved storage options; local absolute paths,

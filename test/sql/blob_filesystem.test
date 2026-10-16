@@ -120,3 +120,63 @@ query II
 EXECUTE blob_routes;
 ----
 6	true
+
+# Dataset and column parameters are constants once EXECUTE supplies their values.
+statement ok
+PREPARE blob_dataset_parameter AS SELECT lance_blob_uri($1, 'video', 0::UBIGINT) = lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', 0::UBIGINT);
+
+query I
+EXECUTE blob_dataset_parameter('test/data/blob_v2_fixture.lance');
+----
+true
+
+statement error
+EXECUTE blob_dataset_parameter(NULL);
+----
+non-null constants
+
+query I
+EXECUTE blob_dataset_parameter('test/data/blob_v2_fixture.lance');
+----
+true
+
+statement ok
+PREPARE blob_column_parameter AS SELECT contains(lance_blob_uri('test/data/blob_v2_fixture.lance', $1, 0::UBIGINT), '&column=' || $1 || '&rowid=0');
+
+query I
+EXECUTE blob_column_parameter('video');
+----
+true
+
+query I
+EXECUTE blob_column_parameter('info.video');
+----
+true
+
+statement error
+EXECUTE blob_column_parameter(NULL);
+----
+non-null constants
+
+statement error
+EXECUTE blob_column_parameter('plain');
+----
+Blob v2 column
+
+query I
+EXECUTE blob_column_parameter('video');
+----
+true
+
+statement ok
+PREPARE blob_parameters AS SELECT lance_blob_uri($1, $2, $3) IS NULL;
+
+query I
+EXECUTE blob_parameters('test/data/blob_v2_fixture.lance', 'video', NULL);
+----
+true
+
+query I
+EXECUTE blob_parameters('test/data/blob_v2_fixture.lance', 'info.video', 0::UBIGINT);
+----
+false
