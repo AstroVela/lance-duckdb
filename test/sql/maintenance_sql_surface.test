@@ -42,7 +42,7 @@ ATTACH 'test/.tmp' AS maintenance_surface_ns (TYPE LANCE);
 query TTT
 OPTIMIZE maintenance_surface_ns.main.maintenance_sql_surface;
 ----
-compact	test/.tmp/maintenance_sql_surface.lance	<REGEX>:\{.*\}
+compact	<REGEX>:.*[/\\]test[/\\]\.tmp[/\\]maintenance_sql_surface\.lance	<REGEX>:\{.*\}
 
 statement error
 OPTIMIZE;

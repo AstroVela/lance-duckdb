@@ -2,7 +2,8 @@
 
 PR2 adds snapshot-bound Blob v2 range reads to the common Rust/FFI layer. It
 registers no SQL function or filesystem. The SQL URI encoder, DuckDB FileHandle,
-and production native permission/secret adapter belong to PR3.
+and production native permission/secret adapter are described in
+[Blob v2 SQL and filesystem](blob_v2_filesystem.md).
 
 ## Read and ownership contract
 
@@ -34,7 +35,7 @@ they are not treated as evidence that the row is absent.
 length before I/O, accepts empty reads through EOF, and copies no bytes on
 failure. The mediated object store rejects short bodies and EOF-clipped ranges
 before Lance's scheduler can slice a short response. There is no extension
-payload cache or cursor in Rust. The future C++ FileHandle owns sequential
+payload cache or cursor in Rust. The C++ FileHandle owns sequential
 position and bounded read-ahead.
 
 The caller owns each opaque FFI handle and frees it once. A Blob handle retains
@@ -59,9 +60,11 @@ The internal callback ABI is declared in `src/include/lance_ffi.hpp`:
   ClientContext or FileOpener is insufficient. Callbacks must catch exceptions
   and must not unwind or re-enter the same access handle.
 - Authorization receives the full normalized target and operation before
-  provider construction/cache lookup, listing, metadata and payload access.
+  provider construction/reuse, listing, metadata and payload access.
   Options are selected for that target and frozen for this open. Credentials,
   endpoints and store overrides from another dataset are not inherited.
+  The callback's `resolve_options` flag requests credentials only on the first
+  provider resolution for a target; cached providers still require authorization.
 
 Each open uses an empty upstream `ObjectStoreRegistry` populated only with
 mediated upstream providers. A target's opaque SHA-256 cache prefix separates

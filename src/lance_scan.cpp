@@ -632,11 +632,10 @@ static void CaptureLanceDistributedSnapshot(
   bind_data.distributed_scan_token = UUID::ToString(UUID::GenerateRandomUUID());
 
 #ifdef LANCE_VANE_DISTRIBUTED
-  // The bind data owns this exact snapshot for the lifetime of the current
-  // plan. Do not also retain it as the connection's latest-path cache entry:
-  // a Vane coordinator can commit a distributed mutation in another process,
-  // and the caller's next query must reopen the new latest version.
-  LanceInvalidateDatasetCacheForPath(context, bind_data.file_path);
+  // Other expressions in this query (including lance_blob_uri) must share
+  // this captured snapshot. Expire the latest-path entry at QueryEnd so the
+  // next query still observes mutations committed by another coordinator.
+  LanceExpireDatasetCacheAfterQuery(context, bind_data.file_path);
 #endif
 }
 

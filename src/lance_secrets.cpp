@@ -1,34 +1,24 @@
 #include "lance_secrets.hpp"
 
-#ifdef LANCE_VANE_DISTRIBUTED
 #include "lance_common.hpp"
-#endif
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
 namespace duckdb {
 
-#ifdef LANCE_VANE_DISTRIBUTED
 static vector<string>
-CanonicalizeLanceSecretScopes(const vector<string> &scopes) {
+CanonicalizeLanceSecretScopes(const vector<string> &scopes,
+                              const string &type) {
   vector<string> result;
   result.reserve(scopes.size());
   for (auto &scope : scopes) {
-    result.push_back(LanceVaneCanonicalizeSecretScope(scope));
+    result.push_back(type == "lance_namespace"
+                         ? LanceNormalizeUriScheme(scope)
+                         : LanceNormalizeStorageSecretScope(scope));
   }
   return result;
 }
-
-static unique_ptr<BaseSecret> DeserializeLanceSecret(Deserializer &deserializer,
-                                                     BaseSecret base_secret) {
-  BaseSecret normalized_base(
-      CanonicalizeLanceSecretScopes(base_secret.GetScope()),
-      base_secret.GetType(), base_secret.GetProvider(), base_secret.GetName());
-  return KeyValueSecret::Deserialize<KeyValueSecret>(
-      deserializer, std::move(normalized_base));
-}
-#endif
 
 static bool ShouldRedactLanceStorageOption(const string &key) {
   return StringUtil::Contains(StringUtil::Lower(key), "secret") ||
@@ -38,14 +28,9 @@ static bool ShouldRedactLanceStorageOption(const string &key) {
 
 static unique_ptr<BaseSecret>
 CreateLanceSecretFromConfig(ClientContext &, CreateSecretInput &input) {
-#ifdef LANCE_VANE_DISTRIBUTED
-  auto secret =
-      make_uniq<KeyValueSecret>(CanonicalizeLanceSecretScopes(input.scope),
-                                input.type, input.provider, input.name);
-#else
-  auto secret = make_uniq<KeyValueSecret>(input.scope, input.type,
-                                          input.provider, input.name);
-#endif
+  auto secret = make_uniq<KeyValueSecret>(
+      CanonicalizeLanceSecretScopes(input.scope, input.type), input.type,
+      input.provider, input.name);
 
   for (auto &kv : input.options) {
     if (StringUtil::CIEquals(kv.first, "storage_options")) {
@@ -113,11 +98,7 @@ void RegisterLanceSecrets(DatabaseInstance &instance) {
   if (!HasSecretType(secret_manager, "lance")) {
     SecretType secret_type;
     secret_type.name = "lance";
-#ifdef LANCE_VANE_DISTRIBUTED
-    secret_type.deserializer = DeserializeLanceSecret;
-#else
     secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
-#endif
     secret_type.default_provider = "config";
     secret_type.extension = "lance";
     secret_manager.RegisterSecretType(secret_type);
@@ -233,7 +214,8 @@ void RegisterLanceSecrets(DatabaseInstance &instance) {
   if (!HasSecretType(secret_manager, "lance_namespace")) {
     SecretType namespace_secret_type;
     namespace_secret_type.name = "lance_namespace";
-    namespace_secret_type.deserializer = DeserializeLanceSecret;
+    namespace_secret_type.deserializer =
+        KeyValueSecret::Deserialize<KeyValueSecret>;
     namespace_secret_type.default_provider = "config";
     namespace_secret_type.extension = "lance";
     secret_manager.RegisterSecretType(namespace_secret_type);
