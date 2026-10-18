@@ -45,6 +45,19 @@ public:
     entries.erase(key);
   }
 
+  void ExpireAfterQuery(const string &key) {
+    lock_guard<mutex> guard(lock);
+    expire_after_query.insert(key);
+  }
+
+  void QueryEnd() override {
+    lock_guard<mutex> guard(lock);
+    for (const auto &key : expire_after_query) {
+      entries.erase(key);
+    }
+    expire_after_query.clear();
+  }
+
   void QueryBegin(ClientContext &) override {
     lock_guard<mutex> guard(lock);
     query_hits = 0;
@@ -60,6 +73,7 @@ public:
 private:
   mutex lock;
   unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> entries;
+  unordered_set<string> expire_after_query;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
 };
@@ -106,7 +120,7 @@ LanceBuildResolvedPathDatasetCacheKey(const string &open_path,
   }
 
   string key = "path|";
-  AppendCacheKeyPart(key, open_path);
+  AppendCacheKeyPart(key, LanceNormalizeDatasetPath(open_path));
   AppendCacheKeyPart(key, option_keys.size());
   for (idx_t i = 0; i < option_keys.size(); i++) {
     AppendCacheKeyPart(key, option_keys[i]);
@@ -257,7 +271,7 @@ static shared_ptr<LanceDatasetCacheEntry> GetOrOpenDatasetCacheEntry(
 
 shared_ptr<LanceDatasetCacheEntry>
 LanceGetOrOpenDatasetEntry(ClientContext &context, const string &path,
-                           bool *out_cache_hit) {
+                           bool *out_cache_hit, void *blob_access) {
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;
@@ -274,8 +288,11 @@ LanceGetOrOpenDatasetEntry(ClientContext &context, const string &path,
   return GetOrOpenDatasetCacheEntry(
       context, cache_key,
       [&]() {
-        auto *dataset = OpenResolvedPathDataset(context, open_path, option_keys,
-                                                option_values);
+        auto *dataset =
+            blob_access ? lance_blob_open_binding_dataset(open_path.c_str(),
+                                                          blob_access)
+                        : OpenResolvedPathDataset(context, open_path,
+                                                  option_keys, option_values);
         if (!dataset) {
           return shared_ptr<LanceDatasetCacheEntry>();
         }
@@ -404,6 +421,12 @@ void LanceInvalidateDatasetCacheForPath(ClientContext &context,
                                         const string &path) {
   LanceInvalidateDatasetCache(context,
                               LanceBuildPathDatasetCacheKey(context, path));
+}
+
+void LanceExpireDatasetCacheAfterQuery(ClientContext &context,
+                                       const string &path) {
+  GetOrCreateLanceDatasetCacheState(context)->ExpireAfterQuery(
+      LanceBuildPathDatasetCacheKey(context, path));
 }
 
 void LanceInvalidateDatasetCacheForTable(ClientContext &context,

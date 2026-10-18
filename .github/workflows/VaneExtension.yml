@@ -362,6 +362,15 @@ jobs:
           printf 'GitHub Actions ccache restore hit: %s\n' "${VANE_CCACHE_ACTION_HIT:-false}"
           ccache --show-stats
 
+      - name: Test Blob FileHandles against Vane DuckDB
+        run: |
+          cmake --build "$VANE_NATIVE_BUILD_DIR" --target lance_blob_filesystem_test --parallel 2
+          python3 -m venv "$RUNNER_TEMP/vane-blob-tests"
+          "$RUNNER_TEMP/vane-blob-tests/bin/pip" install pylance==9.0.1 pyarrow==22.0.0
+          cd "$VANE_EXTENSION_ROOT"
+          "$RUNNER_TEMP/vane-blob-tests/bin/python" test/scripts/run_blob_filesystem_tests.py \
+            "$VANE_NATIVE_BUILD_DIR/extension/lance/lance_blob_filesystem_test"
+
   vane-wheel-build:
     name: Build and verify static Vane wheel
     needs: preflight

@@ -6,6 +6,26 @@ struct LanceNamespaceQueryConfig;
 
 namespace duckdb {
 
+struct CatalogTransaction;
+
+// Lexical normalization only: no filesystem access or credential lookup.
+string LanceNormalizeDatasetPath(const string &path);
+// Normalize scope identities like dataset paths, preserving empty scopes and
+// trailing directory separators for DuckDB's literal prefix matching.
+string LanceNormalizeStorageSecretScope(const string &scope);
+void LanceFillStorageOptionsFromSecrets(DatabaseInstance &database,
+                                        CatalogTransaction transaction,
+                                        const string &path,
+                                        vector<string> &keys,
+                                        vector<string> &values);
+#ifdef LANCE_VANE_DISTRIBUTED
+void LanceCaptureBlobSessionOptions(ClientContext &context,
+                                    vector<string> &keys,
+                                    vector<string> &values);
+void CanonicalizeLanceS3StorageOptions(vector<string> &keys,
+                                       vector<string> &values);
+#endif
+
 string LanceConsumeLastError();
 string LanceFormatErrorSuffix();
 
@@ -31,11 +51,9 @@ void *LanceOpenDatasetVersionFromManifestAndIndexSectionForDistributedSearch(
 #endif
 
 string LanceNormalizeS3Scheme(const string &path);
-#ifdef LANCE_VANE_DISTRIBUTED
 // Canonicalize a syntactically valid URI scheme for secret matching. URI
 // schemes are ASCII case-insensitive; Lance also treats s3a/s3n as s3 aliases.
-string LanceVaneCanonicalizeSecretScope(const string &scope);
-#endif
+string LanceNormalizeUriScheme(const string &scope);
 void LanceFillStorageOptionsFromSecrets(ClientContext &context,
                                         const string &path,
                                         vector<string> &out_keys,

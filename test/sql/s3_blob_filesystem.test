@@ -1,0 +1,44 @@
+# name: test/sql/s3_blob_filesystem.test
+# description: Blob URIs and read_blob through S3 with TYPE LANCE secrets
+# group: [sql]
+
+require-env LANCE_TEST_S3 1
+
+test-env LANCE_S3_ENDPOINT http://127.0.0.1:9000
+
+test-env LANCE_S3_REGION us-east-1
+
+test-env LANCE_S3_BUCKET lance-test
+
+test-env LANCE_S3_ACCESS_KEY_ID minioadmin
+
+test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
+
+require lance
+
+statement ok
+CREATE SECRET blob_s3 (TYPE LANCE, SCOPE 's3://${LANCE_S3_BUCKET}/', ACCESS_KEY_ID '${LANCE_S3_ACCESS_KEY_ID}', SECRET_ACCESS_KEY '${LANCE_S3_SECRET_ACCESS_KEY}', REGION '${LANCE_S3_REGION}', ENDPOINT '${LANCE_S3_ENDPOINT}', ALLOW_HTTP true, VIRTUAL_HOSTED_STYLE_REQUEST false);
+
+statement ok
+SET VARIABLE blob_uri = (SELECT lance_blob_uri('s3a://${LANCE_S3_BUCKET}/blob_v2_fixture.lance', 'video', _rowid) FROM 's3://${LANCE_S3_BUCKET}/blob_v2_fixture.lance' WHERE id=1);
+
+query II
+SELECT size, content = repeat('p', 64)::BLOB FROM read_blob(getvariable('blob_uri'));
+----
+64	true
+
+statement ok
+SET VARIABLE blob_uri = (SELECT lance_blob_uri('s3://${LANCE_S3_BUCKET}/blob_v2_fixture.lance', 'video', _rowid) FROM 's3://${LANCE_S3_BUCKET}/blob_v2_fixture.lance' WHERE id=2);
+
+query II
+SELECT size, content = repeat('d', 256)::BLOB FROM read_blob(getvariable('blob_uri'));
+----
+256	true
+
+statement ok
+SET disabled_filesystems='S3FileSystem';
+
+statement error
+SELECT * FROM read_blob(getvariable('blob_uri'));
+----
+access denied

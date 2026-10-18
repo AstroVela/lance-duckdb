@@ -34,6 +34,20 @@ Common URI schemes:
 
 ## Secret Type: `LANCE`
 
+Blob v2 URIs created by `lance_blob_uri` use these same secrets. Each backing
+dataset, alternate base and external object is authorized by its actual URI;
+an external object does not inherit the dataset's credentials or endpoint.
+Use separate scoped secrets when those targets require different credentials,
+including two prefixes in the same bucket. Reopening a Blob URI resolves secrets
+again. The URI itself carries only the dataset/column/row snapshot locator.
+
+The Blob filesystem checks both the synthetic URI and backing targets against
+DuckDB's external-access and disabled-filesystem settings. Thus allowing only
+`lance-blob://` does not grant access to an S3 bucket or local directory. Vane
+builds capture applicable session S3 settings on the opening thread; callbacks
+retain the database and use native secret lookup without borrowing a connection.
+See [Blob filesystem](blob_v2_filesystem.md) for details.
+
 The extension registers a dedicated secret type with multiple providers:
 
 - `PROVIDER config`: Explicit key/value configuration in SQL.

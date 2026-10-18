@@ -1094,6 +1094,11 @@ fn ffi_pointer_validation_and_failed_open_release_every_owner() {
             -1
         );
         assert!(lance_blob_snapshot_token(ptr::null_mut(), access.handle).is_null());
+        assert!(lance_blob_normalize_uri(ptr::null(), false).is_null());
+        assert_eq!(
+            lance_blob_validate_column(ptr::null_mut(), c"video".as_ptr()),
+            -1
+        );
         assert!(lance_dataset_checkout_version(ptr::null_mut(), 1).is_null());
         lance_blob_free(ptr::null_mut());
         lance_blob_access_free(ptr::null_mut());
@@ -1119,6 +1124,19 @@ fn unsupported_collection_and_lookalike_columns_and_null_parents() {
     .unwrap();
     let access = Access::new();
     let binding = Binding::new(&uri, &access);
+    // Binding validates the producer schema without materializing any row.
+    // SAFETY: The binding and C strings remain alive during validation.
+    unsafe {
+        assert_eq!(
+            lance_blob_validate_column(binding.dataset, c"video".as_ptr()),
+            0
+        );
+        assert_eq!(
+            lance_blob_validate_column(binding.dataset, c"info.video".as_ptr()),
+            0
+        );
+        assert_eq!(lance_blob_validate_column(binding.dataset, ptr::null()), -1);
+    }
     for column in ["clips", "clips.item", "lookalike", "plain", "info"] {
         assert_eq!(
             Blob::open(&uri, &binding, &access, 0, column)

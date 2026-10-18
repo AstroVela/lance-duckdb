@@ -158,6 +158,62 @@ fn snapshot_token_inner(dataset: *mut c_void, access: *mut c_void) -> FfiResult<
         .map_err(|_| FfiError::new(ErrorCode::BlobSnapshot, "invalid snapshot token"))
 }
 
+/// Normalize with the same provider rules used at open. `local_path` requests
+/// the OS path for native DuckDB policy matching, without filesystem I/O.
+#[no_mangle]
+pub unsafe extern "C" fn lance_blob_normalize_uri(
+    uri: *const c_char,
+    local_path: bool,
+) -> *const c_char {
+    let result = (|| {
+        // SAFETY: Caller supplies a live NUL-terminated string.
+        let uri = normalize_uri(unsafe { cstr_to_str(uri, "uri")? })?;
+        let normalized = if local_path && uri.scheme() == "file" {
+            uri.to_file_path()
+                .ok()
+                .and_then(|path| path.into_os_string().into_string().ok())
+                .ok_or_else(|| FfiError::new(ErrorCode::BlobAccess, "invalid local Blob target"))?
+        } else {
+            uri.to_string()
+        };
+        CString::new(normalized)
+            .map_err(|_| FfiError::new(ErrorCode::BlobAccess, "invalid Blob target"))
+    })();
+    match result {
+        Ok(value) => {
+            clear_last_error();
+            value.into_raw()
+        }
+        Err(error) => {
+            set_last_error(error.code, error.message);
+            ptr::null()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_blob_validate_column(
+    dataset: *mut c_void,
+    column: *const c_char,
+) -> i32 {
+    let result = (|| {
+        // SAFETY: Caller supplies a live dataset and NUL-terminated column.
+        let (dataset, column) =
+            unsafe { (dataset_handle(dataset)?, cstr_to_str(column, "column")?) };
+        validate_column(&dataset.dataset, column)
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(error) => {
+            set_last_error(error.code, error.message);
+            -1
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_blob_open(
     options: *const LanceBlobOpenOptions,
@@ -254,6 +310,13 @@ fn open_inner(
         }
         let file = files.remove(0);
         let size = file.size();
+        // Lance opens packed/dedicated payload sources lazily. Initialize the
+        // source with an empty range while the opener's transaction is live,
+        // so its target-specific credentials are owned by this handle before
+        // returning to DuckDB. This probes metadata without fetching payload.
+        file.read_range(0..0)
+            .await
+            .map_err(|error| blob_open_error(&error))?;
         Ok(BlobHandle {
             file,
             _dataset: dataset,

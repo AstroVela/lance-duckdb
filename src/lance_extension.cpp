@@ -2,6 +2,8 @@
 
 #include "lance_extension.hpp"
 #include "lance_secrets.hpp"
+#include "lance_blob.hpp"
+#include "lance_blob_filesystem.hpp"
 #ifdef LANCE_VANE_DISTRIBUTED
 #include "lance_distributed_write.hpp"
 #include "lance_session_state.hpp"
@@ -39,6 +41,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   RegisterLanceDistributedWrites(loader);
 #endif
   RegisterLanceMaintenance(loader);
+  RegisterLanceBlobFunctions(loader);
 }
 
 void LanceExtension::Load(ExtensionLoader &loader) {
@@ -47,6 +50,8 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   // Enable SELECT * FROM '.../dataset.lance'
   auto &instance = loader.GetDatabaseInstance();
   RegisterLanceSecrets(instance);
+  FileSystem::GetFileSystem(instance).RegisterSubSystem(
+      make_uniq<LanceBlobFileSystem>());
   auto &config = DBConfig::GetConfig(instance);
   config.AddExtensionOption("lance_deferred_materialization",
                             "Enable deferred materialization for heavy columns "

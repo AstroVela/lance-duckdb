@@ -62,7 +62,13 @@ pub struct LanceBlobAccessCallbacks {
     pub retain: Option<unsafe extern "C" fn(*mut c_void)>,
     pub release: Option<unsafe extern "C" fn(*mut c_void)>,
     pub resolve: Option<
-        unsafe extern "C" fn(*mut c_void, *const c_char, u32, *mut LanceBlobAccessResult) -> i32,
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            u32,
+            bool,
+            *mut LanceBlobAccessResult,
+        ) -> i32,
     >,
     pub release_result: Option<unsafe extern "C" fn(*mut c_void, *mut LanceBlobAccessResult)>,
 }
@@ -97,7 +103,12 @@ impl Drop for BlobAccessContext {
 }
 
 impl BlobAccessContext {
-    fn resolve(&self, target: &Url, operation: u32) -> FfiResult<HashMap<String, String>> {
+    fn resolve(
+        &self,
+        target: &Url,
+        operation: u32,
+        resolve_options: bool,
+    ) -> FfiResult<HashMap<String, String>> {
         let _guard = self
             .callback_lock
             .lock()
@@ -112,6 +123,7 @@ impl BlobAccessContext {
                 self.callbacks.context,
                 target_string.as_ptr(),
                 operation,
+                resolve_options,
                 &mut result,
             )
         };
@@ -274,7 +286,6 @@ pub(super) fn normalize_uri(uri: &str) -> FfiResult<Url> {
     if uri.is_empty()
         || uri.trim() != uri
         || uri.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
-        || uri.contains(['?', '#'])
         || (uri.contains("://") && Url::parse(uri).is_err())
     {
         return Err(access_error("invalid or credential-bearing Blob target"));
@@ -337,6 +348,36 @@ pub(super) fn normalize_uri(uri: &str) -> FfiResult<Url> {
             None => format!("/{owner}/{repo}"),
         };
         url.set_path(&path);
+    }
+    if !is_local_scheme(url.scheme()) {
+        // Match the provider's object-store Path decoding, then encode each
+        // component exactly once. In particular, %2F is a separator whereas
+        // %252F is a literal percent sequence. Scope and cache normalization
+        // must agree with StoreTarget before credentials are selected.
+        // HF's owner/repository form the provider root, not the object key.
+        let mut prefix = Vec::new();
+        let encoded_path = if url.scheme() == "hf" {
+            let mut parts = url.path().trim_start_matches('/').splitn(3, '/');
+            prefix.push(parts.next().unwrap_or_default().to_owned());
+            prefix.push(parts.next().unwrap_or_default().to_owned());
+            parts.next().unwrap_or_default()
+        } else {
+            url.path()
+        };
+        let path = Path::from_url_path(encoded_path)
+            .map_err(|_| access_error("invalid Blob object path"))?;
+        let directory =
+            url.path().ends_with('/') || url.path().to_ascii_lowercase().ends_with("%2f");
+        if !url.path().is_empty() {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| access_error("invalid Blob object path"))?;
+            segments.clear().extend(&prefix).extend(path.parts());
+            // Preserve directory scope boundaries for native prefix matching.
+            if directory && (!path.is_root() || !prefix.is_empty()) {
+                segments.push("");
+            }
+        }
     }
     Ok(url)
 }
@@ -537,11 +578,29 @@ impl fmt::Debug for BlobStoreProvider {
 impl BlobStoreProvider {
     fn resolve(&self, target: &StoreTarget, operation: u32) -> lance::Result<Arc<ResolvedStore>> {
         let url = &target.url;
-        // Authorization precedes the upstream cache lookup and any delegation.
+        let cached = self
+            .resolutions
+            .lock()
+            .map_err(|_| denied())?
+            .get(url.as_str())
+            .cloned();
+        // Reauthorize before reusing a store or delegating, but keep credentials
+        // frozen at this target's first open. Later reads may outlive the SQL
+        // transaction that supplied them.
+        let options = self
+            .access
+            .resolve(url, PROVIDER, cached.is_none())
+            .map_err(|_| denied())?;
         if operation != PROVIDER {
-            self.access.resolve(url, PROVIDER).map_err(|_| denied())?;
+            // Operation callbacks authorize only. They need not repeat the
+            // credentials/options returned at the provider boundary.
+            self.access
+                .resolve(url, operation, false)
+                .map_err(|_| denied())?;
         }
-        let options = self.access.resolve(url, operation).map_err(|_| denied())?;
+        if let Some(resolved) = cached {
+            return Ok(resolved);
+        }
         let mut resolutions = self.resolutions.lock().map_err(|_| denied())?;
         if let Some(resolved) = resolutions.get(url.as_str()) {
             return Ok(resolved.clone());

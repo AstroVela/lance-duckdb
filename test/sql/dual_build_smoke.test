@@ -21,3 +21,12 @@ SELECT video.kind, video.size
 FROM 'test/data/blob_v2_fixture.lance' WHERE id = 3;
 ----
 3	19
+
+# Common Blob URI and filesystem registration must also work in both builds.
+statement ok
+SET VARIABLE smoke_blob_uri = (SELECT lance_blob_uri('test/data/blob_v2_fixture.lance', 'video', _rowid) FROM 'test/data/blob_v2_fixture.lance' WHERE id = 0);
+
+query IT
+SELECT size, content::VARCHAR FROM read_blob(getvariable('smoke_blob_uri'));
+----
+3	abc
