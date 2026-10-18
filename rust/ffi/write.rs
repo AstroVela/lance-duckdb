@@ -903,7 +903,16 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
         session,
         schema,
     ) {
-        Ok(handle) => {
+        Ok(mut handle) => {
+            // Native INSERT supplies the target table's declared schema. Inferring
+            // vectors from its list columns would change ordinary numeric metadata
+            // into fixed-size lists and make the append incompatible with the table.
+            handle
+                .state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vector_candidates
+                .clear();
             clear_last_error();
             Box::into_raw(Box::new(handle)) as *mut c_void
         }
