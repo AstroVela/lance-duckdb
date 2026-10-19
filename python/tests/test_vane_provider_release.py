@@ -104,7 +104,7 @@ def test_config_declares_the_built_lance_matrix() -> None:
     native = release._load_source_tools()
     manifest = native.load_manifest(ROOT / "vane-extension.toml", ROOT)
     assert manifest.name == "lance"
-    assert manifest.vane_revision == "c433f193c103f1b8a52fe738fe842fd252511834"
+    assert manifest.vane_revision == "b51ef003415d83be042870e8580e71572f8b2c85"
 
 
 def test_shared_validate_preserves_workflow_outputs(
@@ -312,7 +312,7 @@ def test_production_and_development_manifests_pin_independent_engines() -> None:
         "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
     )
     assert development["vane"].pop("revision") == (
-        "c433f193c103f1b8a52fe738fe842fd252511834"
+        "b51ef003415d83be042870e8580e71572f8b2c85"
     )
     assert production == development
 
