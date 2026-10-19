@@ -50,7 +50,7 @@ def test_local_lazy_results_write_and_reopen_without_ray(
                 log.write(json.dumps({"event": "batch", "rows": batch.num_rows}) + "\n")
             return identity(batch)
 
-        def close(self):
+        def _vane_close(self):
             with open(trace, "a") as log:
                 log.write(json.dumps({"event": "close"}) + "\n")
 
