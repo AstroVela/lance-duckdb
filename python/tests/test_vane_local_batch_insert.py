@@ -20,11 +20,12 @@ from packaged_dynamic_extension import load_packaged_dynamic_lance
 def test_local_lazy_results_write_and_reopen_without_ray(
     tmp_path, monkeypatch, backend, mode, empty, source_kind
 ):
+    if not os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"):
+        pytest.skip("requires the installed signed dynamic provider qualification")
+
     import ray
     import vane
 
-    if not os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"):
-        pytest.skip("requires the installed signed dynamic provider qualification")
     assert not ray.is_initialized(), "run separately from the Ray integration suite"
 
     def forbid_ray(*args, **kwargs):
