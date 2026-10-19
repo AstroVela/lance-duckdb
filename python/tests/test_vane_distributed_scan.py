@@ -1628,10 +1628,8 @@ async def _drain_native_result_stream_async(stream) -> None:
 
 @contextlib.contextmanager
 def _capture_worker_tasks(physical, connection):
-    from vane.runners.ray.query_resource_graph import (
-        QueryAllocation,
-        ResourceVector,
-    )
+    from vane.execution.query_resource_spec import QueryAllocation
+    from vane.execution.resources import ResourceVector
     from vane.runners.ray.query_resource_graph_builder import (
         build_query_resource_graph,
     )

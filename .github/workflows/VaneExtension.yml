@@ -1058,7 +1058,7 @@ jobs:
 
   vane-dynamic-provider-smoke-test:
     if: inputs.operation != 'testpypi-dev'
-    name: Vane dynamic Lance default Ray smoke integration
+    name: Vane dynamic Lance local and default Ray smoke integration
     needs: [python-quality, vane-dynamic-provider-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -1086,7 +1086,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Exercise provider-backed Lance with default Ray
+      - name: Exercise provider-backed Lance with local subprocesses and default Ray
         shell: bash
         run: |
           set -euo pipefail
@@ -1096,6 +1096,8 @@ jobs:
           test "${#wheels[@]}" -eq 2
           python -m pip install "${wheels[@]}" "grpcio>=1.42.0" "pylance==9.0.1" pytest
           python -m pip check
+          VANE_RUNNER=local-fast python -m pytest -q \
+            python/tests/test_vane_local_batch_insert.py
           python -m pytest -q \
             python/tests/test_vane_single_scan.py
 
