@@ -6,8 +6,8 @@ native_test_selection = "test/sql/dual_build_smoke.test"
 
 [vane]
 repository = "AstroVela/vane"
-# Descriptor-bound materializers, output ownership and unified native local runners.
-revision = "b51ef003415d83be042870e8580e71572f8b2c85"
+# Context's native embedding outputs on the unified native local runner baseline.
+revision = "028cd966d2f70f19d20f94cbd665d8839df1dc8b"
 
 [vcpkg]
 repository = "microsoft/vcpkg"
