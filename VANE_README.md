@@ -117,6 +117,12 @@ numeric lists against an explicitly declared target schema. CTAS uses fixed-size
 vectors because its existing floating-list inference treats variable lists as
 vector candidates. Run the existing Ray tests in a separate process.
 
+Build-only CI also runs the shared
+[local connector write gate](https://github.com/AstroVela/vane-extension-ci-tools/blob/c355a85311dd15f306e6a194987f8b77139712b8/README.md#github-actions).
+It checks both local runner names with tasks and actors, ordinary SQL controls,
+empty and multi-batch writes, injected failures and fresh-connection readback.
+The development engine pin remains aligned with Context's installation baseline.
+
 The development pin also includes Context's native embedding output descriptors
 and SGLang HTTP codecs. These additions are Python-only relative to the unified
 native runner baseline; an audited matching native binary and signed provider

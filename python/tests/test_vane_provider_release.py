@@ -248,6 +248,7 @@ def test_workflow_uses_only_the_committed_tools_submodule() -> None:
         "vane-native-build",
         "vane-wheel-build",
         "vane-dynamic-provider-build",
+        "vane-dynamic-provider-smoke-test",
         "vane-provider-prepare",
         "vane-testpypi-wheels",
         "provider-release-preflight",
