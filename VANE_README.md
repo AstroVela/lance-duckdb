@@ -90,11 +90,12 @@ interface.
 
 The Vane revision in `vane-extension.toml` binds external-block readers to their
 descriptors, transfers output ownership and unifies both local runner names on
-native execution. Rebuild the base engine and the signed Lance provider together
-before using lazy `subprocess_task` or `subprocess_actor` results in native
-INSERT or CTAS. Existing provider artifacts have the previous C++ layout and
-cannot be reused with the new engine. This development pin does not change the
-published release baseline in `vane-extension-release.toml`.
+native execution. When upgrading from the older C++ descriptor layout, rebuild
+the base engine and the signed Lance provider together before using lazy
+`subprocess_task` or `subprocess_actor` results in native INSERT or CTAS. Provider
+artifacts from that older layout cannot be reused with this native baseline.
+This development pin does not change the published release baseline in
+`vane-extension-release.toml`.
 
 Set `VANE_RUNNER=local` before creating the connection. `local-fast` remains a
 compatibility alias and the engine normalizes both names to `local`. Load the matching
@@ -115,6 +116,13 @@ actor closure and reopening the written table. INSERT also checks variable
 numeric lists against an explicitly declared target schema. CTAS uses fixed-size
 vectors because its existing floating-list inference treats variable lists as
 vector candidates. Run the existing Ray tests in a separate process.
+
+The development pin also includes Context's native embedding output descriptors
+and SGLang HTTP codecs. These additions are Python-only relative to the unified
+native runner baseline; an audited matching native binary and signed provider
+can be reused. Install the updated Python wheel noneditably and follow the
+[Context installation qualification](docs/vane_context_qualification.md) to
+verify the complete combination. The production manifest remains independent.
 
 ### Prepare the connection
 
