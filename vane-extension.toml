@@ -6,8 +6,8 @@ native_test_selection = "test/sql/dual_build_smoke.test"
 
 [vane]
 repository = "AstroVela/vane"
-# Descriptor-bound materializers and retry-safe hash exchanges.
-revision = "c433f193c103f1b8a52fe738fe842fd252511834"
+# Descriptor-bound materializers, output ownership and unified native local runners.
+revision = "b51ef003415d83be042870e8580e71572f8b2c85"
 
 [vcpkg]
 repository = "microsoft/vcpkg"

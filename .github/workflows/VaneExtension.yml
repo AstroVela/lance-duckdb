@@ -1096,7 +1096,7 @@ jobs:
           test "${#wheels[@]}" -eq 2
           python -m pip install "${wheels[@]}" "grpcio>=1.42.0" "pylance==9.0.1" pytest
           python -m pip check
-          VANE_RUNNER=local-fast python -m pytest -q \
+          VANE_RUNNER=local python -m pytest -q \
             python/tests/test_vane_local_batch_insert.py
           python -m pytest -q \
             python/tests/test_vane_single_scan.py

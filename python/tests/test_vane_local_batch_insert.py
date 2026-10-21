@@ -14,11 +14,12 @@ from packaged_dynamic_extension import load_packaged_dynamic_lance
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
 @pytest.mark.parametrize("mode", ["insert", "ctas"])
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("source_kind", ["range", "lance_scan"])
 def test_local_lazy_results_write_and_reopen_without_ray(
-    tmp_path, monkeypatch, backend, mode, empty, source_kind
+    tmp_path, monkeypatch, backend, runner, mode, empty, source_kind
 ):
     if not os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"):
         pytest.skip("requires the installed signed dynamic provider qualification")
@@ -32,7 +33,8 @@ def test_local_lazy_results_write_and_reopen_without_ray(
         raise AssertionError("local Lance writes must not initialize Ray")
 
     monkeypatch.setattr(ray, "init", forbid_ray)
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    assert vane.get_or_infer_runner_type() == "local"
     trace = str(tmp_path / "actor.jsonl")
 
     def identity(batch):

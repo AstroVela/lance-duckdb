@@ -86,16 +86,18 @@ Use `.show()` to display results; use `.fetchall()` when Python code needs a
 list of result rows. See the [SQL reference](docs/sql.md) for the shared SQL
 interface.
 
-### Local subprocess writes in the development baseline
+### Native local writes in the development baseline
 
 The Vane revision in `vane-extension.toml` binds external-block readers to their
-descriptors. Rebuild the base engine and the signed Lance provider together
+descriptors, transfers output ownership and unifies both local runner names on
+native execution. Rebuild the base engine and the signed Lance provider together
 before using lazy `subprocess_task` or `subprocess_actor` results in native
 INSERT or CTAS. Existing provider artifacts have the previous C++ layout and
 cannot be reused with the new engine. This development pin does not change the
 published release baseline in `vane-extension-release.toml`.
 
-Set `VANE_RUNNER=local-fast` before creating the connection. Load the matching
+Set `VANE_RUNNER=local` before creating the connection. `local-fast` remains a
+compatibility alias and the engine normalizes both names to `local`. Load the matching
 provider through `vane.load_installed_extension`, then use the ordinary relation
 `insert_into` or `create` methods. This path keeps batch processing lazy until a
 consumer needs column data and does not initialize Ray.
@@ -103,11 +105,11 @@ consumer needs column data and does not initialize Ray.
 Qualify the installed signed development provider in its own pytest process:
 
 ```bash
-VANE_EXPECTED_EXTENSION_TRUST_IDENTITY=vane-ci-test-key VANE_RUNNER=local-fast \
+VANE_EXPECTED_EXTENSION_TRUST_IDENTITY=vane-ci-test-key VANE_RUNNER=local \
   python -m pytest -q python/tests/test_vane_local_batch_insert.py
 ```
 
-The regression covers range and Lance-scan inputs, task and actor workers,
+The 32-case regression covers both runner names, range and Lance-scan inputs, task and actor workers,
 INSERT and CTAS, empty and multiple batches, nested values, fixed-size vectors,
 actor closure and reopening the written table. INSERT also checks variable
 numeric lists against an explicitly declared target schema. CTAS uses fixed-size
