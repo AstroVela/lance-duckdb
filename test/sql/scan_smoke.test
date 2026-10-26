@@ -18,4 +18,4 @@ SELECT * FROM 'test/data/test_data.lance' LIMIT 1;
 statement error
 SELECT * FROM 'dummy_path.lance';
 ----
-IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset open 'dummy_path.lance':
+IO Error: Failed to open Lance dataset: dummy_path.lance

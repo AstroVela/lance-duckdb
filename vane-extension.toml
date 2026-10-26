@@ -6,8 +6,8 @@ native_test_selection = "test/sql/dual_build_smoke.test"
 
 [vane]
 repository = "AstroVela/vane"
-# Vane v0.2.0.
-revision = "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
+# Context's native embedding outputs on the unified native local runner baseline.
+revision = "028cd966d2f70f19d20f94cbd665d8839df1dc8b"
 
 [vcpkg]
 repository = "microsoft/vcpkg"

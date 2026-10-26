@@ -158,6 +158,59 @@ def test_default_ray_lance_writes_and_mutations(
         connection.close()
 
 
+@pytest.mark.parametrize("numeric_type", ["FLOAT", "DOUBLE"])
+def test_native_insert_preserves_numeric_lists_and_vectors(
+    tmp_path: Path, monkeypatch, numeric_type: str
+) -> None:
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    connection = _connect()
+    root = tmp_path / "native-list-insert"
+    root.mkdir()
+    try:
+        connection.execute(f"ATTACH {_sql_literal(root)} AS list_insert (TYPE LANCE)")
+        connection.execute(
+            "CREATE TABLE list_insert.main.target "
+            f"(id BIGINT, metadata {numeric_type}[], embedding {numeric_type}[3])"
+        )
+        # Separate appends exercise all-null, empty, uniform and variable-length
+        # metadata batches without changing the fixed-size embedding column.
+        batches = [
+            [(0, None), (1, None)],
+            [(2, [])],
+            [(3, [1.0]), (4, [2.0])],
+            [(5, [3.0, 4.0]), (6, [5.0, 6.0, 7.0])],
+        ]
+        for batch in batches:
+            values = ", ".join(
+                f"({row_id}, {metadata if metadata is not None else 'NULL'}, [1, 2, 3])"
+                for row_id, metadata in batch
+            )
+            connection.sql(
+                f"SELECT id::BIGINT AS id, metadata::{numeric_type}[] AS metadata, "
+                f"embedding::{numeric_type}[3] AS embedding "
+                f"FROM (VALUES {values}) AS source(id, metadata, embedding)"
+            ).insert_into("list_insert.main.target")
+
+        assert connection.execute(
+            "SELECT id, metadata, embedding FROM list_insert.main.target ORDER BY id"
+        ).fetchall() == [
+            (row_id, metadata, (1.0, 2.0, 3.0))
+            for batch in batches
+            for row_id, metadata in batch
+        ]
+        column_types = {
+            row[0]: row[1]
+            for row in connection.execute("DESCRIBE list_insert.main.target").fetchall()
+        }
+        assert column_types == {
+            "id": "BIGINT",
+            "metadata": f"{numeric_type}[]",
+            "embedding": f"{numeric_type}[3]",
+        }
+    finally:
+        connection.close()
+
+
 def test_vane_rowid_in_uses_sql_membership_semantics(tmp_path: Path) -> None:
     connection = _connect()
     path = tmp_path / "rowid-membership.lance"

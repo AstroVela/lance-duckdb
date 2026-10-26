@@ -1,0 +1,82 @@
+# name: test/sql/dml_delete_filters.test
+# description: DELETE preserves table-column filter indices and rejects partial filters
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT id, 'tag-' || id AS tag, {'value': id} AS nested FROM range(4) t(id))
+TO 'test/.tmp/delete_filters.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS del_filter_ns (TYPE LANCE);
+
+# The filter key is a table column id, not its position in scan column_ids.
+query I
+DELETE FROM del_filter_ns.main.delete_filters WHERE tag = 'missing';
+----
+0
+
+# A quoted column name must not become the string literal 'tag' in Lance SQL.
+query I
+DELETE FROM del_filter_ns.main.delete_filters WHERE tag = 'tag';
+----
+0
+
+query I
+SELECT count(*) FROM del_filter_ns.main.delete_filters;
+----
+4
+
+statement error
+DELETE FROM del_filter_ns.main.delete_filters WHERE nested.value = 1;
+----
+Lance DELETE cannot preserve all pushed table filters
+
+# Retaining the id conjunct alone would delete three rows instead of one.
+statement error
+DELETE FROM del_filter_ns.main.delete_filters WHERE id >= 1 AND nested.value = 2;
+----
+Lance DELETE cannot preserve all pushed table filters
+
+query I
+SELECT id FROM del_filter_ns.main.delete_filters ORDER BY id;
+----
+0
+1
+2
+3
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM del_filter_ns.main.delete_filters WHERE tag = 'tag-2';
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT id FROM del_filter_ns.main.delete_filters ORDER BY id;
+----
+0
+1
+2
+3
+
+query I
+DELETE FROM del_filter_ns.main.delete_filters WHERE tag = 'tag-2';
+----
+1
+
+query I
+SELECT id FROM del_filter_ns.main.delete_filters ORDER BY id;
+----
+0
+1
+3
+
+statement ok
+DETACH del_filter_ns;

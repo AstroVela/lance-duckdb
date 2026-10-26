@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::Schema;
 use datafusion::catalog::TableProvider;
 use datafusion::dataframe::DataFrame;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
@@ -132,20 +132,19 @@ impl TableProvider for LanceExecTableProvider {
 }
 
 fn projected_schema(handle: &DatasetHandle, projection: &[String]) -> Result<Arc<Schema>, String> {
-    let base_schema = handle.arrow_schema.as_ref();
+    let base_schema = handle.read_arrow_schema.as_ref();
     let mut fields = Vec::with_capacity(projection.len());
     for name in projection.iter() {
         let idx = base_schema
             .index_of(name)
             .map_err(|_| format!("projection column not found: {name}"))?;
         let field = base_schema.field(idx);
-        fields.push(Field::new(
-            field.name(),
-            field.data_type().clone(),
-            field.is_nullable(),
-        ));
+        fields.push(field.clone());
     }
-    Ok(Arc::new(Schema::new(fields)))
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        base_schema.metadata().clone(),
+    )))
 }
 
 async fn build_exec_df(handle: &DatasetHandle, exec_ir: &[u8]) -> Result<DataFrame, String> {

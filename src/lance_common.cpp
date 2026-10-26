@@ -4,9 +4,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
-#ifdef LANCE_VANE_DISTRIBUTED
 #include "duckdb/common/file_system.hpp"
-#endif
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -122,24 +120,23 @@ void FillLanceNamespaceQueryConfig(
   out_config.api_key = api_key.empty() ? nullptr : api_key.c_str();
 }
 
-#ifdef LANCE_VANE_DISTRIBUTED
-static bool IsLanceVaneUriSchemeFirstChar(char c) {
+static bool IsLanceUriSchemeFirstChar(char c) {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
 
-static bool IsLanceVaneUriSchemeChar(char c) {
-  return IsLanceVaneUriSchemeFirstChar(c) || (c >= '0' && c <= '9') ||
-         c == '+' || c == '-' || c == '.';
+static bool IsLanceUriSchemeChar(char c) {
+  return IsLanceUriSchemeFirstChar(c) || (c >= '0' && c <= '9') || c == '+' ||
+         c == '-' || c == '.';
 }
 
-string LanceVaneCanonicalizeSecretScope(const string &scope) {
+string LanceNormalizeUriScheme(const string &scope) {
   auto delimiter = scope.find("://");
   if (delimiter == string::npos || delimiter == 0 ||
-      !IsLanceVaneUriSchemeFirstChar(scope[0])) {
+      !IsLanceUriSchemeFirstChar(scope[0])) {
     return scope;
   }
   for (idx_t i = 1; i < delimiter; i++) {
-    if (!IsLanceVaneUriSchemeChar(scope[i])) {
+    if (!IsLanceUriSchemeChar(scope[i])) {
       return scope;
     }
   }
@@ -158,10 +155,8 @@ string LanceVaneCanonicalizeSecretScope(const string &scope) {
   }
   return scheme + scope.substr(delimiter);
 }
-#endif
 
 string LanceNormalizeS3Scheme(const string &path) {
-#ifdef LANCE_VANE_DISTRIBUTED
   // URL schemes are ASCII case-insensitive. Canonicalize all supported S3
   // spellings before secret matching and connection-setting replay so a
   // coordinator cannot succeed from ambient credentials while an isolated
@@ -173,15 +168,71 @@ string LanceNormalizeS3Scheme(const string &path) {
                            StringUtil::CIEquals(path.substr(0, 6), "s3n://"))) {
     return "s3://" + path.substr(6);
   }
-#else
-  if (StringUtil::StartsWith(path, "s3a://")) {
-    return "s3://" + path.substr(6);
-  }
-  if (StringUtil::StartsWith(path, "s3n://")) {
-    return "s3://" + path.substr(6);
-  }
-#endif
   return path;
+}
+
+string LanceNormalizeDatasetPath(const string &path) {
+  if (path.find('\0') != string::npos) {
+    throw InvalidInputException("Invalid Lance dataset path");
+  }
+  auto normalized = LanceNormalizeUriScheme(path);
+  auto delimiter = normalized.find("://");
+  if (delimiter != string::npos) {
+    auto scheme = StringUtil::Lower(normalized.substr(0, delimiter));
+    if (scheme != "file" && scheme != "file-object-store" &&
+        scheme != "file+uring") {
+      // Share the Blob reader's canonical remote identity, including HF
+      // repository aliases and escaped path bytes. Preserve other ordinary
+      // Lance targets that are outside the Blob reader's supported schemes.
+      auto remote = lance_blob_normalize_uri(normalized.c_str(), false);
+      if (!remote) {
+        LanceConsumeLastError();
+        return normalized;
+      }
+      string result(remote);
+      lance_free_string(remote);
+      return result;
+    }
+  }
+  auto result = lance_blob_normalize_uri(normalized.c_str(), true);
+  if (!result) {
+    LanceConsumeLastError();
+    throw InvalidInputException("Invalid Lance dataset path");
+  }
+  string local(result);
+  lance_free_string(result);
+  while (local.size() > 1 && local.back() == '/') {
+    local.pop_back();
+  }
+  return local;
+}
+
+string LanceNormalizeStorageSecretScope(const string &scope) {
+  // An empty scope matches every target. Normalizing it as a local path would
+  // instead restrict it to the current working directory.
+  if (scope.empty()) {
+    return scope;
+  }
+  auto normalized = LanceNormalizeDatasetPath(scope);
+  auto filesystem = FileSystem::CreateLocal();
+  if (!filesystem->IsPathAbsolute(normalized)) {
+    return normalized;
+  }
+  // Local path normalization can remove a trailing separator. Restore the
+  // directory boundary, including URI-escaped separators, so a scope cannot
+  // match similarly named siblings.
+  auto separator = filesystem->PathSeparator(normalized);
+  bool directory = StringUtil::EndsWith(scope, "/") ||
+                   StringUtil::EndsWith(scope, separator);
+  if (scope.find("://") != string::npos && scope.size() >= 3) {
+    auto suffix = StringUtil::Lower(scope.substr(scope.size() - 3));
+    directory =
+        directory || suffix == "%2f" || (separator == "\\" && suffix == "%5c");
+  }
+  if (directory && !StringUtil::EndsWith(normalized, separator)) {
+    normalized += separator;
+  }
+  return normalized;
 }
 
 #ifdef LANCE_VANE_DISTRIBUTED
@@ -329,19 +380,14 @@ static string SecretValueToString(const Value &value) {
   return value.ToString();
 }
 
-void LanceFillStorageOptionsFromSecrets(ClientContext &context,
-                                        const string &path,
-                                        vector<string> &out_keys,
-                                        vector<string> &out_values) {
-  auto &secret_manager = SecretManager::Get(context);
-  auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-#ifdef LANCE_VANE_DISTRIBUTED
-  auto lookup_path = LanceVaneCanonicalizeSecretScope(path);
+static void FillStorageOptionsFromSecrets(SecretManager &secret_manager,
+                                          CatalogTransaction transaction,
+                                          const string &path,
+                                          vector<string> &out_keys,
+                                          vector<string> &out_values) {
+  auto lookup_path = LanceNormalizeDatasetPath(path);
   auto secret_match =
       secret_manager.LookupSecret(transaction, lookup_path, "lance");
-#else
-  auto secret_match = secret_manager.LookupSecret(transaction, path, "lance");
-#endif
   if (!secret_match.HasMatch() || !secret_match.secret_entry ||
       !secret_match.secret_entry->secret) {
     return;
@@ -360,6 +406,25 @@ void LanceFillStorageOptionsFromSecrets(ClientContext &context,
     out_keys.push_back(kv.first);
     out_values.push_back(kv.second.ToString());
   }
+}
+
+void LanceFillStorageOptionsFromSecrets(ClientContext &context,
+                                        const string &path,
+                                        vector<string> &keys,
+                                        vector<string> &values) {
+  FillStorageOptionsFromSecrets(
+      SecretManager::Get(context),
+      CatalogTransaction::GetSystemCatalogTransaction(context), path, keys,
+      values);
+}
+
+void LanceFillStorageOptionsFromSecrets(DatabaseInstance &database,
+                                        CatalogTransaction transaction,
+                                        const string &path,
+                                        vector<string> &keys,
+                                        vector<string> &values) {
+  FillStorageOptionsFromSecrets(SecretManager::Get(database), transaction, path,
+                                keys, values);
 }
 
 #ifdef LANCE_VANE_DISTRIBUTED
@@ -555,8 +620,8 @@ static string CanonicalLanceS3StorageOptionKey(const string &key) {
   return key;
 }
 
-static void CanonicalizeLanceS3StorageOptions(vector<string> &out_keys,
-                                              vector<string> &out_values) {
+void CanonicalizeLanceS3StorageOptions(vector<string> &out_keys,
+                                       vector<string> &out_values) {
   vector<string> normalized_keys;
   vector<string> normalized_values;
   normalized_keys.reserve(out_keys.size());
@@ -704,7 +769,7 @@ static void FillLanceNamespaceAuthFromSecrets(ClientContext &context,
   auto &secret_manager = SecretManager::Get(context);
   auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 #ifdef LANCE_VANE_DISTRIBUTED
-  auto lookup_endpoint = LanceVaneCanonicalizeSecretScope(endpoint);
+  auto lookup_endpoint = LanceNormalizeUriScheme(endpoint);
   auto secret_match = secret_manager.LookupSecret(transaction, lookup_endpoint,
                                                   "lance_namespace");
 #else
@@ -825,7 +890,7 @@ void ResolveLanceNamespaceAuthOverrides(
 void ResolveLanceStorageOptions(ClientContext &context, const string &path,
                                 string &out_open_path, vector<string> &out_keys,
                                 vector<string> &out_values) {
-  out_open_path = path;
+  out_open_path = LanceNormalizeDatasetPath(path);
   out_keys.clear();
   out_values.clear();
 
@@ -835,8 +900,18 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
 }
 
 #ifdef LANCE_VANE_DISTRIBUTED
+void LanceCaptureBlobSessionOptions(ClientContext &context,
+                                    vector<string> &keys,
+                                    vector<string> &values) {
+  if (ProcessHasLanceS3Environment() &&
+      !LanceS3SettingsOverrideProcessEnvironment(context)) {
+    return;
+  }
+  FillLanceStorageOptionsFromDuckDBS3Settings(context, keys, values);
+}
+
 bool LanceHasMatchingStorageSecret(ClientContext &context, const string &path) {
-  auto normalized_path = LanceVaneCanonicalizeSecretScope(path);
+  auto normalized_path = LanceNormalizeDatasetPath(path);
   auto &secret_manager = SecretManager::Get(context);
   auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
   auto secret_match =

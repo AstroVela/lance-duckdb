@@ -1,0 +1,232 @@
+# name: test/sql/scan_blob_v2.test
+# description: Blob v2 read descriptors, nested projection, search and write protection
+# group: [sql]
+
+require lance
+
+query TTTT
+SELECT typeof(video), typeof(required_video), typeof(plain), typeof(lookalike)
+FROM 'test/data/blob_v2_fixture.lance' LIMIT 1;
+----
+STRUCT(kind UTINYINT, "position" UBIGINT, size UBIGINT, blob_id UINTEGER, blob_uri VARCHAR)	STRUCT(kind UTINYINT, "position" UBIGINT, size UBIGINT, blob_id UINTEGER, blob_uri VARCHAR)	BLOB	STRUCT("data" BLOB, uri VARCHAR, "position" UBIGINT, size UBIGINT)
+
+# All four storage kinds, plus an empty payload and a null struct.
+query III
+SELECT id, video.kind, video.size FROM 'test/data/blob_v2_fixture.lance' ORDER BY id;
+----
+0	0	3
+1	1	64
+2	2	256
+3	3	19
+4	0	0
+5	NULL	NULL
+
+# Reordered projections, nested struct/list descriptors and Float16 coexist.
+query IIII
+SELECT info.video.size, clips[1].size, id, info.half
+FROM 'test/data/blob_v2_fixture.lance' ORDER BY id;
+----
+3	3	0	1.0
+64	64	1	2.0
+256	256	2	3.0
+19	19	3	4.0
+NULL	0	4	NULL
+NULL	NULL	5	6.0
+
+query ITI
+SELECT video.kind, video.blob_uri, video.position
+FROM 'test/data/blob_v2_fixture.lance' WHERE id = 3;
+----
+3	s3://blob-pr1-does-not-exist.invalid/video.mp4	7
+
+# Whole-struct reads must have the same layout as field projection.
+query T
+SELECT video FROM 'test/data/blob_v2_fixture.lance' WHERE id = 3;
+----
+{'kind': 3, 'position': 7, 'size': 19, 'blob_id': 0, 'blob_uri': 's3://blob-pr1-does-not-exist.invalid/video.mp4'}
+
+# The original failing query: project only a descriptor child.
+query I
+SELECT video.size FROM 'test/data/blob_v2_fixture.lance' ORDER BY id;
+----
+3
+64
+256
+19
+0
+NULL
+
+query III
+SELECT video.size AS first_size, id, video.size AS repeated_size
+FROM 'test/data/blob_v2_fixture.lance' WHERE id = 3;
+----
+19	3	19
+
+query II
+SELECT id, video.size FROM 'test/data/blob_v2_fixture.lance' WHERE video.size >= 19 ORDER BY id;
+----
+1	64
+2	256
+3	19
+
+query I
+SELECT count(*) FROM 'test/data/blob_v2_fixture.lance' WHERE video IS NULL;
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT video FROM 'test/data/blob_v2_fixture.lance' LIMIT 0);
+----
+0
+
+# Row-ID take must bind the descriptor view. DISTINCT makes this check
+# independent of when each host removes duplicate IN-list entries.
+query II
+SELECT DISTINCT id, video.size FROM 'test/data/blob_v2_fixture.lance' WHERE _rowid IN (3, 0, 3, 999) ORDER BY id;
+----
+0	3
+3	19
+
+# Reusing prepared plans must retain the read schema and its ownership.
+statement ok
+PREPARE blob_lookup AS SELECT video.size FROM 'test/data/blob_v2_fixture.lance' WHERE id = $1;
+
+query I
+EXECUTE blob_lookup(1);
+----
+64
+
+query I
+EXECUTE blob_lookup(3);
+----
+19
+
+statement ok
+DEALLOCATE blob_lookup;
+
+# The compact descriptors stay in the scan; the incompressible plain binary
+# column is fetched by deferred take. Point lookup above covers taking Blobs.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT video.size, octet_length(plain) FROM 'test/data/blob_v2_fixture.lance' WHERE id::VARCHAR LIKE '%3%';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*"Lance Deferred Columns": "plain"[\s\S]*
+
+query II
+SELECT video.size, octet_length(plain) FROM 'test/data/blob_v2_fixture.lance' WHERE id::VARCHAR LIKE '%3%';
+----
+19	2048
+
+statement ok
+SET lance_deferred_materialization = false;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT video.size, octet_length(plain) FROM 'test/data/blob_v2_fixture.lance' WHERE id::VARCHAR LIKE '%3%';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
+
+query II
+SELECT video.size, octet_length(plain) FROM 'test/data/blob_v2_fixture.lance' WHERE id::VARCHAR LIKE '%3%';
+----
+19	2048
+
+statement ok
+SET lance_deferred_materialization = true;
+
+# Aggregation must work with the descriptor input schema on either host.
+# Native Exec pushdown is asserted separately in exec_pushdown_p0.test.
+query I
+SELECT count(video) FROM 'test/data/blob_v2_fixture.lance';
+----
+5
+
+query II
+SELECT id, video.size FROM lance_vector_search('test/data/blob_v2_fixture.lance', 'vec', [0, 0]::FLOAT[2], k = 1, use_index = false);
+----
+0	3
+
+query I
+SELECT count(video.size) FROM lance_fts('test/data/blob_v2_fixture.lance', 'text', 'puppy', k = 10);
+----
+5
+
+query I
+SELECT count(video.size) FROM lance_hybrid_search('test/data/blob_v2_fixture.lance', 'vec', [0, 0]::FLOAT[2], 'text', 'puppy', k = 6, use_index = false);
+----
+5
+
+statement ok
+ATTACH 'test/data' AS blob_ns (TYPE LANCE);
+
+query III
+SELECT id, video.size, info.video.size FROM blob_ns.main.blob_v2_fixture WHERE id = 1;
+----
+1	64	64
+
+# Namespace search reconstructs list element names through DuckDB ("l"),
+# while Lance returns "item". Validate layouts even when clips is not selected.
+query I
+SELECT id FROM lance_fts('blob_ns.main.blob_v2_fixture', 'text', 'puppy', k = 6) ORDER BY id;
+----
+0
+1
+2
+3
+4
+5
+
+query I
+SELECT id FROM lance_vector_search('blob_ns.main.blob_v2_fixture', 'vec', [0, 0]::FLOAT[2], k = 1, use_index = false);
+----
+0
+
+# The same batches must also decode the list descriptors correctly, including
+# every storage kind, empty payloads and null descriptors.
+query IIII
+SELECT id, clips[1].kind, clips[1].size, video.size
+FROM lance_fts('blob_ns.main.blob_v2_fixture', 'text', 'puppy', k = 6) ORDER BY id;
+----
+0	0	3	3
+1	1	64	64
+2	2	256	256
+3	3	19	19
+4	0	0	0
+5	NULL	NULL	NULL
+
+query IIII
+SELECT id, clips[1].kind, clips[1].size, video.size
+FROM lance_vector_search('blob_ns.main.blob_v2_fixture', 'vec', [0, 0]::FLOAT[2], k = 6, use_index = false) ORDER BY id;
+----
+0	0	3	3
+1	1	64	64
+2	2	256	256
+3	3	19	19
+4	0	0	0
+5	NULL	NULL	NULL
+
+# Guard the whole table, even assignments that do not name a Blob column.
+statement error
+INSERT INTO blob_ns.main.blob_v2_fixture (id) VALUES (99);
+----
+column(s) [video, required_video, info, clips]
+
+statement error
+UPDATE blob_ns.main.blob_v2_fixture SET id = 99 WHERE id = 0;
+----
+column(s) [video, required_video, info, clips]
+
+statement error
+MERGE INTO blob_ns.main.blob_v2_fixture AS target
+USING (SELECT 0::BIGINT AS id) AS source ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET text = 'changed';
+----
+column(s) [video, required_video, info, clips]
+
+query I
+SELECT count(*) FROM blob_ns.main.blob_v2_fixture;
+----
+6
+
+statement ok
+DETACH blob_ns;

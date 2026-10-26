@@ -86,6 +86,50 @@ Use `.show()` to display results; use `.fetchall()` when Python code needs a
 list of result rows. See the [SQL reference](docs/sql.md) for the shared SQL
 interface.
 
+### Native local writes in the development baseline
+
+The Vane revision in `vane-extension.toml` binds external-block readers to their
+descriptors, transfers output ownership and unifies both local runner names on
+native execution. When upgrading from the older C++ descriptor layout, rebuild
+the base engine and the signed Lance provider together before using lazy
+`subprocess_task` or `subprocess_actor` results in native INSERT or CTAS. Provider
+artifacts from that older layout cannot be reused with this native baseline.
+This development pin does not change the published release baseline in
+`vane-extension-release.toml`.
+
+Set `VANE_RUNNER=local` before creating the connection. `local-fast` remains a
+compatibility alias and the engine normalizes both names to `local`. Load the matching
+provider through `vane.load_installed_extension`, then use the ordinary relation
+`insert_into` or `create` methods. This path keeps batch processing lazy until a
+consumer needs column data and does not initialize Ray.
+
+Qualify the installed signed development provider in its own pytest process:
+
+```bash
+VANE_EXPECTED_EXTENSION_TRUST_IDENTITY=vane-ci-test-key VANE_RUNNER=local \
+  python -m pytest -q python/tests/test_vane_local_batch_insert.py
+```
+
+The 32-case regression covers both runner names, range and Lance-scan inputs, task and actor workers,
+INSERT and CTAS, empty and multiple batches, nested values, fixed-size vectors,
+actor closure and reopening the written table. INSERT also checks variable
+numeric lists against an explicitly declared target schema. CTAS uses fixed-size
+vectors because its existing floating-list inference treats variable lists as
+vector candidates. Run the existing Ray tests in a separate process.
+
+Build-only CI also runs the shared
+[local connector write gate](https://github.com/AstroVela/vane-extension-ci-tools/blob/c355a85311dd15f306e6a194987f8b77139712b8/README.md#github-actions).
+It checks both local runner names with tasks and actors, ordinary SQL controls,
+empty and multi-batch writes, injected failures and fresh-connection readback.
+The development engine pin remains aligned with Context's installation baseline.
+
+The development pin also includes Context's native embedding output descriptors
+and SGLang HTTP codecs. These additions are Python-only relative to the unified
+native runner baseline; an audited matching native binary and signed provider
+can be reused. Install the updated Python wheel noneditably and follow the
+[Context installation qualification](docs/vane_context_qualification.md) to
+verify the complete combination. The production manifest remains independent.
+
 ### Prepare the connection
 
 Configure the Lance directory once so the write examples have a target

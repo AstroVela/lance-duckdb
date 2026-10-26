@@ -8,7 +8,7 @@ require lance
 statement error
 SELECT * FROM lance_vector_search('dummy_path.lance', 'vec', [1.0]::FLOAT[1], k = 1)
 ----
-IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset open 'dummy_path.lance':
+IO Error: Failed to open Lance dataset: dummy_path.lance
 
 # Empty query vector is rejected
 statement error

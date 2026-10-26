@@ -109,10 +109,96 @@ void *lance_open_dataset_in_namespace_with_session(
     const char *api_key, const char *delimiter, const char *headers_tsv,
     void *session, const char **out_table_uri);
 void lance_close_dataset(void *dataset);
-#ifdef LANCE_VANE_DISTRIBUTED
 uint64_t lance_dataset_version(void *dataset);
 const char *lance_dataset_generation_id(void *dataset);
 void *lance_dataset_checkout_version(void *dataset, uint64_t version);
+
+// Internal Blob access ABI. All callbacks must be non-null, must not throw or
+// re-enter the access handle, and must accept calls on arbitrary runtime
+// threads. The retained context owns its database/policy state independently of
+// a query, connection or FileOpener. Rust serializes resolve/release_result per
+// context; retain/release must be thread-safe. No credentials are serialized
+// into tokens.
+enum LanceBlobAccessOperation : uint32_t {
+  LANCE_BLOB_PROVIDER = 1,
+  LANCE_BLOB_LIST = 2,
+  LANCE_BLOB_METADATA = 3,
+  LANCE_BLOB_READ = 4
+};
+
+// Keep these internal categories in sync with rust/error.rs.
+enum LanceBlobErrorCode : int32_t {
+  LANCE_BLOB_ERROR_OPEN = 56,
+  LANCE_BLOB_ERROR_READ = 57,
+  LANCE_BLOB_ERROR_RANGE = 58,
+  LANCE_BLOB_ERROR_SNAPSHOT = 59,
+  LANCE_BLOB_ERROR_ACCESS = 60,
+  LANCE_BLOB_ERROR_NOT_FOUND = 61
+};
+
+struct LanceBlobAccessResult {
+  // On success return the same normalized target and target-scoped options.
+  // Put path prefixes in the target URI. The root and hf_root options may only
+  // denote the store root (empty or slash-only), never a directory prefix.
+  // Rust copies the strings before release_result, including on failure.
+  const char *normalized_uri;
+  const char *const *option_keys;
+  const char *const *option_values;
+  size_t option_count;
+  // Reserved for adapter diagnostics; Rust does not forward arbitrary text.
+  const char *safe_error;
+  void *result_owner;
+};
+
+struct LanceBlobAccessCallbacks {
+  void *context;
+  void (*retain)(void *context);
+  void (*release)(void *context);
+  // Zero authorizes; any nonzero status denies before backing I/O.
+  // Resolve options only on the first provider lookup for a target. Later
+  // callbacks still authorize but reuse the options already owned by Rust.
+  int32_t (*resolve)(void *context, const char *target_uri, uint32_t operation,
+                     bool resolve_options, LanceBlobAccessResult *result);
+  // Called exactly once after every resolve, even for a denied/empty result.
+  void (*release_result)(void *context, LanceBlobAccessResult *result);
+};
+
+int32_t lance_blob_access_create(const LanceBlobAccessCallbacks *callbacks,
+                                 void **out_access);
+void lance_blob_access_free(void *access);
+
+struct LanceBlobOpenOptions {
+  const char *dataset_uri;
+  uint64_t version;
+  const char *snapshot_token;
+  const char *column_path;
+  uint64_t row_id;
+  void *access_context;
+};
+
+// Open always validates the exact historical snapshot against current backing
+// metadata. Outputs are cleared on failure. The access lease is cloned, so the
+// temporary access handle may be freed immediately after open.
+int32_t lance_blob_open(const LanceBlobOpenOptions *options, void **out_blob,
+                        uint64_t *out_size);
+// Exact blob-relative range; zero length at EOF succeeds without I/O. On error
+// out_read is zero and out_buffer is untouched. Caller owns length valid bytes.
+int32_t lance_blob_read_at(void *blob, uint64_t offset, uint8_t *out_buffer,
+                           size_t length, size_t *out_read);
+// Null is allowed. Caller serializes close against reads and consumes once.
+// Destruction of blob/access handles preserves the caller's last error.
+void lance_blob_free(void *blob);
+// Owned DatasetHandle/string: release with
+// lance_close_dataset/lance_free_string.
+void *lance_blob_open_binding_dataset(const char *dataset_uri,
+                                      void *access_context);
+const char *lance_blob_snapshot_token(void *dataset, void *access_context);
+// Owned normalized URI or (for local targets) OS path; release with
+// lance_free_string.
+const char *lance_blob_normalize_uri(const char *uri, bool local_path);
+int32_t lance_blob_validate_column(void *dataset, const char *column_path);
+
+#ifdef LANCE_VANE_DISTRIBUTED
 void *lance_vane_open_dataset_version_with_session(const char *path,
                                                    uint64_t version,
                                                    void *session);
@@ -231,9 +317,15 @@ int32_t lance_vane_resolve_rest_table(
 #endif
 
 void *lance_get_schema(void *dataset);
+// Default scan view; Blob v2 fields are descriptors, including nested fields.
+void *lance_get_read_schema(void *dataset);
 void *lance_get_schema_for_scan(void *dataset);
 void lance_free_schema(void *schema);
 int32_t lance_schema_to_arrow(void *schema, ArrowSchema *out_schema);
+// Borrows storage_schema. out_schema must be distinct and empty; the caller
+// owns the exported schema and releases it using its Arrow release callback.
+int32_t lance_arrow_schema_to_read(const ArrowSchema *storage_schema,
+                                   ArrowSchema *out_schema);
 
 int32_t lance_stream_next(void *stream, void **out_batch);
 void lance_close_stream(void *stream);

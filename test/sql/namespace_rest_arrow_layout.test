@@ -1,0 +1,115 @@
+# name: test/sql/namespace_rest_arrow_layout.test
+# description: REST scans decode the actual Arrow schema and validate logical output
+# group: [sql]
+
+# Run with test/scripts/check_rest_arrow_layout.py and the native test runner.
+require-env LANCE_TEST_REST_ARROW_LAYOUT 1
+
+require-env LANCE_REST_ARROW_LAYOUT_ENDPOINT
+
+require lance
+
+statement ok
+ATTACH 'default' AS rest_layout (TYPE LANCE, ENDPOINT '${LANCE_REST_ARROW_LAYOUT_ENDPOINT}');
+
+# All four tables advertise the same storage schema. Their IPC responses use
+# different offsets/projections, including reversed and extra columns.
+foreach table large narrow reordered extra
+
+query I
+SELECT id FROM rest_layout.main.${table} ORDER BY id;
+----
+0
+1
+2
+3
+
+query IIII
+SELECT id, len(clips), clips[1].size, clips[2].size FROM rest_layout.main.${table} ORDER BY id;
+----
+0	2	3	5
+1	1	NULL	NULL
+2	0	NULL	NULL
+3	NULL	NULL	NULL
+
+query TITTR
+SELECT info.label, id, hex(info.payload), info.video.size::VARCHAR, info.half
+FROM rest_layout.main.${table} ORDER BY id;
+----
+alpha	0	00FF41	3	1.5
+duck 中	1	42430044	5	-2.25
+(empty)	2	(empty)	NULL	NULL
+NULL	3	NULL	NULL	NULL
+
+# Unmarked descriptor-shaped structs keep their own values and types.
+query III
+SELECT id, lookalike[1].kind, plain_info.descriptor.size
+FROM rest_layout.main.${table} ORDER BY id;
+----
+0	7	17
+1	NULL	19
+2	NULL	NULL
+3	NULL	NULL
+
+# Repeated output columns, virtual row ids and a minimal count projection.
+query IIII
+SELECT clips[1].size, id, clips[1].size, rowid FROM rest_layout.main.${table} ORDER BY id;
+----
+3	0	3	0
+NULL	1	NULL	1
+NULL	2	NULL	2
+NULL	3	NULL	3
+
+query I
+SELECT count(*) FROM rest_layout.main.${table};
+----
+4
+
+# A non-pushable nested filter must be evaluated on correctly decoded data.
+query I
+SELECT id FROM rest_layout.main.${table} WHERE info.label || '!' = 'duck 中!';
+----
+1
+
+statement ok
+PREPARE rest_layout_lookup AS SELECT info.video.size, info.label FROM rest_layout.main.${table} WHERE id = $1;
+
+query IT
+EXECUTE rest_layout_lookup(0);
+----
+3	alpha
+
+query IT
+EXECUTE rest_layout_lookup(1);
+----
+5	duck 中
+
+statement ok
+DEALLOCATE rest_layout_lookup;
+
+endloop
+
+# Accepting different physical offsets must not admit invalid descriptors or
+# scalar types, missing projected columns, or ambiguous column names.
+statement error
+SELECT id, clips[1].size FROM rest_layout.main.bad_descriptor;
+----
+Lance namespace batch schema does not match the bound output for column 'clips'
+
+statement error
+SELECT id FROM rest_layout.main.bad_scalar;
+----
+Lance namespace batch schema does not match the bound output for column 'id'
+
+statement error
+SELECT id, clips[1].size FROM rest_layout.main.missing;
+----
+Missing expected column in Arrow batch: clips
+
+statement error
+SELECT id FROM rest_layout.main.duplicate;
+----
+Lance namespace batch has missing or duplicate column names
+
+statement ok
+DETACH rest_layout;

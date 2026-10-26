@@ -25,6 +25,64 @@ FROM 'path/to/dataset.lance'
 LIMIT 10;
 ```
 
+### Blob v2 descriptor columns
+
+Lance Blob v2 columns expose the default Lance scan view:
+`STRUCT(kind UTINYINT, position UBIGINT, size UBIGINT, blob_id UINTEGER, blob_uri VARCHAR)`.
+This applies to direct scans, attached tables, and search results, including
+Blob fields nested inside structs and lists.
+
+```sql
+SELECT video.kind, video.size
+FROM 'path/to/videos.lance';
+```
+
+These values describe stored blobs; reading them does not fetch video bytes.
+The descriptor is not the logical write representation
+`STRUCT(data BLOB, uri VARCHAR, position UBIGINT, size UBIGINT)`.
+Ordinary binary columns and unmarked structs retain their existing types.
+
+`INSERT`, `UPDATE`, and `MERGE INTO` are rejected for attached tables containing
+Blob v2 columns, even when only another column is assigned, because the read
+view cannot be written back as the storage schema. `DELETE` and `TRUNCATE`
+continue to use the original storage schema. `DELETE` rejects predicates that
+cannot be fully preserved by the Lance delete path, including unsupported
+Blob descriptor filters; it never executes a partially translated predicate.
+Blob byte reading and writing are not provided by this descriptor support.
+
+### Blob v2 bytes: `lance_blob_uri`
+
+`lance_blob_uri(dataset_uri VARCHAR, column VARCHAR, row_id UBIGINT)` returns a
+snapshot-bound `lance-blob://` URI usable by DuckDB file readers:
+
+```sql
+SELECT lance_blob_uri('path/to/videos.lance', 'video', _rowid) AS video_file
+FROM 'path/to/videos.lance';
+
+-- read_blob consumes a constant filename and materializes its entire contents.
+SET VARIABLE video_file = (
+  SELECT lance_blob_uri('path/to/videos.lance', 'video', _rowid)
+  FROM 'path/to/videos.lance' LIMIT 1
+);
+SELECT size, content FROM read_blob(getvariable('video_file'));
+```
+
+The dataset URI and column must be non-null constant expressions. Supply Lance's
+`_rowid`, not a row number or application ID. A null row ID produces SQL NULL;
+other IDs are checked when the URI is opened. Only Blob v2 leaves reached
+through structs are supported. Column paths follow Lance syntax, including
+backticks for names containing dots: `` 'info.`clip.with.dot`' ``. Collections,
+ordinary binary columns, legacy blobs and table-name aliases are not accepted.
+
+The URI captures the scan's cached dataset version and manifest identity at bind
+time. Prepared execution follows DuckDB's rebinding rules and rebinds the scan
+and URI together; materialized strings retain their captured version. Reopening
+reads that exact version and rejects missing history or a changed identity.
+URIs contain no credentials; each open applies the current opener's permissions
+and scoped `TYPE LANCE` secrets. The filesystem supports read/seek only and has a bounded
+read-ahead buffer. See [Blob filesystem](blob_v2_filesystem.md) for URI limits,
+access policy, snapshot guarantees and validation commands.
+
 ## Search
 
 ### Vector search: `lance_vector_search`

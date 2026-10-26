@@ -30,7 +30,7 @@ DROP TABLE ns.main.drop_table_basic;
 statement error
 SELECT count(*) FROM 'test/.tmp/nsroot/drop_table_basic.lance';
 ----
-IO Error: Failed to open Lance dataset: test/.tmp/nsroot/drop_table_basic.lance (Lance error: dataset open 'test/.tmp/nsroot/drop_table_basic.lance':
+IO Error: Failed to open Lance dataset: test/.tmp/nsroot/drop_table_basic.lance
 
 statement ok
 DROP TABLE IF EXISTS ns.main.drop_table_basic;

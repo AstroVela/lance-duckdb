@@ -1,4 +1,8 @@
 mod arrow_export;
+mod blob;
+mod blob_store;
+#[cfg(test)]
+mod blob_test_support;
 mod dataset;
 mod dir_namespace;
 #[cfg(feature = "vane-distributed")]
@@ -12,6 +16,7 @@ mod merge;
 mod namespace;
 mod projection;
 mod query_table;
+mod read_schema;
 mod scan;
 mod schema_evolution;
 mod search;

@@ -6,8 +6,6 @@ use std::ptr;
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::{FileReader, StreamReader};
 use datafusion_expr::Expr;
-use datafusion_sql::unparser::dialect::CustomDialectBuilder;
-use datafusion_sql::unparser::Unparser;
 use lance_namespace::models::{
     QueryTableRequest, QueryTableRequestColumns, QueryTableRequestFullTextQuery,
     QueryTableRequestVector, StringFtsQuery,
@@ -16,6 +14,7 @@ use lance_namespace::LanceNamespace;
 use lance_namespace_impls::{DirectoryNamespaceBuilder, RestNamespaceBuilder};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
+use crate::filter_ir::filter_expr_to_sql;
 use crate::runtime;
 
 #[cfg(feature = "vane-distributed")]
@@ -406,21 +405,6 @@ fn execute_to_stream(
     Ok(StreamHandle::Batches(batches.into_iter()))
 }
 
-fn filter_expr_to_sql(expr: &Expr) -> FfiResult<String> {
-    let dialect = CustomDialectBuilder::new()
-        .with_identifier_quote_style('`')
-        .build();
-    Unparser::new(&dialect)
-        .expr_to_sql(expr)
-        .map(|sql| sql.to_string())
-        .map_err(|err| {
-            FfiError::new(
-                ErrorCode::NamespaceQueryTable,
-                format!("unparse namespace scan filter: {err}"),
-            )
-        })
-}
-
 fn build_namespace_scan_request(
     config: &ParsedNamespaceQueryConfig,
     filter_expr: Option<&Expr>,
@@ -485,7 +469,12 @@ fn build_namespace_scan_request(
     }
 
     if let Some(filter_expr) = filter_expr {
-        let filter_sql = filter_expr_to_sql(filter_expr)?;
+        let filter_sql = filter_expr_to_sql(filter_expr).map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!("unparse namespace scan filter: {err}"),
+            )
+        })?;
         request.filter = Some(match request.filter.take() {
             Some(existing) => format!("({existing}) AND ({filter_sql})"),
             None => filter_sql,

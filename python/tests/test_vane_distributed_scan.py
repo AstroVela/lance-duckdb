@@ -1628,10 +1628,8 @@ async def _drain_native_result_stream_async(stream) -> None:
 
 @contextlib.contextmanager
 def _capture_worker_tasks(physical, connection):
-    from vane.runners.ray.query_resource_graph import (
-        QueryAllocation,
-        ResourceVector,
-    )
+    from vane.execution.query_resource_spec import QueryAllocation
+    from vane.execution.resources import ResourceVector
     from vane.runners.ray.query_resource_graph_builder import (
         build_query_resource_graph,
     )
@@ -4780,8 +4778,8 @@ def test_unsafe_directory_namespace_uri_is_not_serialized(
             _write_dataset(writer, directory / "ctas_items.lance")
         finally:
             writer.close()
+    userinfo_uri = f"file://{user}:{password}@localhost{userinfo_directory}"
     unsafe_uris = {
-        "userinfo_ns": (f"file://{user}:{password}@localhost{userinfo_directory}"),
         "query_ns": f"file://{query_directory}",
         "fragment_ns": f"file://{fragment_directory}",
         "single_slash_query_ns": f"file:{query_directory}",
@@ -4793,16 +4791,23 @@ def test_unsafe_directory_namespace_uri_is_not_serialized(
     serialized = None
     attach_sql = None
     try:
+        # Userinfo is rejected during ATTACH, before catalog transport can run.
+        with pytest.raises(Exception, match="Invalid Lance dataset path") as error:
+            source_connection.execute(
+                f"ATTACH {_sql_literal(userinfo_uri)} AS userinfo_ns (TYPE LANCE)"
+            )
+        for sensitive in (userinfo_uri, user, password):
+            assert sensitive not in str(error.value)
+        assert source_connection.execute(
+            "SELECT count(*) FROM duckdb_databases() "
+            "WHERE database_name = 'userinfo_ns'"
+        ).fetchone() == (0,)
+
         for catalog_name, unsafe_uri in unsafe_uris.items():
             source_connection.execute(
                 f"ATTACH {_sql_literal(unsafe_uri)} AS {catalog_name} " "(TYPE LANCE)"
             )
-        for catalog_name in (
-            "query_ns",
-            "fragment_ns",
-            "single_slash_query_ns",
-            "single_slash_fragment_ns",
-        ):
+        for catalog_name in unsafe_uris:
             with pytest.raises(Exception, match="replayable") as error:
                 source_connection.execute(
                     f"SELECT count(*) FROM {catalog_name}.main.items"
@@ -4886,6 +4891,7 @@ def test_unsafe_directory_namespace_uri_is_not_serialized(
         )
         serialized = pickle.dumps(logical)
         for sensitive in (
+            userinfo_uri,
             *unsafe_uris.values(),
             query_secret,
             fragment_secret,
@@ -4987,35 +4993,20 @@ def test_single_slash_uri_replay_and_diagnostics_are_private(
             (f"/#{trailing_fragment_secret}", trailing_fragment_secret),
         ):
             unsafe_uri = safe_uri + suffix
-            with pytest.raises(Exception, match="replayable") as error:
-                connection.execute(
-                    f"SELECT count(*) FROM {_sql_literal(unsafe_uri)}"
-                ).fetchone()
-            assert secret not in str(error.value)
-            explain_text = "\n".join(
-                str(value)
-                for row in connection.execute(
-                    f"EXPLAIN SELECT id FROM {_sql_literal(unsafe_uri)}"
-                ).fetchall()
-                for value in row
-            )
-            assert secret not in explain_text
-            aggregate_explain = "\n".join(
-                str(value)
-                for row in connection.execute(
-                    f"EXPLAIN SELECT sum(id) FROM {_sql_literal(unsafe_uri)}"
-                ).fetchall()
-                for value in row
-            )
-            assert secret not in aggregate_explain
-            with pytest.raises(Exception, match="replayable") as error:
-                relation = connection.sql(
-                    f"SELECT id FROM {_sql_literal(unsafe_uri)} ORDER BY id"
-                )
-                logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-                    relation, "lance-private-single-slash-file-uri"
-                )
-                logical.to_physical_plan(connection)
+            # URI normalization rejects these targets during binding, including
+            # EXPLAIN and relation creation, before distributed replay checks.
+            for query in (
+                f"SELECT count(*) FROM {_sql_literal(unsafe_uri)}",
+                f"EXPLAIN SELECT id FROM {_sql_literal(unsafe_uri)}",
+                f"EXPLAIN SELECT sum(id) FROM {_sql_literal(unsafe_uri)}",
+            ):
+                with pytest.raises(
+                    Exception, match="Invalid Lance dataset path"
+                ) as error:
+                    connection.execute(query).fetchall()
+                assert secret not in str(error.value)
+            with pytest.raises(Exception, match="Invalid Lance dataset path") as error:
+                connection.sql(f"SELECT id FROM {_sql_literal(unsafe_uri)} ORDER BY id")
             assert secret not in str(error.value)
 
         for index, (delimiter, secret) in enumerate(
