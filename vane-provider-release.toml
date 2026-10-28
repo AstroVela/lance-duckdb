@@ -4,5 +4,11 @@ platforms = ["manylinux_2_28_x86_64"]
 max_wheel_bytes = 100000000
 
 [providers.lance]
+release_number = 1
 distribution = "vane-extension-lance"
 dependencies = []
+
+# Packaging tools are pinned independently of the exact Vane runtime.
+[packaging]
+repository = "AstroVela/vane"
+revision = "bd9b0434c476eb39d4e305fb05ad90fade9456f2"
