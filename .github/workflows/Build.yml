@@ -37,7 +37,7 @@ jobs:
       - name: Compute Build SHA
         id: build-sha
         run: |
-          echo "sha=${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}" >> "$GITHUB_OUTPUT"
+          echo "sha=${{ hashFiles('CMakeLists.txt', 'cmake/**', 'extension_config.cmake', 'Makefile') }}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare cache directories
         run: |
