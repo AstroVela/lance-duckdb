@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.20)
 
 # Set extension name here
 set(TARGET_NAME lance)
@@ -282,61 +282,12 @@ elseif(DEFINED VCPKG_TARGET_TRIPLET)
   endif()
 endif()
 
-# Building both debug and release Rust artifacts is expensive and can trigger
-# OOMs in CI. For single-config generators (Ninja/Makefiles), only build the
-# active configuration's artifact.
-if(CMAKE_CONFIGURATION_TYPES)
-  add_custom_command(
-    OUTPUT "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}"
-    COMMAND
-      ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
-      ${RUST_CARGO_FEATURE_ARGS} ${RUST_CARGO_REPRODUCIBILITY_ARGS}
-      --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
-      --target=${RUST_PLATFORM_TARGET}
-    COMMAND
-      ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
-      ${RUST_CARGO_FEATURE_ARGS} ${RUST_CARGO_REPRODUCIBILITY_ARGS}
-      --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release
-      --target=${RUST_PLATFORM_TARGET}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
-    DEPENDS ${RUST_FFI_DEPENDS}
-    VERBATIM)
-
-  add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_DEBUG_LIB}"
-                                                   "${RUST_RELEASE_LIB}")
-else()
-  if(NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
-    set(CMAKE_BUILD_TYPE Release)
-  endif()
-
-  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_custom_command(
-      OUTPUT "${RUST_DEBUG_LIB}"
-      COMMAND
-        ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
-        ${RUST_CARGO_FEATURE_ARGS} ${RUST_CARGO_REPRODUCIBILITY_ARGS}
-        --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
-        --target=${RUST_PLATFORM_TARGET}
-      WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
-      DEPENDS ${RUST_FFI_DEPENDS}
-      VERBATIM)
-
-    add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_DEBUG_LIB}")
-  else()
-    add_custom_command(
-      OUTPUT "${RUST_RELEASE_LIB}"
-      COMMAND
-        ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
-        ${RUST_CARGO_FEATURE_ARGS} ${RUST_CARGO_REPRODUCIBILITY_ARGS}
-        --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release
-        --target=${RUST_PLATFORM_TARGET}
-      WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
-      DEPENDS ${RUST_FFI_DEPENDS}
-      VERBATIM)
-
-    add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_RELEASE_LIB}")
-  endif()
+# A single output profile is selected by the configuration for every generator.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
 endif()
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/rust_ffi_build.cmake")
+lance_add_rust_ffi_build("${CMAKE_CURRENT_LIST_DIR}/Cargo.toml")
 
 target_link_libraries(${EXTENSION_NAME} debug "${RUST_DEBUG_LIB}" optimized
                       "${RUST_RELEASE_LIB}" ${PLATFORM_LIBS})

@@ -16,3 +16,19 @@ and vector, full-text, and hybrid search.
 ## License
 
 [Apache License 2.0](LICENSE).
+
+## Rust build configuration contracts
+
+The Rust FFI build requires CMake 3.20 or later and uses the selected configuration
+on all generators. Configuration-dependent outputs prevent inactive Visual Studio
+build rules from running; the minimum version follows that CMake feature.
+`Debug` builds Cargo's `dev` profile; other configurations use `release`.
+Single-config generators default to Release when no build type is set.
+Visual Studio, Xcode and Ninja Multi-Config select one profile per build without
+changing feature flags or the existing conditional lock-file policy.
+
+Run `python test/cmake/test_rust_profiles.py` with CMake and Ninja on PATH.
+The tests exercise the actual custom-command dependency graph with a recording
+Cargo fixture, including profile switching, up-to-date builds, paths with spaces
+and lock/feature arguments. They do not compile the Rust crates or qualify the
+resulting extension ABI. Existing extension build tests retain that role.

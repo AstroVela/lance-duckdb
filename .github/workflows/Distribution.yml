@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - "CMakeLists.txt"
+      - "cmake/**"
       - "Makefile"
       - "extension_config.cmake"
       - "vcpkg.json"
