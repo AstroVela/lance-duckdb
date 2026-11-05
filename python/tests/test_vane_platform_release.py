@@ -117,6 +117,10 @@ def test_native_wheel_policy_requires_a_compatible_host(
     monkeypatch.setattr(builder, "sys_tags", lambda: iter([Tag("cp312", "cp312", tag)]))
     assert builder._platform_tag() == tag
     monkeypatch.setattr(builder, "_require_file", lambda path, _description: path)
+    if system == "win32":
+        library = tmp_path / "dependencies" / triplet / "lib/zs.lib"
+        library.parent.mkdir(parents=True)
+        library.touch()
     environment = builder._build_environment(
         extension_root=ROOT,
         build_directory=tmp_path,
@@ -131,6 +135,9 @@ def test_native_wheel_policy_requires_a_compatible_host(
     if system == "win32":
         assert environment["CMAKE_GENERATOR"] == "Visual Studio 17 2022"
         assert "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" in arguments
+        prefix = tmp_path / "vane-dependency-prefix.cmake"
+        assert "lib/zs.lib" in prefix.read_text()
+        assert "set(ZLIB_USE_STATIC_LIBS ON)" in prefix.read_text()
         assert builder._venv_python(tmp_path) == tmp_path / "Scripts/python.exe"
     if system == "darwin":
         assert environment["MACOSX_DEPLOYMENT_TARGET"] == "15.0"
