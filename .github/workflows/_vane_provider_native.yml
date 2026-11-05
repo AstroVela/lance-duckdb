@@ -78,6 +78,9 @@ jobs:
         if: runner.os == 'Windows'
         with:
           arch: x64
+      - name: Select the native MSVC linker for Cargo
+        if: runner.os == 'Windows'
+        run: python -I extension/scripts/vane_platform_release.py msvc-linker
       - name: Install macOS native prerequisites
         if: runner.os == 'macOS'
         run: |

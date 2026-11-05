@@ -923,10 +923,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          dnf install -y \
-            autoconf automake binutils ccache curl file flex gcc gcc-c++ git libtool m4 \
-            make ninja-build openssl openssl-devel patch perl-IPC-Cmd \
-            perl-Time-Piece pkgconf-pkg-config tar unzip xz zip
+          bash extension/scripts/install_manylinux_deps.sh
           python -m pip install \
             "auditwheel>=6.4" \
             build \
@@ -1390,10 +1387,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          dnf install -y \
-            autoconf automake binutils ccache curl file flex gcc gcc-c++ git libtool m4 \
-            make ninja-build openssl openssl-devel patch perl-IPC-Cmd \
-            perl-Time-Piece pkgconf-pkg-config tar unzip xz zip
+          bash extension/scripts/install_manylinux_deps.sh
           "$VANE_PYTHON" -m pip install \
             "auditwheel>=6.4" \
             build \
@@ -1659,7 +1653,7 @@ jobs:
 
       - name: Install package validation tooling without native build tools
         run: |
-          dnf install -y binutils file
+          bash extension/scripts/install_manylinux_deps.sh binutils file
           "$VANE_PYTHON" -m pip install \
             -r extension/vane-extension-ci-tools/requirements-release.txt
 

@@ -21,13 +21,13 @@ target=next(a.split('=',1)[1] for a in args if a.startswith('--target='))
 directory=Path(os.environ['CARGO_TARGET_DIR'])/target/('debug' if profile=='dev' else 'release')
 directory.mkdir(parents=True,exist_ok=True)
 with open(os.environ['CARGO_TEST_LOG'],'a',encoding='utf-8') as output:
-    output.write(json.dumps({'args':args,'profile':profile})+'\\n')
+    output.write(json.dumps({'args':args,'profile':profile,'linker':os.environ.get('CARGO_TARGET_'+target.upper().replace('-','_')+'_LINKER')})+'\\n')
 (directory/os.environ['CARGO_TEST_LIBRARY']).write_bytes(b'artifact')
 """
 
 
 class RustProfileBuild(unittest.TestCase):
-    def run_graph(self, generator, configurations, reproducible):
+    def run_graph(self, generator, configurations, reproducible, msvc_linker=None):
         # MSBuild disables incremental tracking under the OS TEMP directory.
         # Use the repository's ignored build tree, as production builds do.
         test_root = REPOSITORY / "build" / "contract-tests"
@@ -49,18 +49,20 @@ class RustProfileBuild(unittest.TestCase):
             (source / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.0.0"\n')
             (source / "input.rs").write_text("source")
             helper = (REPOSITORY / "cmake/rust_ffi_build.cmake").as_posix()
+            target = "x86_64-pc-windows-msvc" if msvc_linker else "fixture-target"
             (source / "CMakeLists.txt").write_text(
                 "cmake_minimum_required(VERSION 3.20)\nproject(profiles NONE)\n"
-                "set(RUST_PLATFORM_TARGET fixture-target)\n"
+                f"set(RUST_PLATFORM_TARGET {target})\n"
                 f'set(RUST_STATICLIB_NAME "{library}")\n'
                 f'set(LANCE_CARGO_COMMAND "{Path(sys.executable).as_posix()}" "{cargo.as_posix()}")\n'
                 'set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo")\n'
-                f'set(RUST_DEBUG_LIB "${{RUST_TARGET_DIR}}/fixture-target/debug/{library}")\n'
-                f'set(RUST_RELEASE_LIB "${{RUST_TARGET_DIR}}/fixture-target/release/{library}")\n'
+                f'set(RUST_DEBUG_LIB "${{RUST_TARGET_DIR}}/{target}/debug/{library}")\n'
+                f'set(RUST_RELEASE_LIB "${{RUST_TARGET_DIR}}/{target}/release/{library}")\n'
                 'set(RUST_FFI_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/input.rs")\n'
                 "set(RUST_CARGO_FEATURE_ARGS --features vane-distributed)\n"
                 + ("set(RUST_CARGO_REPRODUCIBILITY_ARGS --locked)\n" if reproducible else "")
                 + 'set(RUST_CARGO_ENV "CARGO_TARGET_DIR=${RUST_TARGET_DIR}")\n'
+                + (f'set(WIN32 TRUE)\nset(MSVC TRUE)\nset(CMAKE_LINKER "{msvc_linker}")\n' if msvc_linker else "")
                 + f'include("{helper}")\nlance_add_rust_ffi_build("${{CMAKE_CURRENT_SOURCE_DIR}}/Cargo.toml")\n',
                 encoding="utf-8",
             )
@@ -91,6 +93,7 @@ class RustProfileBuild(unittest.TestCase):
                 self.assertEqual(calls[-1]["profile"], expected)
                 self.assertEqual("--locked" in calls[-1]["args"], reproducible)
                 self.assertIn("vane-distributed", calls[-1]["args"])
+                self.assertEqual(calls[-1]["linker"], msvc_linker)
                 # An up-to-date build must not invoke Cargo for either profile.
                 self.command(command, environment)
                 self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), index + 1)
@@ -115,6 +118,9 @@ class RustProfileBuild(unittest.TestCase):
         for configuration in ("Debug", "Release", "RelWithDebInfo", "MinSizeRel"):
             with self.subTest(configuration=configuration):
                 self.run_graph("Ninja", [configuration], True)
+
+    def test_msvc_uses_cmake_linker_instead_of_git_bash_link(self):
+        self.run_graph("Ninja", ["Release"], True, "C:/MSVC tools/bin/link.exe")
 
     @unittest.skipUnless(os.name == "nt", "Visual Studio generator")
     def test_visual_studio_builds_only_the_requested_profile(self):

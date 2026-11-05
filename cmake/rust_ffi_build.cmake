@@ -7,6 +7,16 @@ function(lance_add_rust_ffi_build manifest)
   if(NOT LANCE_CARGO_COMMAND)
     set(LANCE_CARGO_COMMAND cargo)
   endif()
+  if(WIN32
+     AND MSVC
+     AND RUST_PLATFORM_TARGET MATCHES "windows-msvc$")
+    # Git Bash puts its unrelated link.exe before MSVC on PATH. Use the linker
+    # selected by CMake, including when Cargo links build scripts.
+    string(TOUPPER "${RUST_PLATFORM_TARGET}" rust_linker_target)
+    string(REPLACE "-" "_" rust_linker_target "${rust_linker_target}")
+    list(APPEND RUST_CARGO_ENV
+         "CARGO_TARGET_${rust_linker_target}_LINKER=${CMAKE_LINKER}")
+  endif()
   set(cargo_profile "$<IF:$<CONFIG:Debug>,dev,release>")
   set(rust_profile "$<IF:$<CONFIG:Debug>,debug,release>")
   set(rust_output

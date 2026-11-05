@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import Mock
@@ -129,6 +130,61 @@ def test_indexed_smoke_rejects_changed_staged_bytes_before_installing(
     with pytest.raises(ValueError, match="differs from the immutable"):
         driver.indexed_smoke()
     install.assert_not_called()
+
+
+def test_cargo_bootstrap_selects_the_full_msvc_linker_path(tmp_path, monkeypatch):
+    tools = tmp_path / "MSVC tools"
+    linker = tools / "bin/Hostx64/x64/link.exe"
+    linker.parent.mkdir(parents=True)
+    linker.touch()
+    output = tmp_path / "github-env"
+    monkeypatch.setenv("VCToolsInstallDir", str(tools))
+    monkeypatch.setenv("GITHUB_ENV", str(output))
+    driver.msvc_linker()
+    assert (
+        output.read_text().strip()
+        == f"CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER={linker.as_posix()}"
+    )
+
+
+@pytest.mark.parametrize("succeed", [True, False])
+def test_manylinux_metadata_retry_is_bounded_and_preserves_package_selection(
+    tmp_path, monkeypatch, succeed
+):
+    import os
+
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    state = tmp_path / "dnf-log"
+    dnf = tools / "dnf"
+    dnf.write_text(
+        f"""#!{sys.executable}
+import json, pathlib, sys
+path = pathlib.Path({str(state)!r})
+calls = json.loads(path.read_text()) if path.exists() else []
+calls.append(sys.argv[1:])
+path.write_text(json.dumps(calls))
+attempt = sum('install' in call for call in calls)
+sys.exit(0 if 'clean' in sys.argv or ({succeed!r} and attempt == 3) else 1)
+"""
+    )
+    dnf.chmod(0o755)
+    sleep = tools / "sleep"
+    sleep.write_text("#!/bin/sh\nexit 0\n")
+    sleep.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
+    result = subprocess.run(
+        ["bash", str(ROOT / "scripts/install_manylinux_deps.sh"), "binutils", "file"],
+        capture_output=True,
+        text=True,
+    )
+    import json
+
+    calls = json.loads(state.read_text())
+    installs = [call for call in calls if "install" in call]
+    assert installs == [["--refresh", "install", "-y", "binutils", "file"]] * 3
+    assert len([call for call in calls if "clean" in call]) == 2
+    assert (result.returncode == 0) is succeed
 
 
 def test_reusable_jobs_keep_signing_keys_out_and_preserve_artifact_ids():

@@ -67,6 +67,16 @@ def configure():
     output(os.environ["GITHUB_ENV"], values)
 
 
+def msvc_linker():
+    linker = Path(os.environ["VCToolsInstallDir"]) / "bin/Hostx64/x64/link.exe"
+    if not linker.is_file():
+        raise ValueError("the selected MSVC x64 linker is missing")
+    output(
+        os.environ["GITHUB_ENV"],
+        {"CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER": linker.as_posix()},
+    )
+
+
 def package():
     arguments = []
     environment = os.environ.copy()
@@ -247,6 +257,8 @@ def main():
     command = sys.argv[1]
     if command == "configure":
         configure()
+    elif command == "msvc-linker":
+        msvc_linker()
     elif command == "package":
         package()
     elif command == "smoke":
