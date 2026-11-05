@@ -185,7 +185,9 @@ OIDC identity used for package-index uploads and provenance attestations.
 
 ## Default Ray qualification
 
-The development and production qualification pin is Vane v0.2.0,
+Development qualification uses the exact cross-platform revision in
+`vane-extension.toml`. Production qualification uses the separate published
+runtime pin in `vane-extension-release.toml`, currently Vane v0.2.0,
 `79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`.
 
 All installed-wheel integration tests leave `VANE_RUNNER` unset and use no
@@ -237,4 +239,4 @@ from the engine/runtime manifest. CI checks out that exact commit, exports
 `VANE_PROVIDER_PACKAGING_SOURCE`, and calls the shared `vane_provider_build.py`
 adapter for both building and verification. For local packaging, set that
 variable to the same clean, pinned checkout. This lets the provider use
-numbered releases while retaining its exact Vane `0.2.0` runtime pin.
+numbered releases independently of the selected channel's exact runtime pin.

@@ -38,7 +38,7 @@ def configure():
     else:
         raise ValueError("this workflow requires native macOS arm64 or Windows x64")
     expected_platform = "macos" if sys.platform == "darwin" else "windows"
-    if os.environ.get("PLATFORM", expected_platform) != expected_platform:
+    if os.environ.get("VANE_PROVIDER_PLATFORM", expected_platform) != expected_platform:
         raise ValueError("the requested platform does not match the native runner")
     paths = {
         "VANE_EXTENSION_ROOT": workspace / "extension",
@@ -148,7 +148,7 @@ def package():
             "--bundle-directory",
             "prepared",
             "--signed-artifact",
-            f"signed/{os.environ['PLATFORM']}/lance.duckdb_extension",
+            f"signed/{os.environ['VANE_PROVIDER_PLATFORM']}/lance.duckdb_extension",
             *arguments,
         )
     )

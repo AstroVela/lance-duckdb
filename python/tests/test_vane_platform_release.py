@@ -147,6 +147,26 @@ def test_cargo_bootstrap_selects_the_full_msvc_linker_path(tmp_path, monkeypatch
     )
 
 
+def test_windows_configuration_ignores_the_msvc_platform_variable(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(driver.sys, "platform", "win32")
+    monkeypatch.setattr(driver.platform, "machine", lambda: "AMD64")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("GITHUB_ENV", str(tmp_path / "github-env"))
+    monkeypatch.setenv("MANIFEST", "vane-extension.toml")
+    monkeypatch.setenv("PLATFORM", "x64")  # Set by the MSVC developer environment.
+    monkeypatch.setenv("VANE_PROVIDER_PLATFORM", "windows")
+    driver.configure()
+    assert (
+        "VCPKG_TARGET_TRIPLET=x64-windows-static-release"
+        in (tmp_path / "github-env").read_text()
+    )
+    monkeypatch.setenv("VANE_PROVIDER_PLATFORM", "macos")
+    with pytest.raises(ValueError, match="does not match the native runner"):
+        driver.configure()
+
+
 @pytest.mark.parametrize("succeed", [True, False])
 def test_manylinux_metadata_retry_is_bounded_and_preserves_package_selection(
     tmp_path, monkeypatch, succeed

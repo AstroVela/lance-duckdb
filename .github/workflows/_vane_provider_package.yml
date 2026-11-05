@@ -42,7 +42,7 @@ jobs:
       artifact_id: ${{ steps.wheels.outputs.artifact-id }}
     env:
       MANIFEST: ${{ inputs.manifest }}
-      PLATFORM: ${{ inputs.platform }}
+      VANE_PROVIDER_PLATFORM: ${{ inputs.platform }}
       SIGNING_PROFILE: ${{ inputs.signing-profile }}
       VANE_VERSION: ${{ inputs.vane-version }}
       VANE_RUNTIME_INDEX_URL: ${{ inputs.runtime-index }}
