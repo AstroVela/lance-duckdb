@@ -31,6 +31,36 @@ driver = load_script("vane_platform_release")
 bootstrap = load_script("bootstrap_vane_dependencies")
 
 
+@pytest.mark.parametrize("configuration", ["", "Release"])
+def test_windows_artifact_uses_the_sdk_top_level_output(
+    tmp_path, monkeypatch, configuration
+):
+    monkeypatch.setattr(builder.sys, "platform", "win32")
+    artifact = tmp_path / "extension/lance" / configuration / "lance.duckdb_extension"
+    artifact.parent.mkdir(parents=True)
+    artifact.touch()
+    assert builder._provider_artifact(tmp_path) == artifact
+
+
+def test_windows_artifact_discovery_rejects_ambiguous_outputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(builder.sys, "platform", "win32")
+    for directory in ("extension/lance", "duckdb/extension/lance"):
+        artifact = tmp_path / directory / "lance.duckdb_extension"
+        artifact.parent.mkdir(parents=True)
+        artifact.touch()
+    with pytest.raises(builder.QualificationError, match="exactly one Release"):
+        builder._provider_artifact(tmp_path)
+
+
+def test_windows_artifact_discovery_rejects_debug_only_outputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(builder.sys, "platform", "win32")
+    artifact = tmp_path / "extension/lance/Debug/lance.duckdb_extension"
+    artifact.parent.mkdir(parents=True)
+    artifact.touch()
+    with pytest.raises(builder.QualificationError, match="exactly one Release"):
+        builder._provider_artifact(tmp_path)
+
+
 def test_source_cache_publishes_only_the_pinned_bytes(tmp_path, monkeypatch):
     import hashlib
     import io

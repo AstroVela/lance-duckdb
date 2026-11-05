@@ -46,7 +46,11 @@ class ProviderLinkTests(unittest.TestCase):
                 "project(lance LANGUAGES CXX)\n"
                 f'include("{config.as_posix()}")\n'
                 f'add_library(lance_loadable_extension SHARED "{(root / "provider.cpp").as_posix()}")\n'
-                "set_target_properties(lance_loadable_extension PROPERTIES OUTPUT_NAME provider)\n"
+                'set_target_properties(lance_loadable_extension PROPERTIES OUTPUT_NAME lance PREFIX "" SUFFIX .duckdb_extension)\n'
+                "if(MSVC)\n"
+                "  set_target_properties(lance_loadable_extension PROPERTIES\n"
+                '    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/extension/lance")\n'
+                "endif()\n"
                 f'include("{(ROOT / "cmake/vane_provider_link.cmake").as_posix()}")\n'
                 "lance_configure_vane_provider(lance_loadable_extension)\n"
             )
@@ -93,15 +97,16 @@ class ProviderLinkTests(unittest.TestCase):
                 check=True,
             )
             suffix = ".dll" if sys.platform == "win32" else ".dylib" if sys.platform == "darwin" else ".so"
-            artifacts = list((root / "build").rglob(f"*provider{suffix}"))
-            self.assertEqual(len(artifacts), 1)
+            artifact = BUILDER._provider_artifact(root / "build")
+            expected = root / "build" / ("extension/lance" if sys.platform == "win32" else "duckdb/extension/lance")
+            self.assertEqual(artifact.parent, expected)
             native_artifacts = list((root / "build").rglob(f"*_native{suffix}"))
             self.assertEqual(len(native_artifacts), 1)
             native = ctypes.CDLL(str(native_artifacts[0]))
             self.assertEqual(native.native_entry(), 7)
             with self.assertRaises(AttributeError):
                 native.lance_duckdb_cpp_init
-            library = ctypes.CDLL(str(artifacts[0]))
+            library = ctypes.CDLL(str(artifact))
             self.assertEqual(library.lance_duckdb_cpp_init(), 42)
             with self.assertRaises(AttributeError):
                 library.private_engine_symbol
