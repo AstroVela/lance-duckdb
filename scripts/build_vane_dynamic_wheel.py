@@ -278,7 +278,13 @@ def _write_loadable_extension_config(
         "if(_VANE_LANCE_INDEX EQUAL -1)\n"
         '  message(FATAL_ERROR "Lance extension config did not register lance")\n'
         "endif()\n"
-        "set(DUCKDB_EXTENSION_LANCE_SHOULD_LINK FALSE)\n",
+        "set(DUCKDB_EXTENSION_LANCE_SHOULD_LINK FALSE)\n"
+        "# Visual Studio excludes unrelated targets in the SDK engine subtree.\n"
+        "# Add a build dependency without linking provider bytes into the base.\n"
+        "if(MSVC)\n"
+        '  cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"\n'
+        "    CALL add_dependencies _native lance_loadable_extension)\n"
+        "endif()\n",
         encoding="utf-8",
     )
     return config
