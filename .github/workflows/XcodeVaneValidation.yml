@@ -1,0 +1,25 @@
+name: Native Xcode Vane Lance validation
+
+on:
+  push:
+    branches: [codex/lance-xcode-validation-20261106]
+    paths:
+      - .github/workflows/XcodeVaneValidation.yml
+      - .github/workflows/_vane_provider_native.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xcode-vane-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    uses: ./.github/workflows/_vane_provider_native.yml
+    with:
+      platform: macos
+      phase: full
+      manifest: vane-extension.toml
+      signing-profile: ci-test
