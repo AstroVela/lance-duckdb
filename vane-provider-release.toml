@@ -1,6 +1,6 @@
 # Complete provider matrix and current TestPyPI per-file upload budget.
 interpreters = ["cp310", "cp311", "cp312", "cp313", "cp314"]
-platforms = ["manylinux_2_28_x86_64"]
+platforms = ["manylinux_2_28_x86_64", "macosx_15_0_arm64", "win_amd64"]
 max_wheel_bytes = 100000000
 
 [providers.lance]
@@ -11,4 +11,4 @@ dependencies = []
 # Packaging tools are pinned independently of the exact Vane runtime.
 [packaging]
 repository = "AstroVela/vane"
-revision = "bd9b0434c476eb39d4e305fb05ad90fade9456f2"
+revision = "097758b773d6c5065527feb2da927cd1399d2cf0"

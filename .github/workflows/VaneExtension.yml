@@ -159,11 +159,13 @@ jobs:
           python -m black --check \
             python/tests \
             scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py \
-            scripts/sign_vane_dynamic_bundle.py
+            scripts/sign_vane_dynamic_bundle.py scripts/vane_platform_release.py \
+            scripts/verify_vane_platform.py
           python -m compileall -q \
             python/tests \
             scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py \
-            scripts/sign_vane_dynamic_bundle.py
+            scripts/sign_vane_dynamic_bundle.py scripts/vane_platform_release.py \
+            scripts/verify_vane_platform.py
 
   vane-provider-release-tooling:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -195,7 +197,8 @@ jobs:
           python -m pytest -q \
             python/tests/test_vane_dynamic_wheel.py \
             python/tests/test_vane_dynamic_signing.py \
-            python/tests/test_vane_provider_release.py
+            python/tests/test_vane_provider_release.py \
+            python/tests/test_vane_platform_release.py
 
   vane-native-build:
     name: Build and test Vane ABI
@@ -1188,6 +1191,68 @@ jobs:
           python -m pytest -q \
             python/tests/test_vane_distributed_scan.py::test_fragment_scan_uses_both_ray_execution_nodes
 
+  vane-dynamic-provider-macos:
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
+    needs: preflight
+    uses: ./.github/workflows/_vane_provider_native.yml
+    with:
+      platform: macos
+      phase: full
+      manifest: vane-extension.toml
+      signing-profile: ci-test
+
+  vane-provider-prepare-macos:
+    needs: provider-release-preflight
+    uses: ./.github/workflows/_vane_provider_native.yml
+    with:
+      platform: macos
+      phase: prepare
+      manifest: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+      signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
+
+  vane-testpypi-wheels-macos:
+    needs: [provider-release-preflight, vane-provider-prepare-macos, vane-provider-sign]
+    uses: ./.github/workflows/_vane_provider_package.yml
+    with:
+      platform: macos
+      manifest: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+      signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
+      vane-version: ${{ needs.provider-release-preflight.outputs.vane_version }}
+      runtime-index: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      prepared-id: ${{ needs.vane-provider-prepare-macos.outputs.artifact_id }}
+      signed-id: ${{ needs.vane-provider-sign.outputs.artifact_id }}
+
+  vane-dynamic-provider-windows:
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
+    needs: preflight
+    uses: ./.github/workflows/_vane_provider_native.yml
+    with:
+      platform: windows
+      phase: full
+      manifest: vane-extension.toml
+      signing-profile: ci-test
+
+  vane-provider-prepare-windows:
+    needs: provider-release-preflight
+    uses: ./.github/workflows/_vane_provider_native.yml
+    with:
+      platform: windows
+      phase: prepare
+      manifest: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+      signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
+
+  vane-testpypi-wheels-windows:
+    needs: [provider-release-preflight, vane-provider-prepare-windows, vane-provider-sign]
+    uses: ./.github/workflows/_vane_provider_package.yml
+    with:
+      platform: windows
+      manifest: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+      signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
+      vane-version: ${{ needs.provider-release-preflight.outputs.vane_version }}
+      runtime-index: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      prepared-id: ${{ needs.vane-provider-prepare-windows.outputs.artifact_id }}
+      signed-id: ${{ needs.vane-provider-sign.outputs.artifact_id }}
+
   provider-release-preflight:
     if: inputs.operation == 'testpypi-dev' || inputs.operation == 'release'
     name: Verify the protected provider release inputs
@@ -1470,7 +1535,7 @@ jobs:
 
   vane-provider-sign:
     name: Sign native data without build or package dependencies
-    needs: vane-provider-prepare
+    needs: [vane-provider-prepare, vane-provider-prepare-macos, vane-provider-prepare-windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: ${{ inputs.operation == 'release' && 'production-signing' || 'testpypi' }}
@@ -1507,23 +1572,41 @@ jobs:
         with:
           artifact-ids: ${{ needs.vane-provider-prepare.outputs.artifact_id }}
           merge-multiple: true
-          path: prepared
+          path: prepared/linux
+          digest-mismatch: error
+
+      - name: Download the original macos unsigned bundle by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.vane-provider-prepare-macos.outputs.artifact_id }}
+          merge-multiple: true
+          path: prepared/macos
+          digest-mismatch: error
+
+      - name: Download the original windows unsigned bundle by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.vane-provider-prepare-windows.outputs.artifact_id }}
+          merge-multiple: true
+          path: prepared/windows
           digest-mismatch: error
 
       - name: Fingerprint and consume the key while signing native data only
         env:
           VANE_PROVIDER_SIGNING_PRIVATE_KEY: ${{ secrets[inputs.operation == 'release' && 'VANE_EXTENSION_SIGNING_PRIVATE_KEY' || 'VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY'] }}
         run: |
-          /usr/bin/python3 -I -S extension/scripts/sign_vane_dynamic_bundle.py sign \
-            --profile "$SIGNING_PROFILE" --extension-root extension \
-            --vane-source vane --input-directory prepared --output-directory signed
+          for platform in linux macos windows; do
+            /usr/bin/python3 -I -S extension/scripts/sign_vane_dynamic_bundle.py sign \
+              --profile "$SIGNING_PROFILE" --extension-root extension \
+              --vane-source vane --input-directory "prepared/$platform" --output-directory "signed/$platform"
+          done
 
       - name: Upload only the signed native artifact
         id: signed
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-lance-signed-native
-          path: signed/lance.duckdb_extension
+          path: signed/
           if-no-files-found: error
           retention-days: 30
 
@@ -1537,7 +1620,6 @@ jobs:
     permissions:
       contents: read
     outputs:
-      lance_version: ${{ steps.release.outputs.lance_version }}
       vane_version: ${{ needs.provider-release-preflight.outputs.vane_version }}
       artifact_id: ${{ steps.candidate.outputs.artifact-id }}
     env:
@@ -1659,28 +1741,8 @@ jobs:
             --output-directory "$VANE_DYNAMIC_DIST_DIR" \
             --signing-profile "$SIGNING_PROFILE" \
             --bundle-directory "$GITHUB_WORKSPACE/prepared" \
-            --signed-artifact "$GITHUB_WORKSPACE/signed/lance.duckdb_extension" \
+            --signed-artifact "$GITHUB_WORKSPACE/signed/linux/lance.duckdb_extension" \
             "${runtime_arguments[@]}"
-
-      - name: Validate the immutable publishable release set
-        id: release
-        shell: bash
-        env:
-          RELEASE_CHANNEL: ${{ inputs.operation }}
-          VANE_VERSION: ${{ needs.provider-release-preflight.outputs.vane_version }}
-        run: |
-          set -euo pipefail
-          publish_arguments=(--require-publishable-on testpypi)
-          if [ "$RELEASE_CHANNEL" = release ]; then
-            publish_arguments+=(--require-publishable-on pypi)
-          fi
-          "$VANE_PYTHON" -I extension/vane-extension-ci-tools/scripts/vane_provider_release.py validate \
-            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
-            --vane-source "$VANE_SOURCE_DIR" --ci-tools-version "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)" \
-            --config "$VANE_EXTENSION_ROOT/vane-provider-release.toml" \
-            --directory "$VANE_DYNAMIC_DIST_DIR" --vane-version "$VANE_VERSION" \
-            --channel "$RELEASE_CHANNEL" "${publish_arguments[@]}" \
-            --github-output "$GITHUB_OUTPUT"
 
       - name: Upload verified Lance provider wheels
         id: candidate
@@ -1693,14 +1755,14 @@ jobs:
 
   assemble-testpypi-lance:
     name: Validate, attest, and sign TestPyPI Lance provider
-    needs: vane-testpypi-wheels
+    needs: [vane-testpypi-wheels, vane-testpypi-wheels-macos, vane-testpypi-wheels-windows]
     runs-on: ubuntu-24.04
     permissions:
       attestations: write
       contents: read
       id-token: write
     outputs:
-      lance_version: ${{ needs.vane-testpypi-wheels.outputs.lance_version }}
+      lance_version: ${{ steps.release.outputs.lance_version }}
       vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
       artifact_id: ${{ steps.distributions.outputs.artifact-id }}
     env:
@@ -1744,11 +1806,12 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          artifact-ids: ${{ needs.vane-testpypi-wheels.outputs.artifact_id }}
+          artifact-ids: ${{ needs.vane-testpypi-wheels.outputs.artifact_id }},${{ needs.vane-testpypi-wheels-macos.outputs.artifact_id }},${{ needs.vane-testpypi-wheels-windows.outputs.artifact_id }}
           merge-multiple: true
           path: packages
 
       - name: Revalidate the complete release set
+        id: release
         env:
           RELEASE_CHANNEL: ${{ inputs.operation }}
         run: |
@@ -1764,7 +1827,7 @@ jobs:
             --directory packages \
             --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
             --channel "$RELEASE_CHANNEL" \
-            "${publish_arguments[@]}"
+            "${publish_arguments[@]}" --github-output "$GITHUB_OUTPUT"
 
       - name: Assemble distributions and checksums
         run: |
@@ -2071,6 +2134,44 @@ jobs:
           .venv-vane-testpypi-ray/bin/python -m pytest -q \
             python/tests/test_vane_distributed_scan.py::test_fragment_scan_uses_both_ray_execution_nodes
 
+  testpypi-platform-lance-integration:
+    name: Test indexed Lance on ${{ matrix.platform }}
+    needs: [assemble-testpypi-lance, verify-testpypi-lance]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos, windows]
+    runs-on: ${{ matrix.platform == 'macos' && 'macos-15' || 'windows-2022' }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    env:
+      MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+      INDEX_URL: https://test.pypi.org/simple/
+      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      VANE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.vane_version }}
+      LANCE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.lance_version }}
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: extension
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.assemble-testpypi-lance.outputs.artifact_id }}
+          merge-multiple: true
+          path: expected
+          digest-mismatch: error
+      - run: python -I extension/scripts/vane_platform_release.py configure
+      - run: python -I extension/scripts/vane_platform_release.py indexed-smoke
+
   verify-pypi-promotion:
     if: inputs.operation == 'release'
     name: Approve and verify the immutable Lance promotion without OIDC
@@ -2078,6 +2179,7 @@ jobs:
       - assemble-testpypi-lance
       - testpypi-smoke-lance-integration
       - testpypi-ray-lance-integration
+      - testpypi-platform-lance-integration
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment:

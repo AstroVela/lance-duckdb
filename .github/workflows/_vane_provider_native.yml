@@ -1,0 +1,164 @@
+name: Native Vane Lance provider
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      phase:
+        required: true
+        type: string
+      manifest:
+        required: true
+        type: string
+      signing-profile:
+        required: true
+        type: string
+    outputs:
+      artifact_id:
+        value: ${{ jobs.native.outputs.artifact_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ${{ inputs.platform == 'macos' && 'macos-15' || 'windows-2022' }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      RUSTUP_TOOLCHAIN: "1.98.0"
+      VANE_BUILD_JOBS: "2"
+      PHASE: ${{ inputs.phase }}
+      PLATFORM: ${{ inputs.platform }}
+      SIGNING_PROFILE: ${{ inputs.signing-profile }}
+      MANIFEST: ${{ inputs.manifest }}
+    steps:
+      - name: Preserve committed source bytes
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: extension
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Configure native paths
+        run: python -I extension/scripts/vane_platform_release.py configure
+      - name: Read exact integration and packaging pins
+        id: manifest
+        run: |
+          python -I extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest --github-output "$GITHUB_OUTPUT"
+          python -I extension/scripts/vane_platform_release.py packaging-pin
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          fetch-depth: 0
+          path: vane
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.manifest.outputs.packaging_revision }}
+          path: provider-packaging
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Install macOS native prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison ccache coreutils ninja
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+      - name: Install build and validation tools
+        run: |
+          python -m pip install build "cmake>=3.29" "ninja>=1.10" \
+            "pybind11[global]>=3.0.0" "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0" pyelftools \
+            -r extension/vane-extension-ci-tools/requirements-release.txt
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.98.0"
+          components: rust-docs
+      - name: Record native toolchain identity
+        id: toolchain
+        run: python -I extension/scripts/vane_platform_release.py toolchain
+      - name: Restore exact dependency and tool caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: |
+            vane/vcpkg_installed
+            .cache/vcpkg-archives
+            .cache/cargo-about
+          key: lance-provider-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.identity }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json') }}
+      - name: Install pinned cargo-about
+        run: |
+          if [ ! -f "$VANE_CARGO_ABOUT" ]; then
+            cargo install --locked cargo-about --version 0.9.2 --root "$VANE_CARGO_ABOUT_ROOT"
+          fi
+          "$VANE_CARGO_ABOUT" --version
+      - name: Prepare and verify exact extension dependencies
+        env:
+          VCPKG_REVISION: ${{ steps.manifest.outputs.vcpkg_revision }}
+        run: |
+          git init "$VANE_EXTENSION_VCPKG_ROOT"
+          git -C "$VANE_EXTENSION_VCPKG_ROOT" remote add origin https://github.com/microsoft/vcpkg.git
+          git -C "$VANE_EXTENSION_VCPKG_ROOT" fetch --depth 1 origin "$VCPKG_REVISION"
+          git -C "$VANE_EXTENSION_VCPKG_ROOT" checkout --detach FETCH_HEAD
+          bash "$VANE_EXTENSION_VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          python -I extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools --ci-tools-source "$VANE_EXTENSION_ROOT/vane-extension-ci-tools" \
+            --expected-sha "$(git -C extension rev-parse HEAD:vane-extension-ci-tools)"
+          python -I extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            identity --vane-source "$VANE_SOURCE_DIR"
+          if [ ! -f "$VANE_VCPKG_INSTALLED_DIR/$VCPKG_TARGET_TRIPLET/share/arrow/ArrowConfig.cmake" ]; then
+            python -I extension/vane-extension-ci-tools/scripts/vane_extension.py \
+              --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+              wheel-dependencies --vane-source "$VANE_SOURCE_DIR" \
+              --vcpkg-root "$VANE_VCPKG_ROOT" --installed-root "$VANE_VCPKG_INSTALLED_DIR" \
+              --jobs "$VANE_BUILD_JOBS"
+          fi
+      - name: Build and audit native provider data
+        env:
+          VANE_REVISION: ${{ steps.manifest.outputs.vane_revision }}
+        run: |
+          arguments=()
+          if [ "$PHASE" = full ]; then
+            arguments+=(--package-local-runtime --signing-private-key "$VANE_SOURCE_DIR/external/duckdb/test/mbedtls/private.pem")
+          fi
+          python -I extension/scripts/build_vane_dynamic_wheel.py \
+            --phase "$PHASE" --extension-root "$VANE_EXTENSION_ROOT" \
+            --manifest "$VANE_MANIFEST" --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "$VANE_REVISION" --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
+            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" --cargo-about "$VANE_CARGO_ABOUT" \
+            --build-directory "$VANE_DYNAMIC_BUILD_DIR" --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS" --signing-profile "$SIGNING_PROFILE" "${arguments[@]}"
+      - name: Qualify signed CI wheels on the native platform
+        if: inputs.phase == 'full'
+        timeout-minutes: 25
+        env:
+          VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
+        run: python -I extension/scripts/vane_platform_release.py smoke
+      - name: Upload original native data or qualified CI wheels
+        id: bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: vane-lance-${{ inputs.phase }}-${{ inputs.platform }}
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/
+          if-no-files-found: error
+          retention-days: 30

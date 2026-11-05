@@ -16,6 +16,11 @@ Provider packages are published on
 wheels target Linux x86-64 with glibc 2.28 or newer and CPython 3.10 through
 3.14. Python 3.12 is used below.
 
+The release workflow also targets macOS 15+ arm64 and Windows x64. Publishing
+those providers requires a matching cross-platform Vane release; the existing
+Vane 0.2.0 production pin has Linux wheels only. See
+[provider release qualification](docs/VANE_RELEASE.md) for the matrix and gates.
+
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
@@ -50,7 +55,7 @@ linked. It uses the Vane revision pinned in
 [`vane-extension.toml`](vane-extension.toml) and the build helpers in
 [`makefiles/vane_extension.Makefile`](makefiles/vane_extension.Makefile).
 
-Build on Linux x86-64 with Git, a C++20 compiler, Rust/Cargo, CMake 3.29+, Ninja,
+Build on Linux x86-64, macOS 15+ arm64, or Windows x64 with Git, a C++20 compiler, Rust/Cargo, CMake 3.29+, Ninja,
 ccache, and the native dependency tools listed in
 [Vane Extension CI](.github/workflows/VaneExtension.yml). From this repository:
 
@@ -69,6 +74,11 @@ python -m pip install build/vane-wheel/dist/vane_ai-*.whl "grpcio>=1.42.0"
 The target prepares the pinned Vane checkout and vcpkg dependencies under
 `build/`. Reduce `VANE_BUILD_JOBS` to suit the machine. Use a non-editable
 installation so Ray workers import the installed package.
+
+The commands above use a POSIX shell. On Windows, use Git Bash with MSVC's x64
+developer environment, activate `.venv-vane/Scripts/activate`, and set
+`VANE_PYTHON="$VIRTUAL_ENV/Scripts/python.exe"`. Native dependency triplets and
+Python verification paths are selected from the host platform.
 
 With this static wheel, replace the provider-loading call above with:
 

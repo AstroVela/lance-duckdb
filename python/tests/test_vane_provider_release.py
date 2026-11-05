@@ -31,6 +31,7 @@ VANE_VERSION = "0.2.0.dev612"
 PROVIDER_VERSION = "0.2.0.1.dev612"
 INTERPRETERS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 PLATFORM = "manylinux_2_28_x86_64"
+PLATFORMS = (PLATFORM, "macosx_15_0_arm64", "win_amd64")
 
 
 def _tools_revision() -> str:
@@ -59,6 +60,7 @@ def _write_wheel(
     *,
     requirement: str = f"vane-ai==={VANE_VERSION}",
     vane_version: str = VANE_VERSION,
+    platform: str = PLATFORM,
 ) -> Path:
     distribution = "vane_extension_lance"
     version = (
@@ -66,7 +68,7 @@ def _write_wheel(
         if vane_version == "0.2.0"
         else PROVIDER_VERSION
     )
-    path = directory / f"{distribution}-{version}-{interpreter}-none-{PLATFORM}.whl"
+    path = directory / f"{distribution}-{version}-{interpreter}-none-{platform}.whl"
     metadata = (
         "Metadata-Version: 2.4\n"
         "Name: vane-extension-lance\n"
@@ -79,7 +81,11 @@ def _write_wheel(
 
 
 def _write_release(directory: Path) -> tuple[Path, ...]:
-    return tuple(_write_wheel(directory, interpreter) for interpreter in INTERPRETERS)
+    return tuple(
+        _write_wheel(directory, interpreter, platform=platform)
+        for platform in PLATFORMS
+        for interpreter in INTERPRETERS
+    )
 
 
 def _source_arguments(directory: Path) -> list[str]:
@@ -102,7 +108,7 @@ def _source_arguments(directory: Path) -> list[str]:
 def test_config_declares_the_built_lance_matrix() -> None:
     config = release.load_config(CONFIG)
     assert config.interpreters == INTERPRETERS
-    assert config.platforms == (PLATFORM,)
+    assert config.platforms == PLATFORMS
     assert config.max_wheel_bytes == 100_000_000
     assert config.providers == (
         release.Provider("lance", "vane-extension-lance", (), 1),
@@ -110,7 +116,7 @@ def test_config_declares_the_built_lance_matrix() -> None:
     native = release._load_source_tools()
     manifest = native.load_manifest(ROOT / "vane-extension.toml", ROOT)
     assert manifest.name == "lance"
-    assert manifest.vane_revision == "028cd966d2f70f19d20f94cbd665d8839df1dc8b"
+    assert manifest.vane_revision == "097758b773d6c5065527feb2da927cd1399d2cf0"
 
 
 def test_shared_validate_preserves_workflow_outputs(
@@ -231,7 +237,7 @@ def test_workflow_uses_only_the_committed_tools_submodule() -> None:
     consumers = set()
     for name, job in workflow["jobs"].items():
         initialized = False
-        for step in job["steps"]:
+        for step in job.get("steps", []):
             if step.get("with", {}).get("submodules") == "recursive":
                 initialized = True
             command = step.get("run", "")
@@ -271,7 +277,7 @@ def test_release_workflow_supplies_exact_sources_and_shared_config() -> None:
     )
     commands = {}
     for name, job in workflow["jobs"].items():
-        steps = job["steps"]
+        steps = job.get("steps", [])
         for index, step in enumerate(steps):
             command = step.get("run", "")
             if (
@@ -300,14 +306,13 @@ def test_release_workflow_supplies_exact_sources_and_shared_config() -> None:
                 for checkout in checkouts
             )
     assert set(commands) == {
-        "vane-testpypi-wheels",
         "assemble-testpypi-lance",
         "verify-testpypi-lance",
         "verify-pypi-promotion",
         "verify-pypi-lance",
     }
     assert "--provider lance" in commands["verify-testpypi-lance"]
-    for job in ("vane-testpypi-wheels", "assemble-testpypi-lance"):
+    for job in ("assemble-testpypi-lance",):
         assert "--channel" in commands[job]
         assert "--require-publishable-on testpypi" in commands[job]
 
@@ -319,7 +324,7 @@ def test_production_and_development_manifests_pin_independent_engines() -> None:
         "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
     )
     assert development["vane"].pop("revision") == (
-        "028cd966d2f70f19d20f94cbd665d8839df1dc8b"
+        "097758b773d6c5065527feb2da927cd1399d2cf0"
     )
     assert production == development
 
@@ -329,8 +334,13 @@ def test_production_promotion_requires_the_exact_staged_lance_matrix(
 ) -> None:
     paths = tuple(
         _write_wheel(
-            tmp_path, interpreter, requirement="vane-ai===0.2.0", vane_version="0.2.0"
+            tmp_path,
+            interpreter,
+            requirement="vane-ai===0.2.0",
+            vane_version="0.2.0",
+            platform=platform,
         )
+        for platform in PLATFORMS
         for interpreter in INTERPRETERS
     )
     document = {
@@ -380,7 +390,11 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
     assert "environment" not in preflight
     assert "secrets" not in str(preflight)
     assert jobs["vane-provider-prepare"]["needs"] == "provider-release-preflight"
-    assert jobs["vane-provider-sign"]["needs"] == "vane-provider-prepare"
+    assert set(jobs["vane-provider-sign"]["needs"]) == {
+        "vane-provider-prepare",
+        "vane-provider-prepare-macos",
+        "vane-provider-prepare-windows",
+    }
     assert set(jobs["vane-testpypi-wheels"]["needs"]) == {
         "provider-release-preflight",
         "vane-provider-prepare",
@@ -392,6 +406,7 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
         "assemble-testpypi-lance",
         "testpypi-smoke-lance-integration",
         "testpypi-ray-lance-integration",
+        "testpypi-platform-lance-integration",
     }
     assert promotion["environment"]["name"] == "pypi"
     assert promotion["permissions"] == {"contents": "read"}
@@ -487,7 +502,7 @@ def test_publishing_native_jobs_isolate_keys_from_build_and_package_code() -> No
         if step.get("uses", "").startswith("actions/upload-artifact@")
     ]
     assert len(uploads) == 1
-    assert uploads[0]["with"]["path"] == "signed/lance.duckdb_extension"
+    assert uploads[0]["with"]["path"] == "signed/"
 
 
 def test_every_release_stage_downloads_the_original_immutable_artifact_ids() -> None:
@@ -506,9 +521,17 @@ def test_every_release_stage_downloads_the_original_immutable_artifact_ids() -> 
             == "${{ steps." + step + ".outputs.artifact-id }}"
         )
     transfers = {
-        "vane-provider-sign": {"vane-provider-prepare"},
+        "vane-provider-sign": {
+            "vane-provider-prepare",
+            "vane-provider-prepare-macos",
+            "vane-provider-prepare-windows",
+        },
         "vane-testpypi-wheels": {"vane-provider-prepare", "vane-provider-sign"},
-        "assemble-testpypi-lance": {"vane-testpypi-wheels"},
+        "assemble-testpypi-lance": {
+            "vane-testpypi-wheels",
+            "vane-testpypi-wheels-macos",
+            "vane-testpypi-wheels-windows",
+        },
         **{
             name: {"assemble-testpypi-lance"}
             for name in (
@@ -528,9 +551,11 @@ def test_every_release_stage_downloads_the_original_immutable_artifact_ids() -> 
             for step in jobs[consumer]["steps"]
             if step.get("uses", "").startswith("actions/download-artifact@")
         ]
-        assert {step["artifact-ids"] for step in downloads} == {
-            "${{ needs." + source + ".outputs.artifact_id }}" for source in sources
-        }
+        assert {
+            value.strip()
+            for step in downloads
+            for value in step["artifact-ids"].split(",")
+        } == {"${{ needs." + source + ".outputs.artifact_id }}" for source in sources}
         assert all(
             step["merge-multiple"] is True and "name" not in step for step in downloads
         )
@@ -562,7 +587,7 @@ def test_every_artifact_download_fails_on_a_digest_mismatch() -> None:
         (ROOT / ".github/workflows/VaneExtension.yml").read_text()
     )
     for job in workflow["jobs"].values():
-        for step in job["steps"]:
+        for step in job.get("steps", []):
             if step.get("uses", "").startswith("actions/download-artifact@"):
                 assert (
                     step["uses"]
@@ -576,7 +601,7 @@ def test_every_provider_builder_uses_the_selected_manifest() -> None:
         (ROOT / ".github/workflows/VaneExtension.yml").read_text()
     )
     for job in workflow["jobs"].values():
-        for step in job["steps"]:
+        for step in job.get("steps", []):
             command = step.get("run", "")
             if "-I extension/scripts/build_vane_dynamic_wheel.py" in command:
                 assert '--manifest "$VANE_MANIFEST"' in command

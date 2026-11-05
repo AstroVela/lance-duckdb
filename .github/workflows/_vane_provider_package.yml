@@ -1,0 +1,132 @@
+name: Package signed Vane Lance provider
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      manifest:
+        required: true
+        type: string
+      signing-profile:
+        required: true
+        type: string
+      vane-version:
+        required: true
+        type: string
+      runtime-index:
+        required: true
+        type: string
+      prepared-id:
+        required: true
+        type: string
+      signed-id:
+        required: true
+        type: string
+    outputs:
+      artifact_id:
+        value: ${{ jobs.package.outputs.artifact_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ${{ inputs.platform == 'macos' && 'macos-15' || 'windows-2022' }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      artifact_id: ${{ steps.wheels.outputs.artifact-id }}
+    env:
+      MANIFEST: ${{ inputs.manifest }}
+      PLATFORM: ${{ inputs.platform }}
+      SIGNING_PROFILE: ${{ inputs.signing-profile }}
+      VANE_VERSION: ${{ inputs.vane-version }}
+      VANE_RUNTIME_INDEX_URL: ${{ inputs.runtime-index }}
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: extension
+          persist-credentials: false
+          submodules: false
+      - run: git -C extension submodule update --init vane-extension-ci-tools
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        id: py310
+        with:
+          python-version: "3.10"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        id: py311
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        id: py313
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        id: py314
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        id: py312
+        with:
+          python-version: "3.12"
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - run: python -I extension/scripts/vane_platform_release.py configure
+      - name: Read exact source pins
+        id: manifest
+        run: |
+          python -I extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest --github-output "$GITHUB_OUTPUT"
+          python -I extension/scripts/vane_platform_release.py packaging-pin
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.manifest.outputs.packaging_revision }}
+          path: provider-packaging
+          persist-credentials: false
+      - run: python -m pip install pyelftools -r extension/vane-extension-ci-tools/requirements-release.txt
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ inputs.prepared-id }}
+          merge-multiple: true
+          path: prepared
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ inputs.signed-id }}
+          merge-multiple: true
+          path: signed
+          digest-mismatch: error
+      - name: Package and load against every exact indexed runtime
+        env:
+          RUNTIME_PYTHON_310: ${{ steps.py310.outputs.python-path }}
+          RUNTIME_PYTHON_311: ${{ steps.py311.outputs.python-path }}
+          RUNTIME_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+          RUNTIME_PYTHON_313: ${{ steps.py313.outputs.python-path }}
+          RUNTIME_PYTHON_314: ${{ steps.py314.outputs.python-path }}
+        run: python -I extension/scripts/vane_platform_release.py package
+      - name: Qualify local and Ray reads and writes
+        env:
+          VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.signing-profile == 'production' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
+        run: python -I extension/scripts/vane_platform_release.py smoke
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: wheels
+        with:
+          name: vane-testpypi-lance-wheels-${{ inputs.platform }}
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 30
