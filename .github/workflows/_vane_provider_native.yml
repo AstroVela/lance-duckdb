@@ -171,13 +171,7 @@ jobs:
             --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" --cargo-about "$VANE_CARGO_ABOUT" \
             --build-directory "$VANE_DYNAMIC_BUILD_DIR" --output-directory "$VANE_DYNAMIC_DIST_DIR" \
             --jobs "$VANE_BUILD_JOBS" --signing-profile "$SIGNING_PROFILE" "${arguments[@]}"
-      - name: Qualify signed CI wheels on the native platform
-        if: inputs.phase == 'full'
-        timeout-minutes: 25
-        env:
-          VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
-        run: python -I extension/scripts/vane_platform_release.py smoke
-      - name: Upload original native data or qualified CI wheels
+      - name: Upload original native data or CI wheels
         id: bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -185,3 +179,9 @@ jobs:
           path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/
           if-no-files-found: error
           retention-days: 30
+      - name: Qualify signed CI wheels on the native platform
+        if: inputs.phase == 'full'
+        timeout-minutes: 25
+        env:
+          VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
+        run: python -I extension/scripts/vane_platform_release.py smoke

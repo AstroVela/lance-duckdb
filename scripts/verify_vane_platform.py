@@ -53,7 +53,7 @@ def main():
             "lance_platform.main.records"
         )
         rows = connection.execute(
-            "SELECT count(*), sum(id) FROM lance_platform.main.records"
+            "SELECT count(*), sum(id)::BIGINT FROM lance_platform.main.records"
         ).fetchall()
         if rows != [(9, 36)]:
             raise RuntimeError(
