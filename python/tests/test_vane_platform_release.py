@@ -28,6 +28,77 @@ def load_script(name):
 
 builder = load_script("build_vane_dynamic_wheel")
 driver = load_script("vane_platform_release")
+bootstrap = load_script("bootstrap_vane_dependencies")
+
+
+def test_source_cache_publishes_only_the_pinned_bytes(tmp_path, monkeypatch):
+    import hashlib
+    import io
+
+    contents = b"the exact upstream archive"
+    destination = tmp_path / "sources" / "archive.tar.gz"
+    expected = hashlib.sha512(contents).hexdigest()
+    download = Mock(return_value=io.BytesIO(contents))
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", download)
+    bootstrap.cache_archive("https://example.invalid/source", destination, expected)
+    assert destination.read_bytes() == contents
+    bootstrap.cache_archive("https://example.invalid/source", destination, expected)
+    download.assert_called_once()
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_source_cache_rejects_invalid_downloads_without_publishing(
+    tmp_path, monkeypatch, oversized
+):
+    import hashlib
+    import io
+
+    if oversized:
+        monkeypatch.setattr(bootstrap, "MAX_ARCHIVE_BYTES", 4)
+    monkeypatch.setattr(
+        bootstrap.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: io.BytesIO(b"invalid bytes"),
+    )
+    destination = tmp_path / "archive.tar.gz"
+    with pytest.raises(
+        ValueError, match="bounded size" if oversized else "pinned SHA-512"
+    ):
+        bootstrap.cache_archive(
+            "https://example.invalid/source",
+            destination,
+            hashlib.sha512(b"valid").hexdigest(),
+        )
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".checked-source-*"))
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_source_mirror_network_fallback_preserves_the_hash_gate(
+    tmp_path, monkeypatch, corrupt
+):
+    import json
+    import urllib.error
+
+    source = tmp_path / "sdk"
+    source.mkdir()
+    (source / "vcpkg.json").write_text(
+        json.dumps({"builtin-baseline": bootstrap.VANE_DEPENDENCY_BASELINE})
+    )
+    error = (
+        ValueError("pinned SHA-512") if corrupt else urllib.error.URLError("offline")
+    )
+    monkeypatch.setattr(bootstrap, "cache_archive", Mock(side_effect=error))
+    delegate = Mock()
+    monkeypatch.setattr(bootstrap.subprocess, "run", delegate)
+    arguments = ["--vane-source", str(source), "--vcpkg-root", str(tmp_path / "vcpkg")]
+    if corrupt:
+        with pytest.raises(ValueError, match="pinned SHA-512"):
+            bootstrap.main(arguments)
+        delegate.assert_not_called()
+    else:
+        assert bootstrap.main(arguments) == 0
+        assert delegate.call_args.args[0][-len(arguments) :] == arguments
 
 
 @pytest.mark.parametrize(

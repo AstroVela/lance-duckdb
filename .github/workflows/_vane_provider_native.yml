@@ -142,7 +142,7 @@ jobs:
             --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
             identity --vane-source "$VANE_SOURCE_DIR"
           if [ ! -f "$VANE_VCPKG_INSTALLED_DIR/$VCPKG_TARGET_TRIPLET/share/arrow/ArrowConfig.cmake" ]; then
-            python -I extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            python -I extension/scripts/bootstrap_vane_dependencies.py \
               --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
               wheel-dependencies --vane-source "$VANE_SOURCE_DIR" \
               --vcpkg-root "$VANE_VCPKG_ROOT" --installed-root "$VANE_VCPKG_INSTALLED_DIR" \

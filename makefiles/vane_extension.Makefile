@@ -116,7 +116,9 @@ vane_wheel_dependencies: vane_prepare
 		}; \
 	fi
 	VCPKG_TARGET_TRIPLET="$(VCPKG_TARGET_TRIPLET)" \
-	$(VANE_EXTENSION_COMMAND) wheel-dependencies \
+	"$(VANE_PYTHON)" "$(VANE_EXTENSION_ROOT)/scripts/bootstrap_vane_dependencies.py" \
+		--manifest "$(VANE_MANIFEST)" --extension-root "$(VANE_EXTENSION_ROOT)" \
+		wheel-dependencies \
 		--vane-source "$(VANE_SOURCE_DIR)" \
 		--vcpkg-root "$(VANE_VCPKG_ROOT)" \
 		--installed-root "$(VANE_VCPKG_INSTALLED_DIR)" \
