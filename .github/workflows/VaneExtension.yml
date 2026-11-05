@@ -160,12 +160,12 @@ jobs:
             python/tests \
             scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py \
             scripts/sign_vane_dynamic_bundle.py scripts/vane_platform_release.py \
-            scripts/verify_vane_platform.py
+            scripts/verify_vane_platform.py scripts/bootstrap_vane_dependencies.py
           python -m compileall -q \
             python/tests \
             scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py \
             scripts/sign_vane_dynamic_bundle.py scripts/vane_platform_release.py \
-            scripts/verify_vane_platform.py
+            scripts/verify_vane_platform.py scripts/bootstrap_vane_dependencies.py
 
   vane-provider-release-tooling:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -535,7 +535,11 @@ jobs:
           VCPKG_INSTALLED_DIR: ${{ env.VANE_VCPKG_INSTALLED_DIR }}
           VCPKG_ROOT: ${{ env.VANE_VCPKG_ROOT }}
         run: |
-          bash "$VANE_SOURCE_DIR/scripts/bootstrap_vcpkg.sh" "$VANE_SOURCE_DIR"
+          python extension/scripts/bootstrap_vane_dependencies.py \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            wheel-dependencies --vane-source "$VANE_SOURCE_DIR" \
+            --vcpkg-root "$VANE_VCPKG_ROOT" --installed-root "$VANE_VCPKG_INSTALLED_DIR" \
+            --jobs "$VANE_BUILD_JOBS"
 
       - name: Prune Vane vcpkg build intermediates
         shell: bash

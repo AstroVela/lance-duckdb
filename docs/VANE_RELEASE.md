@@ -68,6 +68,15 @@ Both native and provider builders retain the existing integration manifest's
 exact vcpkg revision; `vcpkg.json` does not select a separate baseline. The development source pin advances through reviewed PRs; native dependency versions
 and provider versioning remain explicit.
 
+Dependency preparation retries the exact SDK bootstrap at most three times,
+reusing completed packages and checked downloads. For SDK dependency baseline
+`44819aa2a6c10e56065e2b0330e7d6c89d1d2574`, the Lance adapter can seed the
+unchanged Thrift 0.23.0 archive from Buildroot's HTTPS source cache. It requires
+the SHA-512 from the [pinned vcpkg port](https://github.com/microsoft/vcpkg/blob/44819aa2a6c10e56065e2b0330e7d6c89d1d2574/ports/thrift/portfile.cmake)
+before publishing the cached file; vcpkg verifies it again before extraction.
+Mirror connection failures fall back to the SDK's canonical download, while a
+hash mismatch stops the build. No SDK source, port or dependency pin is changed.
+
 ## Development and production channels
 
 `VaneExtension.yml` keeps `build-only` as its default operation. Pushes, pull
