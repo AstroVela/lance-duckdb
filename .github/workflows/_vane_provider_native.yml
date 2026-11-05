@@ -100,7 +100,8 @@ jobs:
         id: toolchain
         run: python -I extension/scripts/vane_platform_release.py toolchain
       - name: Restore exact dependency and tool caches
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        id: dependencies
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: |
             vane/vcpkg_installed
@@ -110,7 +111,7 @@ jobs:
       - name: Install pinned cargo-about
         run: |
           if [ ! -f "$VANE_CARGO_ABOUT" ]; then
-            cargo install --locked cargo-about --version 0.9.2 --root "$VANE_CARGO_ABOUT_ROOT"
+            cargo install --locked cargo-about --version 0.9.2 --features cli --root "$VANE_CARGO_ABOUT_ROOT"
           fi
           "$VANE_CARGO_ABOUT" --version
       - name: Prepare and verify exact extension dependencies
@@ -136,6 +137,15 @@ jobs:
               --vcpkg-root "$VANE_VCPKG_ROOT" --installed-root "$VANE_VCPKG_INSTALLED_DIR" \
               --jobs "$VANE_BUILD_JOBS"
           fi
+      - name: Save prepared dependencies before compiling Lance
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: |
+            vane/vcpkg_installed
+            .cache/vcpkg-archives
+            .cache/cargo-about
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
       - name: Build and audit native provider data
         env:
           VANE_REVISION: ${{ steps.manifest.outputs.vane_revision }}
