@@ -35,6 +35,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_BUILD_JOBS: "2"
       RUSTUP_TOOLCHAIN: "1.98.0"
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/extension/ci/xcode27-triplets
       VANE_BUILD_JOBS: "2"
       PHASE: ${{ inputs.phase }}
       VANE_PROVIDER_PLATFORM: ${{ inputs.platform }}
@@ -106,7 +107,7 @@ jobs:
           path: |
             vane/vcpkg_installed
             .cache/vcpkg-archives
-          key: lance-provider-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.identity }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json') }}
+          key: lance-provider-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.identity }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/Cargo.lock', 'extension/vcpkg.json', 'extension/ci/xcode27-triplets/*.cmake') }}
       - name: Restore the pinned license tool
         id: cargo-about
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
