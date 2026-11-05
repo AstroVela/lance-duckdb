@@ -1,0 +1,41 @@
+name: Installed Vane Lance smoke validation
+
+on:
+  push:
+    branches: [codex/lance-windows-validation-20261106]
+    paths:
+      - .github/workflows/InstalledSmokeValidation.yml
+      - scripts/verify_vane_platform.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: extension
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: '13460340627'
+          run-id: '42113299751'
+          github-token: ${{ github.token }}
+          path: wheels
+          digest-mismatch: error
+      - name: Install the original signed runtime and provider
+        run: python -m pip install wheels/*.whl 'grpcio>=1.42.0'
+      - name: Qualify local and Ray reads and writes
+        run: |
+          python -I extension/scripts/verify_vane_platform.py --runner local --directory "$RUNNER_TEMP/lance-smoke/local"
+          python -I extension/scripts/verify_vane_platform.py --runner ray --directory "$RUNNER_TEMP/lance-smoke/ray"
