@@ -32,9 +32,7 @@ class RustProfileBuild(unittest.TestCase):
         # Use the repository's ignored build tree, as production builds do.
         test_root = REPOSITORY / "build" / "contract-tests"
         test_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix="lance-cmake-", dir=test_root
-        ) as temporary:
+        with tempfile.TemporaryDirectory(prefix="lance-cmake-", dir=test_root) as temporary:
             root = Path(temporary).resolve()
             assert root.is_relative_to(test_root.resolve())
             source, build, tools = (
@@ -46,13 +44,9 @@ class RustProfileBuild(unittest.TestCase):
             tools.mkdir()
             cargo = tools / "fake_cargo.py"
             cargo.write_text(FAKE_CARGO, encoding="utf-8")
-            library = (
-                "lance_duckdb_ffi.lib" if os.name == "nt" else "liblance_duckdb_ffi.a"
-            )
+            library = "lance_duckdb_ffi.lib" if os.name == "nt" else "liblance_duckdb_ffi.a"
             log = root / "calls.jsonl"
-            (source / "Cargo.toml").write_text(
-                '[package]\nname="fixture"\nversion="0.0.0"\n'
-            )
+            (source / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.0.0"\n')
             (source / "input.rs").write_text("source")
             helper = (REPOSITORY / "cmake/rust_ffi_build.cmake").as_posix()
             (source / "CMakeLists.txt").write_text(
@@ -65,11 +59,7 @@ class RustProfileBuild(unittest.TestCase):
                 f'set(RUST_RELEASE_LIB "${{RUST_TARGET_DIR}}/fixture-target/release/{library}")\n'
                 'set(RUST_FFI_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/input.rs")\n'
                 "set(RUST_CARGO_FEATURE_ARGS --features vane-distributed)\n"
-                + (
-                    "set(RUST_CARGO_REPRODUCIBILITY_ARGS --locked)\n"
-                    if reproducible
-                    else ""
-                )
+                + ("set(RUST_CARGO_REPRODUCIBILITY_ARGS --locked)\n" if reproducible else "")
                 + 'set(RUST_CARGO_ENV "CARGO_TARGET_DIR=${RUST_TARGET_DIR}")\n'
                 + f'include("{helper}")\nlance_add_rust_ffi_build("${{CMAKE_CURRENT_SOURCE_DIR}}/Cargo.toml")\n',
                 encoding="utf-8",
@@ -95,10 +85,7 @@ class RustProfileBuild(unittest.TestCase):
                     configuration,
                 ]
                 self.command(command, environment)
-                calls = [
-                    json.loads(line)
-                    for line in log.read_text(encoding="utf-8").splitlines()
-                ]
+                calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
                 expected = "dev" if configuration.lower() == "debug" else "release"
                 self.assertEqual(len(calls), index + 1)
                 self.assertEqual(calls[-1]["profile"], expected)
@@ -106,9 +93,7 @@ class RustProfileBuild(unittest.TestCase):
                 self.assertIn("vane-distributed", calls[-1]["args"])
                 # An up-to-date build must not invoke Cargo for either profile.
                 self.command(command, environment)
-                self.assertEqual(
-                    len(log.read_text(encoding="utf-8").splitlines()), index + 1
-                )
+                self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), index + 1)
 
     def command(self, command, environment):
         result = subprocess.run(
