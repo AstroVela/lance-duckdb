@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   native:
-    runs-on: ${{ inputs.platform == 'macos' && 'macos-15' || 'windows-2022' }}
+    runs-on: ${{ inputs.platform == 'macos' && 'macos-26' || 'windows-2022' }}
     timeout-minutes: 300
     defaults:
       run:
