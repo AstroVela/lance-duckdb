@@ -1,0 +1,48 @@
+name: Windows Vane Lance Rust validation
+
+on:
+  push:
+    branches: [codex/lance-windows-validation-20261106]
+    paths: [.github/workflows/WindowsRustValidation.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: extension
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with:
+          arch: x64
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: '1.98.0'
+      - name: Install the exact Protobuf compiler
+        shell: pwsh
+        run: |
+          $protocArchive = Join-Path $env:RUNNER_TEMP 'protoc-29.5-win64.zip'
+          $protocRoot = Join-Path $env:RUNNER_TEMP 'lance-protoc-29.5'
+          Invoke-WebRequest 'https://github.com/protocolbuffers/protobuf/releases/download/v29.5/protoc-29.5-win64.zip' -OutFile $protocArchive
+          if ((Get-FileHash $protocArchive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '633d3e555fc97f0a1f55b4adb03256cd94b8059e51e7abbae98ff39e58a9dfa5') {
+            throw 'Protobuf compiler archive differs from its pinned SHA-256'
+          }
+          Expand-Archive -LiteralPath $protocArchive -DestinationPath $protocRoot
+          $protocBinary = Join-Path $protocRoot 'bin/protoc.exe'
+          & $protocBinary --version
+          "PROTOC=$protocBinary" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $linkerBinary = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/link.exe'
+          if (-not (Test-Path -LiteralPath $linkerBinary)) { throw 'MSVC linker is missing' }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linkerBinary" | Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Check the real distributed-provider Rust graph
+        working-directory: extension
+        run: cargo check --locked --target x86_64-pc-windows-msvc --features vane-distributed
