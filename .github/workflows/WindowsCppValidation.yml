@@ -1,0 +1,41 @@
+name: Windows Vane Lance C++ validation
+
+on:
+  push:
+    branches: [codex/lance-windows-validation-20261106]
+    paths:
+      - .github/workflows/WindowsCppValidation.yml
+      - ci/windows_cpp_syntax.py
+      - src/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: extension
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: AstroVela/vane
+          ref: 097758b773d6c5065527feb2da927cd1399d2cf0
+          path: vane
+          sparse-checkout: |
+            external/duckdb/src/include
+            external/duckdb/third_party
+            external/duckdb/CMakeLists.txt
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with:
+          arch: x64
+      - run: python extension/ci/windows_cpp_syntax.py vane
