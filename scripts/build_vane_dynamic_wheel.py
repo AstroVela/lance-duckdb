@@ -213,6 +213,23 @@ def _venv_python(root: Path) -> Path:
     return root / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
 
 
+def _provider_artifact(build_directory: Path) -> Path:
+    directories = [build_directory / "duckdb/extension/lance"]
+    if sys.platform == "win32":
+        # DuckDB's MSVC runtime-output property uses the top-level binary dir,
+        # while other generators retain the nested engine directory.
+        directories.append(build_directory / "extension/lance")
+    artifacts = [
+        directory / configuration / "lance.duckdb_extension"
+        for directory in directories
+        for configuration in ("", "Release")
+        if (directory / configuration / "lance.duckdb_extension").is_file()
+    ]
+    if len(artifacts) != 1:
+        raise QualificationError("expected exactly one Release Lance artifact")
+    return artifacts[0]
+
+
 def _vcpkg_revision(manifest_path: Path) -> str:
     manifest = tomllib.loads(
         _require_file(manifest_path, "Vane extension manifest").read_text(
@@ -1027,15 +1044,7 @@ def main() -> int:
                 environment=environment,
             )
 
-            artifact_directory = build_directory / "duckdb/extension/lance"
-            candidates = [
-                artifact_directory / "lance.duckdb_extension",
-                artifact_directory / "Release/lance.duckdb_extension",
-            ]
-            artifacts = [path for path in candidates if path.is_file()]
-            if len(artifacts) != 1:
-                raise QualificationError("expected exactly one Release Lance artifact")
-            unsigned = artifacts[0]
+            unsigned = _provider_artifact(build_directory)
             _require_self_contained_artifact(unsigned)
             licenses = _stage_license_files(
                 extension_root=extension_root,
