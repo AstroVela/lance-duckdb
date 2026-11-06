@@ -1197,7 +1197,8 @@ jobs:
 
   vane-dynamic-provider-macos:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
-    needs: preflight
+    # Build-only producers verify their own source/tool pins before compilation.
+    # Start on native runners while the independent Linux checks are queued.
     uses: ./.github/workflows/_vane_provider_native.yml
     with:
       platform: macos
@@ -1228,7 +1229,6 @@ jobs:
 
   vane-dynamic-provider-windows:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
-    needs: preflight
     uses: ./.github/workflows/_vane_provider_native.yml
     with:
       platform: windows
