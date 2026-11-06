@@ -16,6 +16,10 @@ set consistently for C++, Rust and native dependencies. Windows uses the static
 CRT across C++, Rust and vcpkg. Each platform builds one native artifact; the
 same signed bytes are packaged and verified against its five CPython runtimes.
 ELF, Mach-O and PE policies come from the pinned Vane packaging implementation.
+The packaging pin includes Vane's Windows import-table correction: repeated
+DLL descriptors are validated before coalescing dependencies, and the exact
+Windows synchronization API-set and performance-counter DLLs are recognized.
+This tooling pin advances independently of the runtime's exact SDK revision.
 The indexed base wheel may advertise an earlier macOS minimum, such as Vane's
 `macosx_11_0_arm64`; its exact version, interpreter and architecture must still
 match, and the complete pair is verified on the provider's minimum platform.
