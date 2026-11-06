@@ -11,4 +11,4 @@ dependencies = []
 # Packaging tools are pinned independently of the exact Vane runtime.
 [packaging]
 repository = "AstroVela/vane"
-revision = "d1693baca2784acb0752f9bbf84d1bdaa88b1a5c"
+revision = "49d92723b8a2287dc7f44cb9112b9bf6fa56291f"
