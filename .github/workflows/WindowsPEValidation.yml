@@ -1,0 +1,50 @@
+name: Windows PE import audit validation
+
+on:
+  push:
+    branches: [codex/lance-windows-validation-20261106]
+    paths:
+      - .github/workflows/WindowsPEValidation.yml
+      - ci/windows_pe_validation.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          path: extension
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: AstroVela/vane
+          ref: 097758b773d6c5065527feb2da927cd1399d2cf0
+          path: old-sdk
+          sparse-checkout: vane_packaging
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: AstroVela/vane
+          ref: 49d92723b8a2287dc7f44cb9112b9bf6fa56291f
+          path: fixed-sdk
+          sparse-checkout: vane_packaging
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: '13468632259'
+          run-id: '42133237700'
+          github-token: ${{ github.token }}
+          path: original-windows-artifact
+          digest-mismatch: error
+      - run: python -m pip install packaging pyelftools pefile
+      - name: Compare audits and load the original Windows binary
+        run: python -I extension/ci/windows_pe_validation.py old-sdk fixed-sdk original-windows-artifact/lance.duckdb_extension
