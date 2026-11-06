@@ -179,6 +179,16 @@ jobs:
           path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/
           if-no-files-found: error
           retention-days: 30
+      - name: Retain a failed Windows provider for diagnosis
+        if: failure() && inputs.platform == 'windows' && env.VANE_DYNAMIC_BUILD_DIR != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: vane-lance-native-diagnostics-windows
+          path: |
+            ${{ env.VANE_DYNAMIC_BUILD_DIR }}/extension/lance/**/lance.duckdb_extension
+            ${{ env.VANE_DYNAMIC_BUILD_DIR }}/duckdb/extension/lance/**/lance.duckdb_extension
+          if-no-files-found: warn
+          retention-days: 7
       - name: Qualify signed CI wheels on the native platform
         if: inputs.phase == 'full'
         timeout-minutes: 25

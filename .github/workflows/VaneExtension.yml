@@ -160,12 +160,14 @@ jobs:
             python/tests \
             scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py \
             scripts/sign_vane_dynamic_bundle.py scripts/vane_platform_release.py \
-            scripts/verify_vane_platform.py scripts/bootstrap_vane_dependencies.py
+            scripts/verify_vane_platform.py scripts/bootstrap_vane_dependencies.py \
+            scripts/hide_msvc_archive_exports.py
           python -m compileall -q \
             python/tests \
             scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py \
             scripts/sign_vane_dynamic_bundle.py scripts/vane_platform_release.py \
-            scripts/verify_vane_platform.py scripts/bootstrap_vane_dependencies.py
+            scripts/verify_vane_platform.py scripts/bootstrap_vane_dependencies.py \
+            scripts/hide_msvc_archive_exports.py
 
   vane-provider-release-tooling:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -198,7 +200,8 @@ jobs:
             python/tests/test_vane_dynamic_wheel.py \
             python/tests/test_vane_dynamic_signing.py \
             python/tests/test_vane_provider_release.py \
-            python/tests/test_vane_platform_release.py
+            python/tests/test_vane_platform_release.py \
+            python/tests/test_msvc_archive_exports.py
 
   vane-native-build:
     name: Build and test Vane ABI

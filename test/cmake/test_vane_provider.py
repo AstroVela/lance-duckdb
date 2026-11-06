@@ -46,10 +46,16 @@ class ProviderLinkTests(unittest.TestCase):
                 "project(lance LANGUAGES CXX)\n"
                 f'include("{config.as_posix()}")\n'
                 f'add_library(lance_loadable_extension SHARED "{(root / "provider.cpp").as_posix()}")\n'
+                f'add_library(crypto_fixture STATIC "{(root / "crypto.cpp").as_posix()}")\n'
+                "set_target_properties(crypto_fixture PROPERTIES POSITION_INDEPENDENT_CODE ON)\n"
+                "target_link_libraries(lance_loadable_extension PRIVATE crypto_fixture)\n"
                 'set_target_properties(lance_loadable_extension PROPERTIES OUTPUT_NAME lance PREFIX "" SUFFIX .duckdb_extension)\n'
                 "if(MSVC)\n"
                 "  set_target_properties(lance_loadable_extension PROPERTIES\n"
                 '    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/extension/lance")\n'
+                "  add_custom_command(TARGET crypto_fixture POST_BUILD\n"
+                f'    COMMAND "{Path(sys.executable).as_posix()}" "{(ROOT / "scripts/hide_msvc_archive_exports.py").as_posix()}" "$<TARGET_FILE:crypto_fixture>"\n'
+                "    VERBATIM)\n"
                 "endif()\n"
                 f'include("{(ROOT / "cmake/vane_provider_link.cmake").as_posix()}")\n'
                 "lance_configure_vane_provider(lance_loadable_extension)\n"
@@ -60,9 +66,11 @@ class ProviderLinkTests(unittest.TestCase):
             )
             (root / "native.cpp").write_text(export + 'extern "C" ENTRY int native_entry() { return 7; }\n')
             (root / "provider.cpp").write_text(
-                export + 'extern "C" ENTRY int lance_duckdb_cpp_init() { return 42; }\n'
+                export + 'extern "C" int private_crypto_symbol();\n'
+                'extern "C" ENTRY int lance_duckdb_cpp_init() { return 35 + private_crypto_symbol(); }\n'
                 'extern "C" int private_engine_symbol() { return 7; }\n'
             )
+            (root / "crypto.cpp").write_text(export + 'extern "C" ENTRY int private_crypto_symbol() { return 7; }\n')
             generator = "Visual Studio 17 2022" if sys.platform == "win32" else "Ninja"
             subprocess.run(
                 [
@@ -78,7 +86,15 @@ class ProviderLinkTests(unittest.TestCase):
                 check=True,
             )
             subprocess.run(
-                ["cmake", "--build", str(root / "build"), "--target", "_native", "--config", "Release"],
+                [
+                    "cmake",
+                    "--build",
+                    str(root / "build"),
+                    "--target",
+                    "_native",
+                    "--config",
+                    "Release",
+                ],
                 check=True,
             )
             # Vane excludes its engine subtree from the top-level build. With
@@ -110,6 +126,8 @@ class ProviderLinkTests(unittest.TestCase):
             self.assertEqual(library.lance_duckdb_cpp_init(), 42)
             with self.assertRaises(AttributeError):
                 library.private_engine_symbol
+            with self.assertRaises(AttributeError):
+                library.private_crypto_symbol
             # Windows holds a loaded DLL open until process exit.
             if sys.platform == "win32":
                 ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(library._handle))

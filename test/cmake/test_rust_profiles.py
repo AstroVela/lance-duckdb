@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 FAKE_CARGO = """
-import json, os, sys
+import json, os, struct, sys
 from pathlib import Path
 args=sys.argv[1:]
 profile=next(a.split('=',1)[1] for a in args if a.startswith('--profile='))
@@ -22,12 +22,28 @@ directory=Path(os.environ['CARGO_TARGET_DIR'])/target/('debug' if profile=='dev'
 directory.mkdir(parents=True,exist_ok=True)
 with open(os.environ['CARGO_TEST_LOG'],'a',encoding='utf-8') as output:
     output.write(json.dumps({'args':args,'profile':profile,'linker':os.environ.get('CARGO_TARGET_'+target.upper().replace('-','_')+'_LINKER')})+'\\n')
-(directory/os.environ['CARGO_TEST_LIBRARY']).write_bytes(b'artifact')
+artifact=b'artifact'
+if os.environ.get('CARGO_TEST_PRIVATE_EXPORTS') == '1':
+    directives=b' /EXPORT:private_ffi /DEFAULTLIB:LIBCMT '
+    coff=struct.pack('<HHIIIHH',0x8664,1,0,0,0,0,0)
+    section=struct.pack('<8sIIIIIIHHI',b'.drectve',0,0,len(directives),60,0,0,0,0,0)
+    payload=coff+section+directives
+    member=b'fixture.obj/'.ljust(16)+b'0'.ljust(12)+b'0'.ljust(6)+b'0'.ljust(6)+b'100644'.ljust(8)
+    member+=str(len(payload)).encode().ljust(10)+b'`\\n'+payload+b'\\n'*(len(payload)%2)
+    artifact=b'!<arch>\\n'+member
+(directory/os.environ['CARGO_TEST_LIBRARY']).write_bytes(artifact)
 """
 
 
 class RustProfileBuild(unittest.TestCase):
-    def run_graph(self, generator, configurations, reproducible, msvc_linker=None):
+    def run_graph(
+        self,
+        generator,
+        configurations,
+        reproducible,
+        msvc_linker=None,
+        dynamic_provider=False,
+    ):
         # MSBuild disables incremental tracking under the OS TEMP directory.
         # Use the repository's ignored build tree, as production builds do.
         test_root = REPOSITORY / "build" / "contract-tests"
@@ -62,6 +78,7 @@ class RustProfileBuild(unittest.TestCase):
                 "set(RUST_CARGO_FEATURE_ARGS --features vane-distributed)\n"
                 + ("set(RUST_CARGO_REPRODUCIBILITY_ARGS --locked)\n" if reproducible else "")
                 + 'set(RUST_CARGO_ENV "CARGO_TARGET_DIR=${RUST_TARGET_DIR}")\n'
+                + ("set(LANCE_VANE_DYNAMIC_PROVIDER ON)\n" if dynamic_provider else "")
                 + (f'set(WIN32 TRUE)\nset(MSVC TRUE)\nset(CMAKE_LINKER "{msvc_linker}")\n' if msvc_linker else "")
                 + f'include("{helper}")\nlance_add_rust_ffi_build("${{CMAKE_CURRENT_SOURCE_DIR}}/Cargo.toml")\n',
                 encoding="utf-8",
@@ -71,6 +88,7 @@ class RustProfileBuild(unittest.TestCase):
                 PATH=str(tools) + os.pathsep + environment.get("PATH", ""),
                 CARGO_TEST_LOG=str(log),
                 CARGO_TEST_LIBRARY=library,
+                CARGO_TEST_PRIVATE_EXPORTS="1" if dynamic_provider else "0",
             )
             command = ["cmake", "-S", str(source), "-B", str(build), "-G", generator]
             if generator == "Ninja":
@@ -94,6 +112,10 @@ class RustProfileBuild(unittest.TestCase):
                 self.assertEqual("--locked" in calls[-1]["args"], reproducible)
                 self.assertIn("vane-distributed", calls[-1]["args"])
                 self.assertEqual(calls[-1]["linker"], msvc_linker)
+                if dynamic_provider:
+                    archive = build / "cargo" / target / ("debug" if expected == "dev" else "release") / library
+                    self.assertNotIn(b"/EXPORT:private_ffi", archive.read_bytes())
+                    self.assertIn(b"/DEFAULTLIB:LIBCMT", archive.read_bytes())
                 # An up-to-date build must not invoke Cargo for either profile.
                 self.command(command, environment)
                 self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), index + 1)
@@ -121,6 +143,15 @@ class RustProfileBuild(unittest.TestCase):
 
     def test_msvc_uses_cmake_linker_instead_of_git_bash_link(self):
         self.run_graph("Ninja", ["Release"], True, "C:/MSVC tools/bin/link.exe")
+
+    def test_msvc_localizes_vane_provider_archive_before_linking(self):
+        self.run_graph(
+            "Ninja",
+            ["Release"],
+            True,
+            "C:/MSVC tools/bin/link.exe",
+            dynamic_provider=True,
+        )
 
     @unittest.skipUnless(os.name == "nt", "Visual Studio generator")
     def test_visual_studio_builds_only_the_requested_profile(self):

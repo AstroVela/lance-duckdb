@@ -20,6 +20,12 @@ The packaging pin includes Vane's Windows import-table correction: repeated
 DLL descriptors are validated before coalescing dependencies, and the exact
 Windows synchronization API-set and performance-counter DLLs are recognized.
 This tooling pin advances independently of the runtime's exact SDK revision.
+Before linking a Windows provider, the build removes embedded `/EXPORT`
+directives from the Rust static archive's COFF `.drectve` sections. MSVC combines
+these directives with a `.def` file, so a `.def` allowlist alone cannot hide
+dependencies' explicit `dllexport` annotations. Code, archive offsets, symbols,
+CRT selection and cryptographic configuration retain their original bytes.
+The final DLL must still export only `lance_duckdb_cpp_init`.
 The indexed base wheel may advertise an earlier macOS minimum, such as Vane's
 `macosx_11_0_arm64`; its exact version, interpreter and architecture must still
 match, and the complete pair is verified on the provider's minimum platform.
