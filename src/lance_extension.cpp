@@ -90,6 +90,7 @@ DUCKDB_CPP_EXTENSION_ENTRY(lance, loader) {
   extension.Load(loader);
 }
 
+#ifndef LANCE_VANE_DYNAMIC_PROVIDER
 DUCKDB_EXTENSION_API void lance_init(duckdb::DatabaseInstance &db) {
   duckdb::DuckDB db_wrapper(db);
   db_wrapper.LoadStaticExtension<duckdb::LanceExtension>();
@@ -98,6 +99,7 @@ DUCKDB_EXTENSION_API void lance_init(duckdb::DatabaseInstance &db) {
 DUCKDB_EXTENSION_API const char *lance_version() {
   return duckdb::DuckDB::LibraryVersion();
 }
+#endif
 }
 
 #ifndef DUCKDB_EXTENSION_MAIN

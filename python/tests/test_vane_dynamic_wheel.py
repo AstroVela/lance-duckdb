@@ -422,10 +422,11 @@ def _runtime_document(version: str) -> dict:
     return {
         "urls": [
             {
-                "filename": f"vane_ai-{version}-{interpreter}-{interpreter}-manylinux_2_28_x86_64.whl",
+                "filename": f"vane_ai-{version}-{interpreter}-{interpreter}-{platform}.whl",
                 "packagetype": "bdist_wheel",
                 "digests": {"sha256": "a" * 64},
             }
+            for platform in ("manylinux_2_28_x86_64", "macosx_11_0_arm64", "win_amd64")
             for interpreter in ("cp310", "cp311", "cp312", "cp313", "cp314")
         ]
     }

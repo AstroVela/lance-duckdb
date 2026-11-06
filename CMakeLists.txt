@@ -17,12 +17,8 @@ option(LANCE_BLOB_ACCESS_PROBE
        "Build the standalone Blob access feasibility experiment" OFF)
 
 if(LANCE_VANE_DYNAMIC_PROVIDER AND NOT LANCE_VANE_DISTRIBUTED)
-  message(FATAL_ERROR
-          "LANCE_VANE_DYNAMIC_PROVIDER requires LANCE_VANE_DISTRIBUTED")
-endif()
-if(LANCE_VANE_DYNAMIC_PROVIDER AND NOT "${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
-  message(FATAL_ERROR
-          "LANCE_VANE_DYNAMIC_PROVIDER currently requires Linux")
+  message(
+    FATAL_ERROR "LANCE_VANE_DYNAMIC_PROVIDER requires LANCE_VANE_DISTRIBUTED")
 endif()
 
 if(LANCE_VANE_DISTRIBUTED)
@@ -76,8 +72,7 @@ set(EXTENSION_SOURCES
 
 if(LANCE_VANE_DISTRIBUTED)
   list(APPEND EXTENSION_SOURCES src/lance_distributed_write.cpp
-       src/lance_vane_search.cpp
-       src/lance_vane_snapshot.cpp
+       src/lance_vane_search.cpp src/lance_vane_snapshot.cpp
        src/lance_vane_rest_resolution.cpp)
 endif()
 
@@ -224,13 +219,15 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)
 
 if(LANCE_VANE_DISTRIBUTED)
-  list(APPEND RUST_FFI_DEPENDS
-       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_write.rs
-       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_mutation.rs
-       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_distributed_search.rs
-       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_index_cache.rs
-       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_rest_resolution.rs
-       ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_search_plan.rs)
+  list(
+    APPEND
+    RUST_FFI_DEPENDS
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_write.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/distributed_mutation.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_distributed_search.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_index_cache.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_rest_resolution.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/vane_search_plan.rs)
 endif()
 
 set(RUST_CARGO_ENV CARGO_TARGET_DIR=${RUST_TARGET_DIR}
@@ -301,41 +298,32 @@ if(LANCE_BLOB_ACCESS_PROBE)
   find_package(Threads REQUIRED)
   add_executable(lance_blob_access_probe test/cpp/blob_access_probe.cpp)
   target_link_libraries(
-    lance_blob_access_probe duckdb_static dummy_static_extension_loader Threads::Threads
-    debug "${RUST_DEBUG_LIB}" optimized "${RUST_RELEASE_LIB}" ${PLATFORM_LIBS})
+    lance_blob_access_probe
+    duckdb_static
+    dummy_static_extension_loader
+    Threads::Threads
+    debug
+    "${RUST_DEBUG_LIB}"
+    optimized
+    "${RUST_RELEASE_LIB}"
+    ${PLATFORM_LIBS})
   add_dependencies(lance_blob_access_probe lance_duckdb_ffi_build)
 endif()
 
 if(BUILD_UNITTESTS)
   find_package(Threads REQUIRED)
   add_executable(lance_blob_filesystem_test test/cpp/test_blob_filesystem.cpp)
-  target_include_directories(lance_blob_filesystem_test PRIVATE
-                             "${DuckDB_SOURCE_DIR}/extension/core_functions/include")
+  target_include_directories(
+    lance_blob_filesystem_test
+    PRIVATE "${DuckDB_SOURCE_DIR}/extension/core_functions/include")
   target_link_libraries(lance_blob_filesystem_test ${EXTENSION_NAME}
-                       core_functions_extension duckdb_static
-                       Threads::Threads)
+                        core_functions_extension duckdb_static Threads::Threads)
   link_extension_libraries(lance_blob_filesystem_test "")
 endif()
 
 if(LANCE_VANE_DYNAMIC_PROVIDER)
-  # The provider carries the Rust closure and its matching DuckDB engine in one
-  # artifact. Hide private definitions and strip at link time, before DuckDB's
-  # signature footer is replaced by the release signer.
-  set(LANCE_VANE_VERSION_SCRIPT
-      "${CMAKE_CURRENT_BINARY_DIR}/vane-lance-exports.map")
-  file(WRITE "${LANCE_VANE_VERSION_SCRIPT}"
-       "{\n  global: lance_duckdb_cpp_init;\n  local: *;\n};\n")
-  set_property(TARGET ${LOADABLE_EXTENSION_NAME}
-               APPEND PROPERTY LINK_DEPENDS "${LANCE_VANE_VERSION_SCRIPT}")
-  target_link_options(
-    ${LOADABLE_EXTENSION_NAME}
-    PRIVATE
-      "-Wl,--version-script=${LANCE_VANE_VERSION_SCRIPT}"
-      -Wl,--exclude-libs,ALL
-      -Wl,-Bsymbolic
-      -Wl,--gc-sections
-      -Wl,--strip-all
-      -Wl,-z,defs)
+  include("${CMAKE_CURRENT_LIST_DIR}/cmake/vane_provider_link.cmake")
+  lance_configure_vane_provider(${LOADABLE_EXTENSION_NAME})
 endif()
 
 install(

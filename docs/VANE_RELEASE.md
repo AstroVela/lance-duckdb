@@ -1,9 +1,34 @@
 # Vane provider release tooling
 
 `vane-provider-release.toml` declares the Lance provider, the complete CPython
-3.10–3.14 `manylinux_2_28_x86_64` wheel matrix, and the existing 100,000,000-byte
+3.10–3.14 wheel matrix on three native platforms, and the existing 100,000,000-byte
 TestPyPI per-file upload budget. Lance has no provider dependencies; every wheel
 requires the exact `vane-ai` version.
+
+| Platform | Runner | Wheel platform | Native triplet |
+| --- | --- | --- | --- |
+| Linux x86_64 | manylinux container on ubuntu-24.04 | `manylinux_2_28_x86_64` | `x64-linux-release` |
+| macOS arm64 | macos-15 | `macosx_15_0_arm64` | `arm64-osx-release` |
+| Windows x64 | windows-2022, MSVC | `win_amd64` | `x64-windows-static-release` |
+
+The complete provider release contains 15 wheels. The macOS minimum is 15.0,
+set consistently for C++, Rust and native dependencies. Windows uses the static
+CRT across C++, Rust and vcpkg. Each platform builds one native artifact; the
+same signed bytes are packaged and verified against its five CPython runtimes.
+ELF, Mach-O and PE policies come from the pinned Vane packaging implementation.
+The packaging pin includes Vane's Windows import-table correction: repeated
+DLL descriptors are validated before coalescing dependencies, and the exact
+Windows synchronization API-set and performance-counter DLLs are recognized.
+This tooling pin advances independently of the runtime's exact SDK revision.
+Before linking a Windows provider, the build removes embedded `/EXPORT`
+directives from the Rust static archive's COFF `.drectve` sections. MSVC combines
+these directives with a `.def` file, so a `.def` allowlist alone cannot hide
+dependencies' explicit `dllexport` annotations. Code, archive offsets, symbols,
+CRT selection and cryptographic configuration retain their original bytes.
+The final DLL must still export only `lance_duckdb_cpp_init`.
+The indexed base wheel may advertise an earlier macOS minimum, such as Vane's
+`macosx_11_0_arm64`; its exact version, interpreter and architecture must still
+match, and the complete pair is verified on the provider's minimum platform.
 
 The release matrix and indexed-file checks live in the exact pinned
 `vane-extension-ci-tools` submodule, not in a per-extension copy. Like the other
@@ -19,7 +44,7 @@ Prepare the pinned tools and run the lightweight consumer checks with Python
 ```bash
 git submodule update --init vane-extension-ci-tools
 python -m pip install -r vane-extension-ci-tools/requirements-release.txt pytest pyyaml
-python -m pytest -q python/tests/test_vane_dynamic_wheel.py python/tests/test_vane_dynamic_signing.py python/tests/test_vane_provider_release.py
+python -m pytest -q python/tests/test_vane_dynamic_wheel.py python/tests/test_vane_dynamic_signing.py python/tests/test_vane_provider_release.py python/tests/test_vane_platform_release.py
 ```
 
 For a locally assembled production candidate set:
@@ -31,7 +56,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-provider-dist \
-  --vane-version 0.2.0 --channel release \
+  --vane-version "$VANE_VERSION" --channel release \
   --require-publishable-on testpypi --require-publishable-on pypi
 ```
 
@@ -53,14 +78,25 @@ Both native and provider builders retain the existing integration manifest's
 exact vcpkg revision; `vcpkg.json` does not select a separate baseline. The development source pin advances through reviewed PRs; native dependency versions
 and provider versioning remain explicit.
 
+Dependency preparation retries the exact SDK bootstrap at most three times,
+reusing completed packages and checked downloads. For SDK dependency baseline
+`44819aa2a6c10e56065e2b0330e7d6c89d1d2574`, the Lance adapter can seed the
+unchanged Thrift 0.23.0 archive from Buildroot's HTTPS source cache. It requires
+the SHA-512 from the [pinned vcpkg port](https://github.com/microsoft/vcpkg/blob/44819aa2a6c10e56065e2b0330e7d6c89d1d2574/ports/thrift/portfile.cmake)
+before publishing the cached file; vcpkg verifies it again before extraction.
+Mirror connection failures fall back to the SDK's canonical download, while a
+hash mismatch stops the build. No SDK source, port or dependency pin is changed.
+
 ## Development and production channels
 
 `VaneExtension.yml` keeps `build-only` as its default operation. Pushes, pull
 requests, and build-only dispatches cannot reach provider publishing or private
-signing keys. They build against `vane-extension.toml`, which pins Vane v0.2.0.
+signing keys. They build against the exact cross-platform development revision
+in `vane-extension.toml` (the Vane #1140 baseline).
 Build-only CI enables the public CI test key in its locally built runtime and
 packages a matching runtime/provider set. These are test artifacts even though
-the runtime reports `0.2.0`; do not mix them with the PyPI runtime or publish them.
+their version resembles an indexed runtime; do not mix them with indexed
+runtime wheels or publish them.
 
 Both publishing operations require a manual dispatch on the protected
 `AstroVela/lance-duckdb` `main_vane` branch. No provider tag is required or created:
@@ -72,17 +108,22 @@ committed exact Vane revision.
 | `testpypi-dev` | `vane-extension.toml`, TestPyPI only | `astrovela/vane-testpypi` |
 | `release` | `vane-extension-release.toml`, PyPI only | `astrovela/vane` |
 
-Both manifests select Vane v0.2.0, commit
-`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`. Production qualification uses its
-exact PyPI runtime wheels and the production signer. Updating this pin does not
+The production manifest still selects Vane v0.2.0, commit
+`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`. This published runtime has only
+Linux wheels. The expanded release preflight therefore rejects it before
+native builds or private-key access. Before a production dispatch, publish a
+Vane release containing all 15 base wheels and update
+`vane-extension-release.toml` to that release's exact official source commit.
+Production qualification uses its exact PyPI runtime wheels and the production
+signer. Updating this pin does not
 publish the provider or establish production qualification; the full protected
 release workflow is still required. Development versions, local versions,
 missing or yanked runtime wheels, and a different source/tool identity fail
 closed. There is no fallback runtime, index, or signing key.
 
-With this stable pin, use `build-only` for PRs and `release` for production.
-`testpypi-dev` deliberately rejects `0.2.0`; a future development publication
-requires a separately reviewed pin to its exact TestPyPI runtime. Ordinary
+Use `build-only` for PRs. A `testpypi-dev` dispatch also requires the exact
+development Vane version and its full platform matrix to be published on
+TestPyPI first. Ordinary
 TestPyPI dev runtimes trust the dedicated TestPyPI key, not the public CI key.
 
 ## One build, two indexes
@@ -92,7 +133,7 @@ The release channel reuses the existing candidate jobs:
 1. Validate the dispatch, exact sources, canonical runtime version, production-key
    ancestry, and the complete published runtime matrix before native builds or
    signing-key access.
-2. Build the native artifact once in a job with no environment, private key, or
+2. Build the native artifact once per platform in jobs with no environment, private key, or
    OIDC permission. Both testing-key CMake switches are explicitly disabled for
    production. Upload only unsigned native data and license records.
 3. A separate protected signing job reads the committed exact manifest and uses
@@ -102,18 +143,20 @@ The release channel reuses the existing candidate jobs:
    from the environment, and destroys its private temporary file after signing.
    Before upload it verifies a regular output of the same size, with the payload
    SHA-256 recorded before signing unchanged and only the final 256-byte signature
-   slot replaced. The only output is the signed native artifact.
-4. In a fresh job without secrets or OIDC, package those signed bytes without a
+   slot replaced. The output contains exactly three native artifacts in separate
+   platform directories. Signing runs on Linux and does not execute any artifact.
+4. In fresh native-platform jobs without secrets or OIDC, package those signed bytes without a
    native rebuild. Verify against every exact indexed runtime and assemble the full
    provider wheel matrix. Preserve provenance, checksums, licenses, and SBOM
    evidence. Independently compare signed bytes with the original unsigned bundle
    before native verification or packaging; only the signature slot may differ.
    Validate availability on both indexes without overwriting files.
 5. Upload the candidate wheels to TestPyPI. Verify the complete indexed filename
-   and SHA-256 set, then install from TestPyPI into fresh default-Ray smoke and full-scan
-   test environments. Both tests compare the downloaded provider bytes with the
+   and SHA-256 set, then install from TestPyPI into fresh local and Ray smoke
+   environments on all three platforms, plus the existing Linux integration
+   suites. These tests compare the downloaded provider bytes with the
    expected build artifact; the exact production runtime comes only from PyPI.
-6. After both tests pass, wait for the `pypi` environment approval. Recheck the
+6. After all platform and integration tests pass, wait for the `pypi` environment approval. Recheck the
    complete candidate set with the shared `verify-promotion` gate in a read-only
    job without OIDC permission. The separate minimal publisher uses the same
    protected environment, so GitHub may require another approval. That job only
@@ -161,7 +204,9 @@ OIDC identity used for package-index uploads and provenance attestations.
 
 ## Default Ray qualification
 
-The development and production qualification pin is Vane v0.2.0,
+Development qualification uses the exact cross-platform revision in
+`vane-extension.toml`. Production qualification uses the separate published
+runtime pin in `vane-extension-release.toml`, currently Vane v0.2.0,
 `79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`.
 
 All installed-wheel integration tests leave `VANE_RUNNER` unset and use no
@@ -213,4 +258,4 @@ from the engine/runtime manifest. CI checks out that exact commit, exports
 `VANE_PROVIDER_PACKAGING_SOURCE`, and calls the shared `vane_provider_build.py`
 adapter for both building and verification. For local packaging, set that
 variable to the same clean, pinned checkout. This lets the provider use
-numbered releases while retaining its exact Vane `0.2.0` runtime pin.
+numbered releases independently of the selected channel's exact runtime pin.

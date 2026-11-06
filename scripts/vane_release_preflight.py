@@ -78,10 +78,17 @@ def require_indexed_runtime(release, version: str, channel: str, config: Path) -
         for interpreter in expected.interpreters
         for platform in expected.platforms
     }
-    if not required <= found:
-        raise ValueError(
-            f"exact Vane runtime is missing indexed wheels: {required - found}"
+    missing = {
+        (interpreter, platform)
+        for interpreter, platform in required
+        if not any(
+            runtime_interpreter == interpreter
+            and release.runtime_platform_supports_provider(runtime_platform, platform)
+            for runtime_interpreter, runtime_platform in found
         )
+    }
+    if missing:
+        raise ValueError(f"exact Vane runtime is missing indexed wheels: {missing}")
 
 
 def main(argv: list[str] | None = None) -> int:
