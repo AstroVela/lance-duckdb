@@ -20,6 +20,10 @@ on:
           - release
         default: build-only
         required: true
+      testpypi-only:
+        description: Stage a release with TestPyPI runtimes and stop after qualification
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ inputs.operation || 'ci' }}
@@ -1223,7 +1227,7 @@ jobs:
       manifest: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
       signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
       vane-version: ${{ needs.provider-release-preflight.outputs.vane_version }}
-      runtime-index: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      runtime-index: ${{ inputs.operation == 'release' && !inputs.testpypi-only && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       prepared-id: ${{ needs.vane-provider-prepare-macos.outputs.artifact_id }}
       signed-id: ${{ needs.vane-provider-sign.outputs.artifact_id }}
 
@@ -1253,7 +1257,7 @@ jobs:
       manifest: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
       signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
       vane-version: ${{ needs.provider-release-preflight.outputs.vane_version }}
-      runtime-index: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      runtime-index: ${{ inputs.operation == 'release' && !inputs.testpypi-only && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       prepared-id: ${{ needs.vane-provider-prepare-windows.outputs.artifact_id }}
       signed-id: ${{ needs.vane-provider-sign.outputs.artifact_id }}
 
@@ -1314,13 +1318,18 @@ jobs:
         id: release
         env:
           RELEASE_CHANNEL: ${{ inputs.operation }}
+          TESTPYPI_ONLY: ${{ inputs.testpypi-only || false }}
         run: |
+          arguments=()
+          if [ "$TESTPYPI_ONLY" = true ]; then
+            arguments+=(--testpypi-only)
+          fi
           python -I scripts/vane_release_preflight.py \
             --channel "$RELEASE_CHANNEL" \
             --manifest "$VANE_MANIFEST" --extension-root . \
             --vane-source vane \
             --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
-            --github-output "$GITHUB_OUTPUT"
+            --github-output "$GITHUB_OUTPUT" "${arguments[@]}"
 
   vane-provider-prepare:
     name: Prepare unsigned Lance native data without secrets
@@ -1683,7 +1692,7 @@ jobs:
       - name: Download every exact indexed Vane runtime wheel
         shell: bash
         env:
-          INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+          INDEX_URL: ${{ inputs.operation == 'release' && !inputs.testpypi-only && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
           VANE_VERSION: ${{ needs.provider-release-preflight.outputs.vane_version }}
         run: |
           set -euo pipefail
@@ -1976,7 +1985,7 @@ jobs:
       contents: read
     env:
       INDEX_URL: https://test.pypi.org/simple/
-      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && !inputs.testpypi-only && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
 
     steps:
@@ -2057,7 +2066,7 @@ jobs:
       contents: read
     env:
       INDEX_URL: https://test.pypi.org/simple/
-      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && !inputs.testpypi-only && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       RAY_DEDUP_LOGS: "0"
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
 
@@ -2152,7 +2161,7 @@ jobs:
     env:
       MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
       INDEX_URL: https://test.pypi.org/simple/
-      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+      VANE_RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && !inputs.testpypi-only && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
       VANE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.vane_version }}
       LANCE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.lance_version }}
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
@@ -2174,7 +2183,7 @@ jobs:
       - run: python -I extension/scripts/vane_platform_release.py indexed-smoke
 
   verify-pypi-promotion:
-    if: inputs.operation == 'release'
+    if: inputs.operation == 'release' && !inputs.testpypi-only
     name: Approve and verify the immutable Lance promotion without OIDC
     needs:
       - assemble-testpypi-lance
@@ -2239,7 +2248,7 @@ jobs:
             --vane-version "$VANE_VERSION"
 
   publish-pypi-lance:
-    if: inputs.operation == 'release'
+    if: inputs.operation == 'release' && !inputs.testpypi-only
     name: Publish only the original verified Lance candidate to PyPI
     needs: [assemble-testpypi-lance, verify-pypi-promotion]
     runs-on: ubuntu-24.04
@@ -2268,6 +2277,7 @@ jobs:
           skip-existing: true
 
   verify-pypi-lance:
+    if: inputs.operation == 'release' && !inputs.testpypi-only
     name: Verify the indexed Lance production release without OIDC
     needs: [assemble-testpypi-lance, publish-pypi-lance]
     runs-on: ubuntu-24.04

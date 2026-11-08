@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Lance DuckDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reject unpublished production runtimes before native builds or key access."""
+"""Require exact indexed runtimes before native builds or key access."""
 
 from __future__ import annotations
 
@@ -43,8 +43,10 @@ def require_publish_dispatch(environment: dict[str, str]) -> None:
         )
 
 
-def require_indexed_runtime(release, version: str, channel: str, config: Path) -> None:
-    index = "pypi" if channel == "release" else "testpypi"
+def require_indexed_runtime(
+    release, version: str, channel: str, config: Path, *, testpypi_only: bool = False
+) -> None:
+    index = "pypi" if channel == "release" and not testpypi_only else "testpypi"
     status, document = release._request_json(
         f"{release.INDEX_JSON_BASES[index]}/vane-ai/{version}/json"
     )
@@ -94,12 +96,15 @@ def require_indexed_runtime(release, version: str, channel: str, config: Path) -
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--channel", choices=("testpypi-dev", "release"), required=True)
+    parser.add_argument("--testpypi-only", action="store_true")
     parser.add_argument("--extension-root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--vane-source", type=Path, required=True)
     parser.add_argument("--ci-tools-version", required=True)
     parser.add_argument("--github-output", type=Path, required=True)
     arguments = parser.parse_args(argv)
+    if arguments.testpypi_only and arguments.channel != "release":
+        parser.error("--testpypi-only requires --channel release")
     require_publish_dispatch(dict(os.environ))
     release = load_release_tools(arguments.extension_root.resolve())
     release.verify_sources(
@@ -131,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         version,
         arguments.channel,
         arguments.extension_root / "vane-provider-release.toml",
+        testpypi_only=arguments.testpypi_only,
     )
     with arguments.github_output.open("a", encoding="utf-8") as output:
         output.write(f"vane_version={version}\n")

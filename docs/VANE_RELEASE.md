@@ -107,15 +107,14 @@ committed exact Vane revision.
 | --- | --- | --- |
 | `testpypi-dev` | `vane-extension.toml`, TestPyPI only | `astrovela/vane-testpypi` |
 | `release` | `vane-extension-release.toml`, PyPI only | `astrovela/vane` |
+| `release` with `testpypi-only: true` | `vane-extension-release.toml`, TestPyPI only | `astrovela/vane` |
 
-The production manifest still selects Vane v0.2.0, commit
-`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`. This published runtime has only
-Linux wheels. The expanded release preflight therefore rejects it before
-native builds or private-key access. Before a production dispatch, publish a
-Vane release containing all 15 base wheels and update
-`vane-extension-release.toml` to that release's exact official source commit.
-Production qualification uses its exact PyPI runtime wheels and the production
-signer. Updating this pin does not
+The release manifest selects Vane v0.3.0, commit
+`d301592c1dfc8314a84ac8ee32d6594359b492ea`. A normal release dispatch requires
+all 15 base wheels on PyPI. TestPyPI-only staging requires the same complete
+runtime matrix on TestPyPI instead. Both use the exact release source and the
+production signer, retaining production-key ancestry and environment approval.
+Updating this pin does not
 publish the provider or establish production qualification; the full protected
 release workflow is still required. Development versions, local versions,
 missing or yanked runtime wheels, and a different source/tool identity fail
@@ -125,6 +124,25 @@ Use `build-only` for PRs. A `testpypi-dev` dispatch also requires the exact
 development Vane version and its full platform matrix to be published on
 TestPyPI first. Ordinary
 TestPyPI dev runtimes trust the dedicated TestPyPI key, not the public CI key.
+
+To stage Lance before its tagged Vane runtime is available on PyPI, dispatch:
+
+```bash
+gh workflow run VaneExtension.yml --repo AstroVela/lance-duckdb \
+  --ref main_vane -f operation=release -F testpypi-only=true
+```
+
+This stages `vane-extension-lance==0.3.0.1`, requires
+`vane-ai===0.3.0`, and downloads every base wheel from TestPyPI. It runs the
+same native signature checks, five-runtime checks per platform, indexed-byte
+checks, local/Ray platform tests and Linux integration suites. All PyPI jobs
+are skipped. The switch defaults to `false` and is accepted only with
+`operation=release`; it does not change the development channel's signing key
+or version rules.
+
+Retry failed jobs in the same run to retain the immutable staged candidate.
+A later normal `release` dispatch builds a new candidate and must increment
+Lance's `release_number`; it cannot rebuild this already published version.
 
 ## One build, two indexes
 
@@ -206,8 +224,8 @@ OIDC identity used for package-index uploads and provenance attestations.
 
 Development qualification uses the exact cross-platform revision in
 `vane-extension.toml`. Production qualification uses the separate published
-runtime pin in `vane-extension-release.toml`, currently Vane v0.2.0,
-`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`.
+runtime pin in `vane-extension-release.toml`, currently Vane v0.3.0,
+`d301592c1dfc8314a84ac8ee32d6594359b492ea`.
 
 All installed-wheel integration tests leave `VANE_RUNNER` unset and use no
 runner-selection APIs. The scan, write, and smoke suites share an owned Ray
