@@ -326,15 +326,19 @@ def test_reusable_jobs_keep_signing_keys_out_and_preserve_artifact_ids():
         assert "secrets" not in prepare and "secrets" not in package
         assert (
             package["with"]["prepared-id"]
-            == f"${{{{ needs.vane-provider-prepare-{platform}.outputs.artifact_id }}}}"
+            == f"${{{{ needs.provider-release-preflight.outputs.{platform}_artifact_id || needs.vane-provider-prepare-{platform}.outputs.artifact_id }}}}"
         )
         assert (
             package["with"]["signed-id"]
-            == "${{ needs.vane-provider-sign.outputs.artifact_id }}"
+            == "${{ needs.provider-release-preflight.outputs.signed_artifact_id || needs.vane-provider-sign.outputs.artifact_id }}"
         )
     for filename in ("_vane_provider_native.yml", "_vane_provider_package.yml"):
         reusable = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
-        assert reusable["permissions"] == {"contents": "read"}
+        assert reusable["permissions"] == (
+            {"contents": "read", "actions": "read"}
+            if filename == "_vane_provider_package.yml"
+            else {"contents": "read"}
+        )
         assert "secrets" not in reusable[True]["workflow_call"]
         for job in reusable["jobs"].values():
             assert "environment" not in job

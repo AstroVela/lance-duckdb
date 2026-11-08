@@ -480,7 +480,11 @@ def test_publishing_native_jobs_isolate_keys_from_build_and_package_code() -> No
     ):
         job = jobs[name]
         assert "environment" not in job
-        assert job["permissions"] == {"contents": "read"}
+        assert job["permissions"] == (
+            {"contents": "read", "actions": "read"}
+            if phase == "package"
+            else {"contents": "read"}
+        )
         assert "secrets[" not in str(job) and "secrets." not in str(job)
         commands = "\n".join(step.get("run", "") for step in job["steps"])
         assert f"--phase {phase}" in commands
@@ -594,7 +598,6 @@ def test_every_release_stage_downloads_the_original_immutable_artifact_ids() -> 
             "vane-provider-prepare-macos",
             "vane-provider-prepare-windows",
         },
-        "vane-testpypi-wheels": {"vane-provider-prepare", "vane-provider-sign"},
         "assemble-testpypi-lance": {
             "vane-testpypi-wheels",
             "vane-testpypi-wheels-macos",
@@ -627,6 +630,22 @@ def test_every_release_stage_downloads_the_original_immutable_artifact_ids() -> 
         assert all(
             step["merge-multiple"] is True and "name" not in step for step in downloads
         )
+    downloads = [
+        step["with"]
+        for step in jobs["vane-testpypi-wheels"]["steps"]
+        if step.get("uses", "").startswith("actions/download-artifact@")
+    ]
+    assert {step["artifact-ids"] for step in downloads} == {
+        "${{ needs.provider-release-preflight.outputs.linux_artifact_id || needs.vane-provider-prepare.outputs.artifact_id }}",
+        "${{ needs.provider-release-preflight.outputs.signed_artifact_id || needs.vane-provider-sign.outputs.artifact_id }}",
+    }
+    assert all(
+        step["run-id"]
+        == "${{ needs.provider-release-preflight.outputs.native_run_id || github.run_id }}"
+        and step["github-token"] == "${{ github.token }}"
+        and step["digest-mismatch"] == "error"
+        for step in downloads
+    )
 
 
 @pytest.mark.parametrize("suite", ["smoke", "ray"])

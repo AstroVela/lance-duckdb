@@ -24,6 +24,10 @@ on:
         description: Stage a release with TestPyPI runtimes and stop after qualification
         type: boolean
         default: false
+      native-run-id:
+        description: Reuse signed native inputs from an unpublished release run
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ inputs.operation || 'ci' }}
@@ -165,13 +169,13 @@ jobs:
             scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py \
             scripts/sign_vane_dynamic_bundle.py scripts/vane_platform_release.py \
             scripts/verify_vane_platform.py scripts/bootstrap_vane_dependencies.py \
-            scripts/hide_msvc_archive_exports.py
+            scripts/hide_msvc_archive_exports.py scripts/reuse_vane_native.py
           python -m compileall -q \
             python/tests \
             scripts/build_vane_dynamic_wheel.py scripts/vane_release_preflight.py \
             scripts/sign_vane_dynamic_bundle.py scripts/vane_platform_release.py \
             scripts/verify_vane_platform.py scripts/bootstrap_vane_dependencies.py \
-            scripts/hide_msvc_archive_exports.py
+            scripts/hide_msvc_archive_exports.py scripts/reuse_vane_native.py
 
   vane-provider-release-tooling:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -205,7 +209,8 @@ jobs:
             python/tests/test_vane_dynamic_signing.py \
             python/tests/test_vane_provider_release.py \
             python/tests/test_vane_platform_release.py \
-            python/tests/test_msvc_archive_exports.py
+            python/tests/test_msvc_archive_exports.py \
+            python/tests/test_vane_release_reuse.py
 
   vane-native-build:
     name: Build and test Vane ABI
@@ -1211,6 +1216,7 @@ jobs:
       signing-profile: ci-test
 
   vane-provider-prepare-macos:
+    if: inputs.native-run-id == ''
     needs: provider-release-preflight
     uses: ./.github/workflows/_vane_provider_native.yml
     with:
@@ -1220,7 +1226,11 @@ jobs:
       signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
 
   vane-testpypi-wheels-macos:
+    if: ${{ !cancelled() && needs.provider-release-preflight.result == 'success' && (needs.vane-provider-sign.result == 'success' || inputs.native-run-id != '') }}
     needs: [provider-release-preflight, vane-provider-prepare-macos, vane-provider-sign]
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/_vane_provider_package.yml
     with:
       platform: macos
@@ -1228,8 +1238,9 @@ jobs:
       signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
       vane-version: ${{ needs.provider-release-preflight.outputs.vane_version }}
       runtime-index: ${{ inputs.operation == 'release' && !inputs.testpypi-only && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
-      prepared-id: ${{ needs.vane-provider-prepare-macos.outputs.artifact_id }}
-      signed-id: ${{ needs.vane-provider-sign.outputs.artifact_id }}
+      prepared-id: ${{ needs.provider-release-preflight.outputs.macos_artifact_id || needs.vane-provider-prepare-macos.outputs.artifact_id }}
+      signed-id: ${{ needs.provider-release-preflight.outputs.signed_artifact_id || needs.vane-provider-sign.outputs.artifact_id }}
+      artifact-run-id: ${{ needs.provider-release-preflight.outputs.native_run_id }}
 
   vane-dynamic-provider-windows:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -1241,6 +1252,7 @@ jobs:
       signing-profile: ci-test
 
   vane-provider-prepare-windows:
+    if: inputs.native-run-id == ''
     needs: provider-release-preflight
     uses: ./.github/workflows/_vane_provider_native.yml
     with:
@@ -1250,7 +1262,11 @@ jobs:
       signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
 
   vane-testpypi-wheels-windows:
+    if: ${{ !cancelled() && needs.provider-release-preflight.result == 'success' && (needs.vane-provider-sign.result == 'success' || inputs.native-run-id != '') }}
     needs: [provider-release-preflight, vane-provider-prepare-windows, vane-provider-sign]
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/_vane_provider_package.yml
     with:
       platform: windows
@@ -1258,8 +1274,9 @@ jobs:
       signing-profile: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
       vane-version: ${{ needs.provider-release-preflight.outputs.vane_version }}
       runtime-index: ${{ inputs.operation == 'release' && !inputs.testpypi-only && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
-      prepared-id: ${{ needs.vane-provider-prepare-windows.outputs.artifact_id }}
-      signed-id: ${{ needs.vane-provider-sign.outputs.artifact_id }}
+      prepared-id: ${{ needs.provider-release-preflight.outputs.windows_artifact_id || needs.vane-provider-prepare-windows.outputs.artifact_id }}
+      signed-id: ${{ needs.provider-release-preflight.outputs.signed_artifact_id || needs.vane-provider-sign.outputs.artifact_id }}
+      artifact-run-id: ${{ needs.provider-release-preflight.outputs.native_run_id }}
 
   provider-release-preflight:
     if: inputs.operation == 'testpypi-dev' || inputs.operation == 'release'
@@ -1268,19 +1285,33 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
     outputs:
       vane_version: ${{ steps.release.outputs.vane_version }}
+      native_run_id: ${{ steps.reuse.outputs.native_run_id }}
+      linux_artifact_id: ${{ steps.reuse.outputs.linux_artifact_id }}
+      macos_artifact_id: ${{ steps.reuse.outputs.macos_artifact_id }}
+      windows_artifact_id: ${{ steps.reuse.outputs.windows_artifact_id }}
+      signed_artifact_id: ${{ steps.reuse.outputs.signed_artifact_id }}
     env:
       VANE_MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
     steps:
       - name: Require the protected official release branch
         shell: bash
+        env:
+          NATIVE_RUN_ID: ${{ inputs.native-run-id }}
+          RELEASE_CHANNEL: ${{ inputs.operation }}
+          TESTPYPI_ONLY: ${{ inputs.testpypi-only || false }}
         run: |
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_REPOSITORY" = AstroVela/lance-duckdb
           test "$GITHUB_REF" = refs/heads/main_vane
           test "$GITHUB_REF_PROTECTED" = true
+          if [ -n "$NATIVE_RUN_ID" ]; then
+            test "$RELEASE_CHANNEL" = release
+            test "$TESTPYPI_ONLY" = true
+          fi
 
       - name: Checkout release inputs
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -1296,7 +1327,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install release preflight tooling
-        run: python -m pip install -r vane-extension-ci-tools/requirements-release.txt "setuptools-scm>=9.2.0"
+        run: python -m pip install -r vane-extension-ci-tools/requirements-release.txt "setuptools-scm>=9.2.0" pytest pyyaml
 
       - name: Read the selected exact integration manifest
         id: manifest
@@ -1313,6 +1344,16 @@ jobs:
           path: vane
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify release regression tests before selecting native inputs
+        run: |
+          python -m pytest -q \
+            python/tests/test_vane_dynamic_wheel.py \
+            python/tests/test_vane_dynamic_signing.py \
+            python/tests/test_vane_provider_release.py \
+            python/tests/test_vane_platform_release.py \
+            python/tests/test_msvc_archive_exports.py \
+            python/tests/test_vane_release_reuse.py
 
       - name: Reject invalid release inputs before native builds or key access
         id: release
@@ -1331,7 +1372,30 @@ jobs:
             --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
             --github-output "$GITHUB_OUTPUT" "${arguments[@]}"
 
+      - name: Select only verified original native artifact IDs
+        if: inputs.native-run-id != ''
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_RUN_ID: ${{ inputs.native-run-id }}
+          VANE_VERSION: ${{ steps.release.outputs.vane_version }}
+        run: |
+          python -I scripts/reuse_vane_native.py \
+            --run-id "$NATIVE_RUN_ID" --extension-root . \
+            --vane-version "$VANE_VERSION" --github-output "$GITHUB_OUTPUT" \
+            --proof-file "$RUNNER_TEMP/reused-native-origin.json"
+
+      - name: Retain the original native source and artifact identities
+        if: inputs.native-run-id != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: reused-native-origin
+          path: ${{ runner.temp }}/reused-native-origin.json
+          if-no-files-found: error
+          retention-days: 30
+
   vane-provider-prepare:
+    if: inputs.native-run-id == ''
     name: Prepare unsigned Lance native data without secrets
     needs: provider-release-preflight
     runs-on: ubuntu-24.04
@@ -1544,6 +1608,7 @@ jobs:
           retention-days: 30
 
   vane-provider-sign:
+    if: inputs.native-run-id == ''
     name: Sign native data without build or package dependencies
     needs: [vane-provider-prepare, vane-provider-prepare-macos, vane-provider-prepare-windows]
     runs-on: ubuntu-24.04
@@ -1621,6 +1686,7 @@ jobs:
           retention-days: 30
 
   vane-testpypi-wheels:
+    if: ${{ !cancelled() && needs.provider-release-preflight.result == 'success' && (needs.vane-provider-sign.result == 'success' || inputs.native-run-id != '') }}
     name: Package and verify signed provider wheels without secrets
     needs: [provider-release-preflight, vane-provider-prepare, vane-provider-sign]
     runs-on: ubuntu-24.04
@@ -1629,6 +1695,7 @@ jobs:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
     permissions:
       contents: read
+      actions: read
     outputs:
       vane_version: ${{ needs.provider-release-preflight.outputs.vane_version }}
       artifact_id: ${{ steps.candidate.outputs.artifact-id }}
@@ -1676,7 +1743,9 @@ jobs:
       - name: Download the original license bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          artifact-ids: ${{ needs.vane-provider-prepare.outputs.artifact_id }}
+          artifact-ids: ${{ needs.provider-release-preflight.outputs.linux_artifact_id || needs.vane-provider-prepare.outputs.artifact_id }}
+          run-id: ${{ needs.provider-release-preflight.outputs.native_run_id || github.run_id }}
+          github-token: ${{ github.token }}
           merge-multiple: true
           path: prepared
           digest-mismatch: error
@@ -1684,7 +1753,9 @@ jobs:
       - name: Download the original signed native artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          artifact-ids: ${{ needs.vane-provider-sign.outputs.artifact_id }}
+          artifact-ids: ${{ needs.provider-release-preflight.outputs.signed_artifact_id || needs.vane-provider-sign.outputs.artifact_id }}
+          run-id: ${{ needs.provider-release-preflight.outputs.native_run_id || github.run_id }}
+          github-token: ${{ github.token }}
           merge-multiple: true
           path: signed
           digest-mismatch: error
