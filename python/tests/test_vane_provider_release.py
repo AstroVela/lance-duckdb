@@ -28,7 +28,7 @@ sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
 
 VANE_VERSION = "0.2.0.dev612"
-PROVIDER_VERSION = "0.2.0.1.dev612"
+PROVIDER_VERSION = "0.2.0.2.dev612"
 INTERPRETERS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 PLATFORM = "manylinux_2_28_x86_64"
 PLATFORMS = (PLATFORM, "macosx_15_0_arm64", "win_amd64")
@@ -111,7 +111,7 @@ def test_config_declares_the_built_lance_matrix() -> None:
     assert config.platforms == PLATFORMS
     assert config.max_wheel_bytes == 100_000_000
     assert config.providers == (
-        release.Provider("lance", "vane-extension-lance", (), 1),
+        release.Provider("lance", "vane-extension-lance", (), 2),
     )
     native = release._load_source_tools()
     manifest = native.load_manifest(ROOT / "vane-extension.toml", ROOT)
