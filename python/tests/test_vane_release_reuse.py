@@ -381,3 +381,35 @@ def test_recovery_workflow_skips_all_compilation_and_signing_jobs():
             )
             assert step["with"]["github-token"] == "${{ github.token }}"
             assert step["with"]["digest-mismatch"] == "error"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "assemble-testpypi-lance",
+        "publish-testpypi-lance",
+        "verify-testpypi-lance",
+        "testpypi-smoke-lance-integration",
+        "testpypi-ray-lance-integration",
+        "testpypi-platform-lance-integration",
+        "verify-pypi-promotion",
+        "publish-pypi-lance",
+        "verify-pypi-lance",
+    ],
+)
+def test_release_descendants_require_successful_direct_inputs_after_skipped_native_jobs(
+    name,
+):
+    jobs = yaml.safe_load((ROOT / reuse.WORKFLOW).read_text())["jobs"]
+    job = jobs[name]
+    condition = job.get("if", "")
+    # GitHub's implicit success() also sees skipped ancestors. A status function
+    # must override it throughout the release graph, while every actual input
+    # must still succeed (including on build-only, failed and cancelled runs).
+    assert "!cancelled()" in condition, name
+    assert "||" not in condition, name
+    dependencies = job["needs"]
+    if isinstance(dependencies, str):
+        dependencies = [dependencies]
+    for dependency in dependencies:
+        assert f"needs.{dependency}.result == 'success'" in condition, name
