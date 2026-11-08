@@ -821,7 +821,8 @@ def test_failed_distributed_lance_update_keeps_the_target_unchanged(
         initial_deletion_file_count = _deletion_file_count(connection, target_path)
 
         previous_dispatch_count = write_capture.dispatch_count
-        with pytest.raises(Exception, match="NULL|NOT NULL|worker mutation"):
+        # Require the underlying Rust error, not only the generic C++ prefix.
+        with pytest.raises(Exception, match="NULL|NOT NULL|non-nullable"):
             connection.table("lance_mutation.main.mutation_target").update(
                 {
                     "value": vane.SQLExpression(

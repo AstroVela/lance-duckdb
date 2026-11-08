@@ -44,14 +44,17 @@ def main():
                 "extension signature and identity checks must remain enabled"
             )
         vane.load_installed_extension("lance", connection=connection)
-        root = args.directory.resolve().as_posix().replace("'", "''")
+        namespace = args.directory / "mutation path 更新"
+        namespace.mkdir()
+        root = namespace.resolve().as_posix().replace("'", "''")
         connection.execute(f"ATTACH '{root}' AS lance_platform (TYPE LANCE)")
-        connection.sql("SELECT i::BIGINT AS id FROM range(8) AS source(i)").create(
-            "lance_platform.main.records"
-        )
-        connection.sql("SELECT 8::BIGINT AS id").insert_into(
-            "lance_platform.main.records"
-        )
+        connection.sql(
+            "SELECT i::BIGINT AS id, 'original'::VARCHAR AS value "
+            "FROM range(8) AS source(i)"
+        ).create("lance_platform.main.records")
+        connection.sql(
+            "SELECT 8::BIGINT AS id, 'original'::VARCHAR AS value"
+        ).insert_into("lance_platform.main.records")
         rows = connection.execute(
             "SELECT count(*), sum(id)::BIGINT FROM lance_platform.main.records"
         ).fetchall()
@@ -59,6 +62,45 @@ def main():
             raise RuntimeError(
                 f"incorrect {args.runner} Lance read/write result: {rows}"
             )
+        connection.table("lance_platform.main.records").update(
+            {"value": vane.lit("updated")}, condition=vane.col("id") < 3
+        )
+        rows = connection.execute(
+            "SELECT id, value FROM lance_platform.main.records ORDER BY id"
+        ).fetchall()
+        if rows != [(i, "updated" if i < 3 else "original") for i in range(9)]:
+            raise RuntimeError(f"incorrect {args.runner} Lance UPDATE result: {rows}")
+
+        # The append is a whole fragment; id=1 also exercises a deletion file.
+        connection.table("lance_platform.main.records").delete(
+            condition=vane.col("id") == 8
+        )
+        connection.table("lance_platform.main.records").delete(
+            condition=vane.col("id") == 1
+        )
+        rows = connection.execute(
+            "SELECT id, value FROM lance_platform.main.records ORDER BY id"
+        ).fetchall()
+        if rows != [
+            (i, "updated" if i < 3 else "original") for i in range(8) if i != 1
+        ]:
+            raise RuntimeError(f"incorrect {args.runner} Lance DELETE result: {rows}")
+
+        connection.table("lance_platform.main.records").update(
+            {"value": vane.lit("all-updated")}
+        )
+        rows = connection.execute(
+            "SELECT id, value FROM lance_platform.main.records ORDER BY id"
+        ).fetchall()
+        if rows != [(i, "all-updated") for i in range(8) if i != 1]:
+            raise RuntimeError(
+                f"incorrect {args.runner} Lance full UPDATE result: {rows}"
+            )
+        connection.table("lance_platform.main.records").delete()
+        if connection.execute(
+            "SELECT count(*) FROM lance_platform.main.records"
+        ).fetchone() != (0,):
+            raise RuntimeError(f"incorrect {args.runner} Lance full DELETE result")
     finally:
         connection.close()
         vane.teardown_runner()

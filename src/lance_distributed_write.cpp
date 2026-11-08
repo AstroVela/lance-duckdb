@@ -2693,6 +2693,10 @@ LanceDistributedWriteCombine(ExecutionContext &context,
           global.transport.set_expr_irs[index].data()));
       set_expr_lengths.push_back(global.transport.set_expr_irs[index].size());
     }
+    // Resolving the redaction policy calls Rust path normalization, which
+    // clears the thread-local error on success. Do it before the mutation.
+    const auto redact_error = LanceVanePathRequiresRedaction(
+        context.client, global.transport.dataset_uri);
     auto *encoded = lance_distributed_create_mutation_transaction(
         global.open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(),
@@ -2716,10 +2720,8 @@ LanceDistributedWriteCombine(ExecutionContext &context,
     if (!encoded) {
       throw IOException(
           "Failed to create distributed Lance worker mutation transaction" +
-          LanceVaneFormatErrorSuffix(
-              global.transport.dataset_uri,
-              LanceVanePathRequiresRedaction(context.client,
-                                             global.transport.dataset_uri)));
+          LanceVaneFormatErrorSuffix(global.transport.dataset_uri,
+                                     redact_error));
     }
     LanceUncommittedMutationTransactionGuard transaction_guard(
         encoded, global.transport, global.open_path, global.option_keys,

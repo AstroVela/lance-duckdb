@@ -15,7 +15,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance_arrow::RecordBatchExt;
-use lance_io::object_store::WrappingObjectStore;
+use lance_io::object_store::{uri_to_url, WrappingObjectStore};
 use lance_table::format::{Fragment, RowIdMeta};
 use lance_table::io::deletion::relative_deletion_file_path;
 use lance_table::rowids::{rechunk_sequences, write_row_ids, RowIdSequence};
@@ -700,17 +700,14 @@ async fn open_dataset(
 }
 
 fn mutation_worker_uri(path: &str) -> FfiResult<String> {
-    let parsed = Url::parse(path).ok();
-    if parsed
-        .as_ref()
-        .is_some_and(|url| !matches!(url.scheme(), "file" | "file+uring"))
-    {
+    let url = uri_to_url(path)
+        .map_err(|err| mutation_error(format!("parse distributed mutation target: {err}")))?;
+    if !matches!(url.scheme(), "file" | "file+uring") {
         return Ok(path.to_string());
     }
-    let local_path = match parsed {
-        Some(url) => std::path::PathBuf::from(url.path()),
-        None => std::path::PathBuf::from(path),
-    };
+    let local_path = url.to_file_path().map_err(|_| {
+        mutation_error(format!("decode local distributed mutation target '{path}'"))
+    })?;
     let absolute = std::fs::canonicalize(&local_path).map_err(|err| {
         mutation_error(format!(
             "resolve local distributed mutation target '{}': {err}",
@@ -2296,6 +2293,40 @@ mod tests {
     const OPERATION_ID: &str = "00000000-0000-4000-8000-000000000001";
     const QUERY_ID: &str = "query";
     const SCHEMA_FINGERPRINT: &str = "00000000000000000000000000000000";
+
+    #[test]
+    fn local_mutation_worker_paths_use_the_tracked_object_store() {
+        let path = std::env::temp_dir().join(format!(
+            "lance-mutation-{} space 更新 %20",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let absolute = std::fs::canonicalize(&path).unwrap();
+        let file_uri = Url::from_file_path(&absolute).unwrap().to_string();
+        let expected = file_uri.replacen("file:", "file-object-store:", 1);
+
+        // On Windows the raw path includes a drive letter, which Url::parse
+        // treats as a scheme. File URIs also need OS-specific percent decoding.
+        for target in [
+            path.to_str().unwrap().to_string(),
+            path.to_str().unwrap().replace('\\', "/"),
+            file_uri.clone(),
+            file_uri.replacen("file:", "file+uring:", 1),
+        ] {
+            assert_eq!(mutation_worker_uri(&target).unwrap(), expected, "{target}");
+        }
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn remote_mutation_worker_uris_are_preserved() {
+        for uri in [
+            "s3://bucket/mutation%20target.lance",
+            "memory://mutation-test",
+        ] {
+            assert_eq!(mutation_worker_uri(uri).unwrap(), uri);
+        }
+    }
 
     fn dataset() -> Dataset {
         let schema = Arc::new(Schema::new(vec![Field::new(
