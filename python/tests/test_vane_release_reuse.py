@@ -21,6 +21,29 @@ reuse = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(reuse)
 
 
+@pytest.mark.parametrize("guarded_cli", [False, True])
+def test_job_log_captures_raw_logs_with_old_and_current_gh(
+    monkeypatch, capsys, guarded_cli
+):
+    raw_log = "\x1b[36;1mRun preflight\x1b[0m\n  RELEASE_CHANNEL: release\n"
+
+    def command_output(command, *, text):
+        assert text is True
+        if command == ["gh", "api", "--help"]:
+            return "--allow-escape-sequences" if guarded_cli else "legacy gh api"
+        assert command[:4] == ["gh", "api", "--hostname", "github.com"]
+        assert command[-1].endswith("/actions/jobs/123/logs")
+        if guarded_cli and "--allow-escape-sequences" not in command:
+            raise subprocess.CalledProcessError(1, command)
+        if not guarded_cli:
+            assert "--allow-escape-sequences" not in command
+        return raw_log
+
+    monkeypatch.setattr(reuse.subprocess, "check_output", command_output)
+    assert reuse._job_log(123) == raw_log
+    assert capsys.readouterr().out == ""
+
+
 def _git(root, *args):
     return subprocess.check_output(
         ["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],

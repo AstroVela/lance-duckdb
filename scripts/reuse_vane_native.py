@@ -51,14 +51,14 @@ def _api(path: str) -> dict:
 
 
 def _job_log(job_id: int) -> str:
+    command = ["gh", "api", "--hostname", "github.com"]
+    help_text = subprocess.check_output(["gh", "api", "--help"], text=True)
+    if "--allow-escape-sequences" in help_text:
+        # These raw logs are captured for parsing, never sent to a terminal.
+        command.append("--allow-escape-sequences")
+    command.append(f"repos/{REPOSITORY}/actions/jobs/{job_id}/logs")
     return subprocess.check_output(
-        [
-            "gh",
-            "api",
-            "--hostname",
-            "github.com",
-            f"repos/{REPOSITORY}/actions/jobs/{job_id}/logs",
-        ],
+        command,
         text=True,
     )
 
