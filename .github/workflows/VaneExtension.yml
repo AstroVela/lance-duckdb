@@ -1835,6 +1835,11 @@ jobs:
           retention-days: 30
 
   assemble-testpypi-lance:
+    if: >-
+      ${{ !cancelled() &&
+          needs.vane-testpypi-wheels.result == 'success' &&
+          needs.vane-testpypi-wheels-macos.result == 'success' &&
+          needs.vane-testpypi-wheels-windows.result == 'success' }}
     name: Validate, attest, and sign TestPyPI Lance provider
     needs: [vane-testpypi-wheels, vane-testpypi-wheels-macos, vane-testpypi-wheels-windows]
     runs-on: ubuntu-24.04
@@ -1960,6 +1965,7 @@ jobs:
           retention-days: 30
 
   publish-testpypi-lance:
+    if: ${{ !cancelled() && needs.assemble-testpypi-lance.result == 'success' }}
     name: Publish Lance provider to TestPyPI
     needs: assemble-testpypi-lance
     runs-on: ubuntu-24.04
@@ -1988,6 +1994,10 @@ jobs:
           skip-existing: true
 
   verify-testpypi-lance:
+    if: >-
+      ${{ !cancelled() &&
+          needs.assemble-testpypi-lance.result == 'success' &&
+          needs.publish-testpypi-lance.result == 'success' }}
     name: Verify indexed Lance provider
     needs: [assemble-testpypi-lance, publish-testpypi-lance]
     runs-on: ubuntu-24.04
@@ -2048,6 +2058,10 @@ jobs:
             --version "${{ needs.assemble-testpypi-lance.outputs.lance_version }}"
 
   testpypi-smoke-lance-integration:
+    if: >-
+      ${{ !cancelled() &&
+          needs.assemble-testpypi-lance.result == 'success' &&
+          needs.verify-testpypi-lance.result == 'success' }}
     name: TestPyPI default Ray Lance smoke
     needs: [assemble-testpypi-lance, verify-testpypi-lance]
     runs-on: ubuntu-24.04
@@ -2129,6 +2143,10 @@ jobs:
             python/tests/test_vane_single_scan.py
 
   testpypi-ray-lance-integration:
+    if: >-
+      ${{ !cancelled() &&
+          needs.assemble-testpypi-lance.result == 'success' &&
+          needs.verify-testpypi-lance.result == 'success' }}
     name: TestPyPI two-worker Ray Lance integration
     needs: [assemble-testpypi-lance, verify-testpypi-lance]
     runs-on: ubuntu-24.04
@@ -2216,6 +2234,10 @@ jobs:
             python/tests/test_vane_distributed_scan.py::test_fragment_scan_uses_both_ray_execution_nodes
 
   testpypi-platform-lance-integration:
+    if: >-
+      ${{ !cancelled() &&
+          needs.assemble-testpypi-lance.result == 'success' &&
+          needs.verify-testpypi-lance.result == 'success' }}
     name: Test indexed Lance on ${{ matrix.platform }}
     needs: [assemble-testpypi-lance, verify-testpypi-lance]
     strategy:
@@ -2254,7 +2276,12 @@ jobs:
       - run: python -I extension/scripts/vane_platform_release.py indexed-smoke
 
   verify-pypi-promotion:
-    if: inputs.operation == 'release' && !inputs.testpypi-only
+    if: >-
+      ${{ !cancelled() && inputs.operation == 'release' && !inputs.testpypi-only &&
+          needs.assemble-testpypi-lance.result == 'success' &&
+          needs.testpypi-smoke-lance-integration.result == 'success' &&
+          needs.testpypi-ray-lance-integration.result == 'success' &&
+          needs.testpypi-platform-lance-integration.result == 'success' }}
     name: Approve and verify the immutable Lance promotion without OIDC
     needs:
       - assemble-testpypi-lance
@@ -2319,7 +2346,10 @@ jobs:
             --vane-version "$VANE_VERSION"
 
   publish-pypi-lance:
-    if: inputs.operation == 'release' && !inputs.testpypi-only
+    if: >-
+      ${{ !cancelled() && inputs.operation == 'release' && !inputs.testpypi-only &&
+          needs.assemble-testpypi-lance.result == 'success' &&
+          needs.verify-pypi-promotion.result == 'success' }}
     name: Publish only the original verified Lance candidate to PyPI
     needs: [assemble-testpypi-lance, verify-pypi-promotion]
     runs-on: ubuntu-24.04
@@ -2348,7 +2378,10 @@ jobs:
           skip-existing: true
 
   verify-pypi-lance:
-    if: inputs.operation == 'release' && !inputs.testpypi-only
+    if: >-
+      ${{ !cancelled() && inputs.operation == 'release' && !inputs.testpypi-only &&
+          needs.assemble-testpypi-lance.result == 'success' &&
+          needs.publish-pypi-lance.result == 'success' }}
     name: Verify the indexed Lance production release without OIDC
     needs: [assemble-testpypi-lance, publish-pypi-lance]
     runs-on: ubuntu-24.04

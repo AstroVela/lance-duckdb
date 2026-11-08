@@ -409,7 +409,7 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
         "vane-provider-sign",
     }
     promotion = jobs["verify-pypi-promotion"]
-    assert promotion["if"] == "inputs.operation == 'release' && !inputs.testpypi-only"
+    assert "inputs.operation == 'release' && !inputs.testpypi-only" in promotion["if"]
     assert set(promotion["needs"]) == {
         "assemble-testpypi-lance",
         "testpypi-smoke-lance-integration",
@@ -423,7 +423,7 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
         for step in promotion["steps"]
     )
     publish = jobs["publish-pypi-lance"]
-    assert publish["if"] == "inputs.operation == 'release' && !inputs.testpypi-only"
+    assert "inputs.operation == 'release' && !inputs.testpypi-only" in publish["if"]
     assert set(publish["needs"]) == {"assemble-testpypi-lance", "verify-pypi-promotion"}
     assert publish["environment"]["name"] == "pypi"
     assert publish["permissions"] == {"contents": "read", "id-token": "write"}
@@ -441,7 +441,7 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
     assert steps[1]["with"]["packages-dir"] == "dist"
     assert steps[1]["with"]["repository-url"] == "https://upload.pypi.org/legacy/"
     indexed = jobs["verify-pypi-lance"]
-    assert indexed["if"] == "inputs.operation == 'release' && !inputs.testpypi-only"
+    assert "inputs.operation == 'release' && !inputs.testpypi-only" in indexed["if"]
     assert set(indexed["needs"]) == {"assemble-testpypi-lance", "publish-pypi-lance"}
     assert indexed["permissions"] == {"contents": "read"}
     assert "environment" not in indexed

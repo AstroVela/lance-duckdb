@@ -172,6 +172,11 @@ check signed bytes against the original unsigned inputs, audit exports,
 package all five interpreters and run local/Ray qualification before assembly.
 Upload approval and indexed qualification remain in the existing workflow.
 
+Every downstream release job must explicitly check its direct inputs
+with a status function such as `!cancelled()`: GitHub's implicit `success()`
+also propagates skipped native/signing ancestors. Assembly, uploads and indexed
+qualification keep requiring successful direct inputs.
+
 For a packaging-only recovery, retain `[skip ci]` in the fix and squash commit
 messages to avoid unrelated automatic compilation workflows. The protected
 manual dispatch runs the focused release regression tests before selecting
