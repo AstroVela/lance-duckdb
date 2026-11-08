@@ -1712,7 +1712,7 @@ jobs:
       - name: Read exact provider packaging tools pin
         id: provider_packaging
         run: |
-          python - <<'PY'
+          "$VANE_PYTHON" - <<'PY'
           import os, tomllib
           from pathlib import Path
           with Path("extension/vane-provider-release.toml").open("rb") as source:
