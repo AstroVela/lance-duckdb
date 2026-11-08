@@ -355,6 +355,94 @@ def test_packaging_rejects_replacement_before_native_audit_or_wheel_build(
     package.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "directory", ["signed/linux", "signed/mac os", "signed/windows"]
+)
+def test_package_reads_relative_signed_artifacts_after_changing_directory(
+    directory, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    payload = b"native payload" * 100
+    original = Path("prepared/artifacts/lance.duckdb_extension")
+    original.parent.mkdir(parents=True)
+    original.write_bytes(payload + b"\0" * 256)
+    signed = Path(directory) / "lance.duckdb_extension"
+    signed.parent.mkdir(parents=True)
+    signed.write_bytes(payload + b"s" * 256)
+    licenses = Path("prepared/licenses/lance")
+    licenses.mkdir(parents=True)
+    for name in (
+        "Lance-DuckDB-Apache-2.0.txt",
+        "Vane-runtime-licenses.txt",
+        "Rust-third-party-licenses.txt",
+        "Rust-standard-library-licenses.html",
+    ):
+        (licenses / name).write_text("license data\n")
+    runtime = tmp_path / "vane_ai-0.3.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+    runtime.touch()
+    arguments = _phase_arguments(
+        "package", "production", signed_artifact=signed, runtime_wheel=[runtime]
+    )
+    output = tmp_path / "dist"
+    output.mkdir()
+
+    def audit(artifact):
+        # Native tools also read this argument after switching to artifact.parent.
+        actual = subprocess.check_output(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import sys; from pathlib import Path; "
+                "sys.stdout.buffer.write(Path(sys.argv[1]).read_bytes())",
+                str(artifact),
+            ],
+            cwd=artifact.parent,
+        )
+        assert actual == payload + b"s" * 256
+
+    def package(**values):
+        assert values["signed"].read_bytes() == payload + b"s" * 256
+        wheel = values["staging"] / (
+            f"vane_extension_lance-0.3.0.1-cp312-none-{values['platform_tag']}.whl"
+        )
+        wheel.write_bytes(b"qualified wheel")
+        return (wheel,)
+
+    monkeypatch.setattr(builder, "_require_self_contained_artifact", audit)
+    monkeypatch.setattr(builder, "_build_provider_matrix", package)
+    assert builder._package_signed(arguments, tmp_path, tmp_path / "build", output) == 0
+    assert len(list(output.glob("*.whl"))) == 1
+
+
+@pytest.mark.parametrize("link_parent", [False, True])
+def test_package_relative_signed_paths_still_reject_symlinks(
+    link_parent, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    payload = b"native payload" * 100
+    original = Path("prepared/artifacts/lance.duckdb_extension")
+    original.parent.mkdir(parents=True)
+    original.write_bytes(payload + b"\0" * 256)
+    actual = tmp_path / "real/lance.duckdb_extension"
+    actual.parent.mkdir()
+    actual.write_bytes(payload + b"s" * 256)
+    signed = Path("signed/lance.duckdb_extension")
+    if link_parent:
+        signed.parent.symlink_to(actual.parent, target_is_directory=True)
+    else:
+        signed.parent.mkdir()
+        signed.symlink_to(actual)
+    arguments = _phase_arguments("package", "production", signed_artifact=signed)
+    audit = Mock()
+    monkeypatch.setattr(builder, "_require_self_contained_artifact", audit)
+    with pytest.raises(builder.QualificationError, match="artifacts.*non-symlink"):
+        builder._package_signed(
+            arguments, tmp_path, tmp_path / "build", tmp_path / "dist"
+        )
+    audit.assert_not_called()
+
+
 @pytest.mark.parametrize("profile", ["production", "ci-test", "testpypi"])
 def test_cmake_enables_only_the_selected_testing_key(
     profile, tmp_path, monkeypatch

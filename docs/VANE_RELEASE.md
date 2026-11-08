@@ -144,6 +144,40 @@ Retry failed jobs in the same run to retain the immutable staged candidate.
 A later normal `release` dispatch builds a new candidate and must increment
 Lance's `release_number`; it cannot rebuild this already published version.
 
+### Recover packaging without compiling again
+
+If native preparation and signing succeeded but packaging failed before any
+index upload, a reviewed packaging correction can reuse those original inputs:
+
+```bash
+gh workflow run VaneExtension.yml --repo AstroVela/lance-duckdb \
+  --ref main_vane -f operation=release -F testpypi-only=true \
+  -f native-run-id=42449970361
+```
+
+The source must be a completed official `main_vane` release run. All three
+native producers, signing and the original preflight must have succeeded;
+publication must have been skipped, and the candidate must remain absent from
+both indexes. Recovery rejects expired, duplicate or mismatched artifacts.
+It retains each producer's original artifact ID and digest and records the
+original native commit separately from the recovery workflow commit.
+
+The native sources, dependency and SDK pins, native build configuration and
+signing job must remain unchanged. Only packaging orchestration, tests,
+documentation and the builder's `_package_signed` function may differ.
+Changes to native inputs require a fresh build. Recovery is restricted to
+TestPyPI-only staging and skips all native preparation and signing jobs,
+including their protected signing environment. The native platform jobs still
+check signed bytes against the original unsigned inputs, audit exports,
+package all five interpreters and run local/Ray qualification before assembly.
+Upload approval and indexed qualification remain in the existing workflow.
+
+For a packaging-only recovery, retain `[skip ci]` in the fix and squash commit
+messages to avoid unrelated automatic compilation workflows. The protected
+manual dispatch runs the focused release regression tests before selecting
+any retained native inputs. Review its packaging and qualification jobs before
+approving the TestPyPI upload.
+
 ## One build, two indexes
 
 The release channel reuses the existing candidate jobs:

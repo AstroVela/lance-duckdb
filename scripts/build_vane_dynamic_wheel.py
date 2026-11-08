@@ -892,7 +892,7 @@ def _prepared_licenses(bundle: Path) -> tuple[Path, ...]:
 def _package_signed(
     arguments, vane_source: Path, build_directory: Path, output_directory: Path
 ) -> int:
-    signed = arguments.signed_artifact
+    signed = arguments.signed_artifact.absolute()
     _require_original_payload(
         arguments.bundle_directory / "artifacts" / f"{EXTENSION_NAME}.duckdb_extension",
         signed,
