@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: [ubuntu-24.04, macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     defaults:
@@ -32,3 +32,5 @@ jobs:
         run: python -m pip install cmake==4.4.4 ninja==1.13.2 pytest==9.1.1
       - name: Check single and multi-config Cargo build graphs
         run: python test/cmake/test_rust_profiles.py
+      - name: Compile and load the native provider linker contract
+        run: python test/cmake/test_vane_provider.py

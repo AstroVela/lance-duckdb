@@ -1043,7 +1043,9 @@ string LanceDistributedWriteProvider::Impl::ResolveReplayPath(
     throw NotImplementedException(
         "Distributed Lance writes require a replayable shared dataset URI");
   }
-  return replay_path;
+  // Freeze the same canonical path that worker storage resolution returns.
+  // Namespace joins can mix '/' with native Windows '\\' separators.
+  return LanceNormalizeDatasetPath(replay_path);
 }
 
 void LanceDistributedWriteProvider::Impl::InitializeInsert() {
