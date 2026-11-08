@@ -321,7 +321,7 @@ def test_production_and_development_manifests_pin_independent_engines() -> None:
     development = tomllib.loads((ROOT / "vane-extension.toml").read_text())
     production = tomllib.loads((ROOT / "vane-extension-release.toml").read_text())
     assert production["vane"].pop("revision") == (
-        "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
+        "d301592c1dfc8314a84ac8ee32d6594359b492ea"
     )
     assert development["vane"].pop("revision") == (
         "097758b773d6c5065527feb2da927cd1399d2cf0"
@@ -384,11 +384,19 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
     dispatch = workflow[True]["workflow_dispatch"]["inputs"]["operation"]
     assert dispatch["default"] == "build-only"
     assert dispatch["options"] == ["build-only", "testpypi-dev", "release"]
+    staging = workflow[True]["workflow_dispatch"]["inputs"]["testpypi-only"]
+    assert staging["type"] == "boolean"
+    assert staging["default"] is False
     jobs = workflow["jobs"]
     assert "inputs.operation != 'release'" in jobs["preflight"]["if"]
     preflight = jobs["provider-release-preflight"]
     assert "environment" not in preflight
     assert "secrets" not in str(preflight)
+    validation = next(
+        step for step in preflight["steps"] if step.get("id") == "release"
+    )
+    assert validation["env"]["TESTPYPI_ONLY"] == "${{ inputs.testpypi-only || false }}"
+    assert "--testpypi-only" in validation["run"]
     assert jobs["vane-provider-prepare"]["needs"] == "provider-release-preflight"
     assert set(jobs["vane-provider-sign"]["needs"]) == {
         "vane-provider-prepare",
@@ -401,7 +409,7 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
         "vane-provider-sign",
     }
     promotion = jobs["verify-pypi-promotion"]
-    assert promotion["if"] == "inputs.operation == 'release'"
+    assert promotion["if"] == "inputs.operation == 'release' && !inputs.testpypi-only"
     assert set(promotion["needs"]) == {
         "assemble-testpypi-lance",
         "testpypi-smoke-lance-integration",
@@ -415,7 +423,7 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
         for step in promotion["steps"]
     )
     publish = jobs["publish-pypi-lance"]
-    assert publish["if"] == "inputs.operation == 'release'"
+    assert publish["if"] == "inputs.operation == 'release' && !inputs.testpypi-only"
     assert set(publish["needs"]) == {"assemble-testpypi-lance", "verify-pypi-promotion"}
     assert publish["environment"]["name"] == "pypi"
     assert publish["permissions"] == {"contents": "read", "id-token": "write"}
@@ -433,10 +441,33 @@ def test_production_workflow_has_no_shortcut_around_qualification() -> None:
     assert steps[1]["with"]["packages-dir"] == "dist"
     assert steps[1]["with"]["repository-url"] == "https://upload.pypi.org/legacy/"
     indexed = jobs["verify-pypi-lance"]
+    assert indexed["if"] == "inputs.operation == 'release' && !inputs.testpypi-only"
     assert set(indexed["needs"]) == {"assemble-testpypi-lance", "publish-pypi-lance"}
     assert indexed["permissions"] == {"contents": "read"}
     assert "environment" not in indexed
     assert any("--index pypi" in step.get("run", "") for step in indexed["steps"])
+
+    runtime_index = (
+        "${{ inputs.operation == 'release' && !inputs.testpypi-only && "
+        "'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}"
+    )
+    for platform in ("macos", "windows"):
+        assert (
+            jobs[f"vane-testpypi-wheels-{platform}"]["with"]["runtime-index"]
+            == runtime_index
+        )
+    runtime_download = next(
+        step
+        for step in jobs["vane-testpypi-wheels"]["steps"]
+        if step["name"] == "Download every exact indexed Vane runtime wheel"
+    )
+    assert runtime_download["env"]["INDEX_URL"] == runtime_index
+    for name in (
+        "testpypi-smoke-lance-integration",
+        "testpypi-ray-lance-integration",
+        "testpypi-platform-lance-integration",
+    ):
+        assert jobs[name]["env"]["VANE_RUNTIME_INDEX_URL"] == runtime_index
 
 
 def test_publishing_native_jobs_isolate_keys_from_build_and_package_code() -> None:

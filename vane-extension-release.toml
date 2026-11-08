@@ -1,4 +1,4 @@
-# Production qualification uses the exact PyPI Vane v0.2.0 runtime wheels.
+# Release qualification uses the exact indexed Vane v0.3.0 runtime wheels.
 schema_version = 2
 name = "lance"
 extension_config = "extension_config_vane.cmake"
@@ -7,8 +7,8 @@ native_test_selection = "test/sql/dual_build_smoke.test"
 
 [vane]
 repository = "AstroVela/vane"
-# Vane v0.2.0.
-revision = "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
+# Vane v0.3.0.
+revision = "d301592c1dfc8314a84ac8ee32d6594359b492ea"
 
 [vcpkg]
 repository = "microsoft/vcpkg"

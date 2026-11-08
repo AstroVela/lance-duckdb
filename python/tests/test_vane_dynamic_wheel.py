@@ -433,14 +433,15 @@ def _runtime_document(version: str) -> dict:
 
 
 @pytest.mark.parametrize(
-    "channel,version,index",
+    "channel,version,index,testpypi_only",
     [
-        ("release", "0.2.0", "pypi"),
-        ("testpypi-dev", "0.2.0.dev612", "testpypi"),
+        ("release", "0.2.0", "pypi", False),
+        ("release", "0.3.0", "testpypi", True),
+        ("testpypi-dev", "0.2.0.dev612", "testpypi", False),
     ],
 )
 def test_preflight_requires_every_exact_runtime_from_only_the_selected_index(
-    channel, version, index, monkeypatch
+    channel, version, index, testpypi_only, monkeypatch
 ) -> None:
     root = SCRIPT.parents[1]
     release = preflight.load_release_tools(root)
@@ -448,7 +449,11 @@ def test_preflight_requires_every_exact_runtime_from_only_the_selected_index(
     request = Mock(return_value=(200, document))
     monkeypatch.setattr(release, "_request_json", request)
     preflight.require_indexed_runtime(
-        release, version, channel, root / "vane-provider-release.toml"
+        release,
+        version,
+        channel,
+        root / "vane-provider-release.toml",
+        testpypi_only=testpypi_only,
     )
     request.assert_called_once_with(
         f"{release.INDEX_JSON_BASES[index]}/vane-ai/{version}/json"
@@ -456,17 +461,26 @@ def test_preflight_requires_every_exact_runtime_from_only_the_selected_index(
     document["urls"].pop()
     with pytest.raises(ValueError, match="missing indexed wheels"):
         preflight.require_indexed_runtime(
-            release, version, channel, root / "vane-provider-release.toml"
+            release,
+            version,
+            channel,
+            root / "vane-provider-release.toml",
+            testpypi_only=testpypi_only,
         )
     request.return_value = (404, None)
     with pytest.raises(ValueError, match=f"not published on {index}"):
         preflight.require_indexed_runtime(
-            release, version, channel, root / "vane-provider-release.toml"
+            release,
+            version,
+            channel,
+            root / "vane-provider-release.toml",
+            testpypi_only=testpypi_only,
         )
 
 
+@pytest.mark.parametrize("testpypi_only", [False, True])
 def test_preparation_pin_cannot_bypass_release_version_preflight(
-    tmp_path, monkeypatch
+    testpypi_only, tmp_path, monkeypatch
 ) -> None:
     root = SCRIPT.parents[1]
     release = preflight.load_release_tools(root)
@@ -498,6 +512,7 @@ def test_preparation_pin_cannot_bypass_release_version_preflight(
                 "--github-output",
                 str(output),
             ]
+            + (["--testpypi-only"] if testpypi_only else [])
         )
     ancestry.assert_not_called()
     request.assert_not_called()
@@ -526,10 +541,15 @@ def test_preflight_rejects_yanked_or_wrong_abi_runtime_files(
 
 
 @pytest.mark.parametrize(
-    "channel,version", [("release", "0.2.0"), ("testpypi-dev", "0.2.0.dev612")]
+    "channel,version,testpypi_only",
+    [
+        ("release", "0.2.0", False),
+        ("release", "0.3.0", True),
+        ("testpypi-dev", "0.2.0.dev612", False),
+    ],
 )
 def test_preflight_preserves_exact_sources_version_and_production_ancestry(
-    channel, version, tmp_path, monkeypatch
+    channel, version, testpypi_only, tmp_path, monkeypatch
 ) -> None:
     root = SCRIPT.parents[1]
     release = preflight.load_release_tools(root)
@@ -564,6 +584,8 @@ def test_preflight_preserves_exact_sources_version_and_production_ancestry(
         "--github-output",
         str(output),
     ]
+    if testpypi_only:
+        arguments.append("--testpypi-only")
     assert preflight.main(arguments) == 0
     sources.assert_called_once_with(manifest, root, tmp_path, "a" * 40)
     assert output.read_text() == f"vane_version={version}\n"
@@ -572,7 +594,11 @@ def test_preflight_preserves_exact_sources_version_and_production_ancestry(
     )
     assert "VANE_VERSION_BRANCH" not in version_command.call_args.kwargs["env"]
     indexed.assert_called_once_with(
-        release, version, channel, root / "vane-provider-release.toml"
+        release,
+        version,
+        channel,
+        root / "vane-provider-release.toml",
+        testpypi_only=testpypi_only,
     )
     if channel == "release":
         ancestry.assert_called_once_with(
@@ -593,3 +619,25 @@ def test_preflight_preserves_exact_sources_version_and_production_ancestry(
         indexed.assert_not_called()
     else:
         ancestry.assert_not_called()
+
+
+def test_testpypi_only_rejects_the_development_channel(tmp_path) -> None:
+    with pytest.raises(SystemExit) as error:
+        preflight.main(
+            [
+                "--channel",
+                "testpypi-dev",
+                "--testpypi-only",
+                "--extension-root",
+                str(tmp_path),
+                "--manifest",
+                str(tmp_path / "vane-extension.toml"),
+                "--vane-source",
+                str(tmp_path / "vane"),
+                "--ci-tools-version",
+                "a" * 40,
+                "--github-output",
+                str(tmp_path / "output"),
+            ]
+        )
+    assert error.value.code == 2
