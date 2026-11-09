@@ -4,7 +4,7 @@ platforms = ["manylinux_2_28_x86_64", "macosx_15_0_arm64", "win_amd64"]
 max_wheel_bytes = 100000000
 
 [providers.lance]
-release_number = 1
+release_number = 2
 distribution = "vane-extension-lance"
 dependencies = []
 
