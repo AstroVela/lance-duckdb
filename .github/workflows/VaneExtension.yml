@@ -28,6 +28,14 @@ on:
         description: Reuse signed native inputs from an unpublished release run
         type: string
         default: ""
+      promote-staged-version:
+        description: Promote an already staged TestPyPI provider version to PyPI
+        type: string
+        default: ""
+      promote-vane-version:
+        description: Exact Vane X.Y.Z runtime version for the staged promotion
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ inputs.operation || 'ci' }}
@@ -1279,7 +1287,7 @@ jobs:
       artifact-run-id: ${{ needs.provider-release-preflight.outputs.native_run_id }}
 
   provider-release-preflight:
-    if: inputs.operation == 'testpypi-dev' || inputs.operation == 'release'
+    if: (inputs.operation == 'testpypi-dev' || inputs.operation == 'release') && inputs.promote-staged-version == ''
     name: Verify the protected provider release inputs
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -2431,6 +2439,181 @@ jobs:
       - name: Verify the exact indexed PyPI release
         env:
           LANCE_VERSION: ${{ needs.assemble-testpypi-lance.outputs.lance_version }}
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest vane-extension-release.toml --extension-root . \
+            --vane-source vane --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --directory dist --index pypi \
+            --provider lance --version "$LANCE_VERSION"
+
+  prepare-staged-promotion:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.promote-staged-version != '' && inputs.promote-vane-version != '' }}
+    name: Prepare and verify the staged TestPyPI promotion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize pinned Vane CI tools
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read the production integration manifest
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension-release.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for promotion verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download the staged TestPyPI distributions
+        env:
+          STAGED_VERSION: ${{ inputs.promote-staged-version }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import urllib.request
+
+          version = os.environ["STAGED_VERSION"]
+          with urllib.request.urlopen(
+              f"https://test.pypi.org/pypi/vane-extension-lance/{version}/json"
+          ) as response:
+              payload = json.load(response)
+          files = [
+              record
+              for record in payload.get("urls", [])
+              if record.get("packagetype") == "bdist_wheel"
+              and not record.get("yanked", False)
+          ]
+          if len(files) != 15:
+              raise SystemExit(
+                  f"expected 15 staged wheels for {version}, got {len(files)}"
+              )
+          dist = pathlib.Path("dist")
+          dist.mkdir()
+          for record in files:
+              data = urllib.request.urlopen(record["url"]).read()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest != record["digests"]["sha256"]:
+                  raise SystemExit(
+                      f"staged wheel hash mismatch: {record['filename']}"
+                  )
+              (dist / record["filename"]).write_bytes(data)
+              print(f"{digest}  {record['filename']}")
+          PY
+
+      - name: Recheck exact TestPyPI staging and PyPI publication identities
+        env:
+          VANE_VERSION: ${{ inputs.promote-vane-version }}
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-promotion \
+            --manifest vane-extension-release.toml --extension-root . \
+            --vane-source vane --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --directory dist \
+            --vane-version "$VANE_VERSION"
+
+      - name: Upload the verified staged distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: vane-lance-staged-promotion-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  promote-staged-lance:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.promote-staged-version != '' && inputs.promote-vane-version != '' && needs.prepare-staged-promotion.result == 'success' }}
+    name: Promote the staged Lance provider to PyPI
+    needs: [prepare-staged-promotion]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: pypi
+      url: https://pypi.org/p/vane-extension-lance
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize pinned Vane CI tools
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read the production integration manifest
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension-release.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for promotion verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download the verified staged distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vane-lance-staged-promotion-dist
+          path: dist
+          digest-mismatch: error
+
+      - name: Recheck exact TestPyPI staging and PyPI publication identities
+        env:
+          VANE_VERSION: ${{ inputs.promote-vane-version }}
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-promotion \
+            --manifest vane-extension-release.toml --extension-root . \
+            --vane-source vane --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --directory dist \
+            --vane-version "$VANE_VERSION"
+
+      - name: Publish the staged wheels through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: true
+          packages-dir: dist
+          repository-url: https://upload.pypi.org/legacy/
+          skip-existing: true
+
+      - name: Verify the exact indexed PyPI release
+        env:
+          LANCE_VERSION: ${{ inputs.promote-staged-version }}
         run: |
           python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
             --manifest vane-extension-release.toml --extension-root . \
